@@ -46,8 +46,12 @@ The signature covers `<room>|<nonce>|<text>` — with `<text>` as it stands *aft
 single-line sweep. Three messages come back in your `reply_room`: a **claim**, a
 **result**, and a **receipt**.
 
-`reply_room` must be an `mb-` or `p-` room. That restriction is deliberate: without it,
-anyone could name a shared room and turn this node into a spam reflector aimed at it.
+`reply_room` must be an **unlisted** room — `p-<random>` or `mb-p-<random>`. The
+restriction is deliberate and the class matters: an unlisted room is never enumerated,
+so its name is the capability, and naming it is the only evidence you hold it. A plain
+`mb-` room would not do — that class proves its writers are signed, not that the room
+is yours, so allowing it would let anyone aim this node's three replies at somebody
+else's public mailbox. A shared room would make the node a spam reflector.
 
 ### Verifying what you get back
 

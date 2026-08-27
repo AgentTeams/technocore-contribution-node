@@ -29,6 +29,7 @@ from ..crypto import didkey
 from ..ledger.db import Ledger, utcnow
 from ..logging import get_logger
 from ..protocol.canonical import CanonicalJSONError, canonicalize, parse_strict
+from ..protocol.sweep import room_classes
 from ..receipts.receipt import build_receipt, canonical_hash, sign_result
 from . import schema as job_schema
 from .tasks import REGISTRY, TaskContext, TaskError
@@ -118,13 +119,15 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         if not _is_repliable(reply_room):
             # `reply_room` is a stranger's string, and this node writes three messages
-            # into it. Left open, a request naming `lobby` would turn the node into a
-            # spam reflector aimed at a shared room, triggered by anyone. Replies are
-            # therefore confined to the classes that mean "a room the requester owns":
-            # a mailbox, or an unlisted room whose name is itself the capability.
+            # into it. Left open, a request naming `lobby` turns the node into a spam
+            # reflector aimed at a shared room; left half-open, one naming somebody
+            # else's mailbox aims it at a specific victim instead. Only a room whose name
+            # is itself evidence the requester holds it will do.
             raise RejectedJob(
                 "reply_room_not_allowed",
-                "reply_room must be an mb- or p- room (e.g. mb-p-<unguessable>)",
+                "reply_room must be an unlisted room whose name you chose — p-<random> "
+                "or mb-p-<random>. A plain mb- room proves only that its writers are "
+                "signed, not that you hold it.",
             )
 
         task = str(job["task"])
@@ -354,11 +357,16 @@ class JobRunner:
 
 
 def _is_repliable(room: str) -> bool:
-    """True only for a room class that means "the requester's own inbox".
+    """True only for a room whose name is itself evidence the requester holds it.
 
-    `mb-` is signed-writes-only, so a reply there is attributable; `p-` is unlisted, so
-    its name is a capability the requester chose to hand over. Every other class — the
-    shared rooms above all — is refused, because this node must not be steerable into
-    writing somewhere a third party did not ask for.
+    The first version of this allowed any `mb-` room, on the reasoning that a mailbox
+    takes signed writes only. That was the wrong reading: `mb-` says every writer is
+    attributable, not that *this* requester owns the room. A stranger could name somebody
+    else's public mailbox and have this node post three messages into it — a narrower
+    reflector than aiming at `lobby`, and aimed at a specific victim.
+
+    The `p-` class is the one that carries evidence. An unlisted room is never enumerated,
+    so its name is a capability: knowing it is how the upstream models being handed access
+    to it. `p-`, `mb-p-` and `e-p-` all qualify; a plain `mb-` room no longer does.
     """
-    return room.startswith(("mb-", "p-"))
+    return "p-" in room_classes(room)

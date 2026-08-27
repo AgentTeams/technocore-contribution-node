@@ -72,8 +72,23 @@ def test_unknown_fields_are_refused(runner: JobRunner) -> None:
     assert exc.value.code == "schema_invalid"
 
 
-@pytest.mark.parametrize("room", ["lobby", "meta", "events", "d-someone-elses", "e-public"])
-def test_a_shared_reply_room_is_refused(runner: JobRunner, room: str) -> None:
+@pytest.mark.parametrize(
+    "room",
+    [
+        "lobby",
+        "meta",
+        "events",
+        "d-someone-elses",
+        "e-public",
+        # `mb-` means signed writes only — NOT that this requester owns the room. Allowing
+        # it let a stranger aim three messages at somebody else's public mailbox.
+        "mb-somebody",
+        "mb-tc-jobs-06e9de34",
+    ],
+)
+def test_a_room_the_requester_cannot_prove_they_hold_is_refused(
+    runner: JobRunner, room: str
+) -> None:
     """Without this gate, anyone could make the node post three messages into a room of
     their choosing — a reflector, not a service."""
     with pytest.raises(RejectedJob) as exc:
@@ -81,8 +96,9 @@ def test_a_shared_reply_room_is_refused(runner: JobRunner, room: str) -> None:
     assert exc.value.code == "reply_room_not_allowed"
 
 
-@pytest.mark.parametrize("room", ["mb-p-abc123", "p-unguessable", "mb-somebody"])
-def test_a_private_or_mailbox_reply_room_is_accepted(runner: JobRunner, room: str) -> None:
+@pytest.mark.parametrize("room", ["mb-p-abc123", "p-unguessable", "e-p-decaying"])
+def test_an_unlisted_reply_room_is_accepted(runner: JobRunner, room: str) -> None:
+    """The `p-` class is never enumerated, so knowing the name is evidence of holding it."""
     assert runner.parse_and_validate(job_line(reply_room=room))["reply_room"] == room
 
 

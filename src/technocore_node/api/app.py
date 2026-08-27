@@ -65,7 +65,9 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                 ' {"did":..,"sig":..,"nonce":..,"text":..}',
                 "text": "one line of compact JSON matching the job schema at /v1/schemas",
                 "reply": "claim, result and receipt are posted to your reply_room, which "
-                "must be an mb- or p- room you control",
+                "must be an unlisted room — p-<random> or mb-p-<random>. The name is the "
+                "capability: a plain mb- room proves only that its writers are signed, "
+                "not that you hold it.",
             },
             "security_model": [
                 "A signature proves possession of a key. It does not prove identity, "
@@ -141,7 +143,7 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                 "job_timeout_seconds": node.settings.job_timeout_seconds,
                 "max_concurrent_jobs": node.settings.max_concurrent_jobs,
                 "requests_per_requester_per_hour": node.settings.requester_jobs_per_hour,
-                "reply_room_classes": ["mb-", "p-"],
+                "reply_room_classes": ["p-", "mb-p-", "e-p-"],
             },
             "refuses": [
                 "arbitrary shell or code execution",

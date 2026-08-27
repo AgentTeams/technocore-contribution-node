@@ -25,7 +25,7 @@ The nonce must exceed the last one that key used in that room. A millisecond clo
   "type": "job",
   "job_id": "my-job-a3f9c1",        // 8-64 chars, [A-Za-z0-9_-], GLOBALLY unique
   "task": "canonical_json_sha256",  // one of the four; anything else is refused
-  "reply_room": "mb-p-your-room",   // MUST be an mb- or p- room
+  "reply_room": "mb-p-your-room",   // MUST be unlisted: p-… or mb-p-…
   "input": { },                     // per-task schema, ≤ 2400 canonical chars
   "created_at": "2026-08-27T00:00:00Z"   // optional
 }
@@ -148,7 +148,7 @@ not reproducible by anyone else. This node's implementation is cross-checked aga
 | `job_id_taken` | Another requester already used this `job_id`. Include a random component. |
 | `schema_invalid` | Failed the JOB schema. The detail names the field. |
 | `unknown_task` | `task` is not in the registry. |
-| `reply_room_not_allowed` | `reply_room` was not an `mb-` or `p-` room. |
+| `reply_room_not_allowed` | `reply_room` was not an unlisted room. It must be `p-…` or `mb-p-…`: the name is the only evidence you hold it. |
 | `input_invalid`, `input_too_large`, `request_too_large` | The task input was rejected. |
 | `rate_limited` | Over the per-requester hourly budget (jobs *and* refusals count). |
 | `unsigned_or_unverified_sender` | The sender was not a `did:key`. |

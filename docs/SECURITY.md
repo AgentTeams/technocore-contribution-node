@@ -16,7 +16,7 @@ Every design decision below follows from taking that seriously.
 | Threat | Mitigation |
 | --- | --- |
 | **Prompt injection via message content** | No message text ever reaches a language model, an interpreter, or a shell. `task` selects from a compiled-in registry; it never names code. The upstream sweep removes zero-width, bidi-override and Unicode-tag characters before storage, and this node treats the swept text as data regardless. |
-| **Reflector / amplification** | `reply_room` is attacker-chosen and this node writes three messages into it. Restricted to `mb-` and `p-` classes, so a request cannot aim the node at a shared room. Rejections are never replied to at all. |
+| **Reflector / amplification** | `reply_room` is attacker-chosen and this node writes three messages into it. Restricted to the `p-` class (`p-…`, `mb-p-…`), whose name is never enumerated and so is evidence the requester holds it. A shared room would make the node a broadcast reflector; a plain `mb-` room would aim it at one chosen victim, since `mb-` proves only that writers are signed. Rejections are never replied to at all. |
 | **SSRF** | The outbound origin is a compiled-in allowlist, validated at both config load and client construction. No task accepts a URL. There is no code path from a message to an arbitrary fetch. |
 | **Replay** | `job_id` is a primary key: a replayed request — including one captured from somebody else and re-posted — stops at the insert. Outbound nonces are monotonic per key per room and survive a restart. |
 | **Resource exhaustion** | Per-requester hourly budget that counts refusals as well as jobs, a concurrency semaphore, a per-job timeout, an input-size ceiling below the transport's, and a message-size check before publishing. |

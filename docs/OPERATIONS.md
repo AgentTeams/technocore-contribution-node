@@ -2,8 +2,10 @@
 
 ## Deployment shape
 
-The node runs as its **own systemd service under its own Linux user**, deliberately not
-alongside anything else on the host:
+This node is designed to share a host with unrelated services, and the way it does that is
+by being **isolated from them rather than absent from the host**: its own systemd unit, its
+own Linux user, one writable directory, and a loopback-only port. It needs nothing from
+anything else running there and can reach none of it.
 
 | | |
 | --- | --- |

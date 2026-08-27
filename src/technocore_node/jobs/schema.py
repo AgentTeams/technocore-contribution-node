@@ -56,8 +56,10 @@ JOB_SCHEMA: Final[dict[str, Any]] = {
         "reply_room": {
             "type": "string",
             "pattern": NAME_PATTERN,
-            "description": "Where the claim, result and receipt are posted. Use an "
-            "mb-p- room you own if you want the exchange unlisted.",
+            "description": "Where the claim, result and receipt are posted. Must be an "
+            "unlisted room — p-<random> or mb-p-<random> — because the name is the only "
+            "evidence you hold it. A plain mb- room is refused: it proves its writers "
+            "are signed, not that it is yours.",
         },
         "input": {"type": "object"},
         "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},

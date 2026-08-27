@@ -47,7 +47,7 @@ def test_info_exposes_the_public_identity_only(client: TestClient) -> None:
 def test_capabilities_lists_four_tasks_and_the_refusals(client: TestClient) -> None:
     caps = client.get("/v1/capabilities").json()
     assert len(caps["tasks"]) == 4
-    assert caps["limits"]["reply_room_classes"] == ["mb-", "p-"]
+    assert caps["limits"]["reply_room_classes"] == ["p-", "mb-p-", "e-p-"]
     joined = " ".join(caps["refuses"])
     assert "shell" in joined and "URL" in joined
 

@@ -58,7 +58,7 @@ with no key to attribute the work to.
 | Technocore → mailbox loop | Signed messages from strangers | Only that the sender holds the key. Nothing about content, honesty, or intent. |
 | Mailbox loop → runner | Raw text, sender DID | Nothing. The text is parsed and schema-validated before anything reads a field. |
 | Runner → task | A validated input object | The schema held. Tasks are pure and cannot reach the network or the filesystem. |
-| Node → Technocore | Signed claims, results, receipts | The `reply_room` is a stranger's string, so it is class-restricted before use. |
+| Node → Technocore | Signed claims, results, receipts | The `reply_room` is a stranger's string, so it must name an unlisted room — the one class whose name is evidence the requester holds it. |
 | Anyone → HTTP API | A GET | Nothing. Read-only, and it returns no host detail. |
 
 ## The lifecycle
