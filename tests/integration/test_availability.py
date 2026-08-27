@@ -54,7 +54,7 @@ def test_an_unobserved_node_says_so_rather_than_guessing(node: Node) -> None:
     either) — the node simply has not looked yet, and says which.
     """
     node.ledger.set_state("owned_room_owner", node.did)
-    node.settings.__class__.public_url  # noqa: B018 — documents that public_url drives a blocker
+    node.ledger.set_state("owned_room_observed", "1")
     availability = node.availability()
     assert availability["third_party_intake"] in {"unverified", "unavailable"}
     assert availability["owned_result_room"]["owned_by_this_node"] is True
@@ -114,7 +114,8 @@ def test_an_unowned_result_room_is_reported_once_it_has_been_looked_at(node: Nod
     before = node.availability()["owned_result_room"]
     assert before["observed_at"] is None, "nothing observed yet"
 
-    node.ledger.set_state("owned_room_owner", None)  # what a 404 read records
+    node.ledger.set_state("owned_room_owner", None)  # what a successful 404 read records
+    node.ledger.set_state("owned_room_observed", "1")
     after = node.availability()
     assert after["owned_result_room"]["observed_at"] is not None
     assert after["owned_result_room"]["owned_by_this_node"] is False
@@ -182,6 +183,7 @@ def test_intake_reads_available_only_with_a_job_and_no_blockers(
     """Both halves are required, and each is checked without the other."""
     object.__setattr__(node.settings, "public_url", "https://example.invalid")
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
 
     # No blockers, but nobody has used it: not `available`.
     assert node.availability()["blockers"] == []
@@ -224,6 +226,7 @@ def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
     _completed_third_party_job(Ledger(env["TCN_DB_PATH"]), node)
     stranger = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
     node.ledger.set_state("owned_room_owner", stranger)
+    node.ledger.set_state("owned_room_observed", "1")
 
     availability = node.availability()
     assert availability["owned_result_room"]["owned_by_this_node"] is False
@@ -234,4 +237,59 @@ def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
 def test_our_own_ownership_is_not_a_blocker(node: Node, env: dict[str, str]) -> None:
     object.__setattr__(node.settings, "public_url", "https://example.invalid")
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
     assert node.availability()["blockers"] == []
+
+
+async def test_a_failed_ownership_check_is_reported_as_not_knowing(node: Node) -> None:
+    """ "I could not look" must never render as "there is nobody there".
+
+    A read that fails on a timeout or a 500 once recorded the same state as a read that
+    succeeded and found no owner — turning an unanswered question into a confident
+    negative. That substitution is the whole reason this release exists, so it would be a
+    poor place to make it.
+    """
+    from technocore_node.protocol.client import TechnocoreError
+
+    async def refuse(room: str) -> str | None:
+        raise TechnocoreError("HTTP 503: upstream unavailable")
+
+    node.client.room_owner = refuse  # type: ignore[method-assign]
+    await node.observe_reachability()
+
+    room = node.availability()["owned_result_room"]
+    assert room["observed"] is False, "nothing was successfully observed"
+    assert room["read_error"] is not None
+    assert any("could not verify" in b for b in node.availability()["blockers"])
+    assert not any("no owner note" in b for b in node.availability()["blockers"])
+
+
+async def test_a_failed_check_does_not_erase_a_good_earlier_observation(node: Node) -> None:
+    """A blip must not un-know something already established."""
+    from technocore_node.protocol.client import TechnocoreError
+
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+
+    async def refuse(room: str) -> str | None:
+        raise TechnocoreError("HTTP 503: upstream unavailable")
+
+    node.client.room_owner = refuse  # type: ignore[method-assign]
+    await node.observe_reachability()
+
+    room = node.availability()["owned_result_room"]
+    assert room["owner"] == node.did, "the earlier observation survives"
+    assert room["observed"] is True
+
+
+async def test_a_successful_check_clears_an_earlier_failure(node: Node) -> None:
+    async def succeed(room: str) -> str | None:
+        return node.did
+
+    node.ledger.set_state("owned_room_error", "HTTP 503: upstream unavailable")
+    node.client.room_owner = succeed  # type: ignore[method-assign]
+    await node.observe_reachability()
+
+    room = node.availability()["owned_result_room"]
+    assert room["read_error"] is None
+    assert room["owned_by_this_node"] is True

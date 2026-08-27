@@ -335,10 +335,14 @@ class Node:
         try:
             owner = await self.client.room_owner(self.result_room)
         except (TechnocoreError, httpx.HTTPError) as exc:
-            self.ledger.set_state("owned_room_owner", None)
+            # Record that the check failed, and leave the last real observation alone.
+            # Writing None here would have been indistinguishable from having read the
+            # room and found no owner — turning "I could not look" into "there is nobody
+            # there", which is the exact substitution this release exists to stop.
             self.ledger.set_state("owned_room_error", str(exc)[:300])
             return
         self.ledger.set_state("owned_room_owner", owner)
+        self.ledger.set_state("owned_room_observed", "1")
         self.ledger.set_state("owned_room_error", None)
 
     async def sync_owned_room(self) -> int:
@@ -473,19 +477,24 @@ class Node:
         that cannot be produced by wishing.
         """
         owner, owner_at = self.ledger.get_state("owned_room_owner")
-        owner_err, _ = self.ledger.get_state("owned_room_error")
+        observed, _ = self.ledger.get_state("owned_room_observed")
+        owner_err, owner_err_at = self.ledger.get_state("owned_room_error")
         result_err, _ = self.ledger.get_state(f"last_publish_error:{self.result_room}")
         metrics = self.ledger.metrics()
         audit = self.ledger.audit_backlog()
 
         completed = int(metrics["completed_jobs"])
         blockers: list[str] = []
-        if owner_at is not None and owner is None:
+        if owner_err:
+            # Not knowing is its own state, and it is still a reason not to claim to be
+            # reachable — but it is reported as not knowing.
+            blockers.append(f"this node could not verify who owns its result room: {owner_err}")
+        elif observed and owner is None:
             blockers.append(
                 "this node's owned result room has no owner note, so receipts cannot be "
                 "published where a third party could audit them"
             )
-        elif owner_at is not None and owner != self.did:
+        elif observed and owner != self.did:
             # Stronger than being unowned, not weaker. An unclaimed room can still be
             # claimed; one held by another key never will be, and the whole value of that
             # room is that only this node can write to it. A receipt published there by
@@ -516,10 +525,14 @@ class Node:
             "public_url": self.settings.public_url or None,
             "owned_result_room": {
                 "room": self.result_room,
+                # `null` here is ambiguous on its own, so it never stands alone:
+                # `observed` says whether anyone has successfully looked.
+                "observed": bool(observed),
                 "owner": owner,
-                "owned_by_this_node": owner == self.did,
+                "owned_by_this_node": bool(observed) and owner == self.did,
                 "observed_at": owner_at,
                 "read_error": owner_err,
+                "read_error_at": owner_err_at if owner_err else None,
             },
             "receipts": {
                 "publicly_auditable": audit["published"],

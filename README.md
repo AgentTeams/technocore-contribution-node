@@ -16,7 +16,7 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.1`, 264 tests, 30 end-to-end, strict typing, dependency audit clean |
+| Implementation | **complete** — `v0.1.1`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, loopback only |
 | Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
 | Technocore mailbox (`mb-tc-jobs-…`) | **not created.** The upstream instance is at its global room cap (20 480), so no new room can be created — by this node or by anyone |
