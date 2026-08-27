@@ -28,7 +28,7 @@ from .. import __version__
 from ..crypto import didkey
 from ..ledger.db import Ledger, utcnow
 from ..logging import get_logger
-from ..protocol.canonical import canonicalize
+from ..protocol.canonical import CanonicalJSONError, canonicalize, parse_strict
 from ..receipts.receipt import build_receipt, canonical_hash, sign_result
 from . import schema as job_schema
 from .tasks import REGISTRY, TaskContext, TaskError
@@ -99,9 +99,13 @@ class JobRunner:
         if len(text) > job_schema.MAX_INPUT_CHARS + 600:
             raise RejectedJob("request_too_large", f"{len(text)} characters")
         try:
-            job = json.loads(text)
+            job = parse_strict(text)
         except json.JSONDecodeError:
             raise RejectedJob("not_json") from None
+        except CanonicalJSONError as exc:
+            # Duplicate keys, NaN, Infinity: parseable by Python, but not documents with
+            # one meaning. A hash over them would not be evidence of anything.
+            raise RejectedJob("not_canonical_json", str(exc)) from None
         if not isinstance(job, dict):
             raise RejectedJob("not_an_object")
 
@@ -132,7 +136,15 @@ class JobRunner:
         payload = job.get("input", {})
         if not isinstance(payload, dict):
             raise RejectedJob("schema_invalid", "input must be an object")
-        if len(canonicalize(payload)) > job_schema.MAX_INPUT_CHARS:
+        try:
+            canonical_input = canonicalize(payload)
+        except CanonicalJSONError as exc:
+            # An unpaired surrogate reaches here: json.loads accepts it and the schema is
+            # happy, but it is not UTF-8 and so has no canonical form. Left uncaught it
+            # surfaced much later as an unhandled UnicodeEncodeError, which meant no
+            # refusal record, no signed answer, and no rate-limit accounting.
+            raise RejectedJob("input_not_canonical", str(exc)) from None
+        if len(canonical_input) > job_schema.MAX_INPUT_CHARS:
             raise RejectedJob("input_too_large", f"limit {job_schema.MAX_INPUT_CHARS} characters")
 
         validator = _INPUT_VALIDATORS.get(task)
@@ -181,7 +193,18 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         task = str(job["task"])
 
-        if self.ledger.job_exists(job_id):
+        owner = self.ledger.job_requester(job_id)
+        if owner is not None:
+            if owner != requester_did:
+                # `job_id` is globally unique because it is also the public receipt
+                # identifier. Silently dropping this would let anyone erase another
+                # agent's job by guessing its id first — no execution, no reply, no
+                # record. It is refused loudly instead, and the refusal is readable.
+                raise RejectedJob(
+                    "job_id_taken",
+                    "another requester already used this job_id; choose one with a "
+                    "random component",
+                )
             log.info(
                 "duplicate job ignored",
                 extra={"fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}},
@@ -262,15 +285,27 @@ class JobRunner:
         else:
             result["error"] = error_message or failure_code or "error"
 
-        result["result_hash"] = canonical_hash(
-            summary if status == "ok" else {"error": error_message}
-        )
+        try:
+            result["result_hash"] = canonical_hash(
+                summary if status == "ok" else {"error": error_message}
+            )
+        except CanonicalJSONError as exc:
+            # A task returned something that cannot be canonicalised. The requester is
+            # still owed a signed answer, so the result degrades to an error rather than
+            # taking the pipeline down with it.
+            status, failure_code = "error", "result_not_canonical"
+            summary = {}
+            result.pop("summary", None)
+            result["status"] = "error"
+            result["error"] = f"result_not_canonical: {exc}"[:200]
+            result["result_hash"] = canonical_hash({"error": "result_not_canonical"})
         result["sig"] = sign_result(self._key, result)
 
         self.ledger.record_result(
             job_id=job_id,
             result_hash=result["result_hash"],
-            result_summary=json.dumps(summary, ensure_ascii=True)[:4000],
+            status=status,
+            summary_bytes=len(json.dumps(summary, ensure_ascii=True).encode("utf-8")),
             provider_signature=result["sig"],
             result_seq=None,
         )

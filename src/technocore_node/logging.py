@@ -17,7 +17,18 @@ from typing import Any
 #: Patterns that must never reach a log line, however they got into the record.
 _REDACT_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
-    re.compile(r"(?i)\b(passphrase|password|secret|token|api[_-]?key)\b\s*[=:]\s*\S+"),
+    # Order matters. The scheme-plus-token rules run before the generic key/value rule,
+    # because the generic one stops at whitespace: matched first, it would blank the words
+    # `Authorization: Bearer` and leave the token itself sitting in the log line.
+    re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/-]{8,}=*"),
+    re.compile(r"(?i)[\"']?\bauthorization\b[\"']?\s*[=:]\s*[\"']?[^\"',}\]\n]+"),
+    # `"token": "..."` as well as `token=...`: the optional quote around the key name is
+    # what makes the JSON-encoded form match. Without it a credential inside a serialised
+    # object passes straight through, which is the shape most likely to be logged.
+    re.compile(
+        r"(?i)[\"']?\b(pass(phrase|word)?|secret|token|api[_-]?key|access[_-]?token"
+        r"|client[_-]?secret|refresh[_-]?token)\b[\"']?\s*[=:]\s*[\"']?[^\s\"',}\]]+[\"']?"
+    ),
 ]
 _REDACTED = "[redacted]"
 

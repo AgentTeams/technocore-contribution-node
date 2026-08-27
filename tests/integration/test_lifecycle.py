@@ -70,20 +70,25 @@ async def test_the_same_job_id_is_never_executed_twice(runner: JobRunner) -> Non
     assert second is None, "a replayed job_id must be answered from the ledger, not rerun"
 
 
-async def test_a_replayed_job_from_a_different_sender_is_still_a_duplicate(
+async def test_a_replayed_job_from_a_different_sender_is_refused_not_dropped(
     runner: JobRunner,
 ) -> None:
-    """Capturing somebody else's signed job and re-posting it must not buy new work."""
+    """Capturing somebody else's signed job and re-posting it must not buy new work.
+
+    It must also not *silently* buy nothing. This test used to assert `is None` — which
+    was the bug: the same path meant a stranger could erase a legitimate job by claiming
+    its `job_id` first, with nothing executed, answered or recorded. The refusal is now
+    explicit and readable at `GET /v1/receipts/<job_id>`.
+    """
     await runner.handle(
         text=job_line(), requester_did=REQUESTER, request_room="mb-test", request_seq=1
     )
     other = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
-    assert (
+    with pytest.raises(RejectedJob) as exc:
         await runner.handle(
             text=job_line(), requester_did=other, request_room="mb-test", request_seq=2
         )
-        is None
-    )
+    assert exc.value.code == "job_id_taken"
 
 
 async def test_an_unsigned_sender_is_refused(runner: JobRunner) -> None:

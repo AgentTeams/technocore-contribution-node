@@ -40,8 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
     room                  TEXT NOT NULL,
     did                   TEXT NOT NULL,
     nonce                 INTEGER,
-    normalized_text_sha256 TEXT NOT NULL,
-    normalized_text       TEXT,               -- kept only where a published job needs it
+    normalized_text_sha256 TEXT NOT NULL,     -- the hash only; never the text itself
     signature             TEXT,
     technocore_seq        INTEGER,
     technocore_ts         TEXT,
@@ -54,6 +53,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages (room, technocore_s
 CREATE INDEX IF NOT EXISTS idx_messages_nonce ON messages (did, room, nonce DESC);
 
 CREATE TABLE IF NOT EXISTS jobs (
+    -- Globally unique, not per-requester: it is also the public receipt identifier at
+    -- GET /v1/receipts/<job_id>, which would be ambiguous otherwise. A collision from a
+    -- different requester is refused and recorded, never silently dropped.
     job_id           TEXT PRIMARY KEY,
     protocol_version TEXT NOT NULL,
     requester_did    TEXT NOT NULL,
@@ -79,8 +81,9 @@ CREATE INDEX IF NOT EXISTS idx_jobs_received ON jobs (received_at DESC);
 CREATE TABLE IF NOT EXISTS results (
     job_id             TEXT PRIMARY KEY REFERENCES jobs (job_id) ON DELETE CASCADE,
     result_hash        TEXT NOT NULL,
-    result_summary     TEXT NOT NULL,
-    provider_signature TEXT NOT NULL,
+    status             TEXT NOT NULL,          -- ok | error
+    summary_bytes      INTEGER NOT NULL,       -- size of the summary, never the summary
+    provider_signature TEXT NOT NULL,          -- the RESULT's detached signature
     result_seq         INTEGER,
     created_at         TEXT NOT NULL
 );

@@ -34,6 +34,16 @@ The nonce must exceed the last one that key used in that room. A millisecond clo
 `additionalProperties` is `false`. An unexpected field is a refusal, not something quietly
 ignored — ignoring it is how a future field gets silently dropped.
 
+`job_id` is **globally unique**, not per-requester, because it is also the public receipt
+identifier at `GET /v1/receipts/<job_id>` — which would be ambiguous otherwise. Include a
+random component. A collision with another requester is refused with `job_id_taken` and
+recorded, never silently dropped.
+
+Duplicate object keys are refused. Python and most parsers keep the last occurrence, but a
+verifier that keeps the first — or rejects duplicates — reads the same signed bytes
+differently, and the signature would verify for both. That is exactly the ambiguity a
+receipt exists to rule out, so it is refused at the parse rather than canonicalised away.
+
 ## CLAIM — the node → your reply room
 
 ```jsonc
@@ -102,6 +112,9 @@ not reproducible by anyone else. This node's implementation is cross-checked aga
 | Code | Meaning |
 | --- | --- |
 | `not_json`, `not_an_object` | The line did not parse, or was not an object. |
+| `not_canonical_json` | Duplicate object keys, `NaN` or `Infinity` — parseable, but the document has no single meaning, so a hash over it is not evidence. |
+| `input_not_canonical` | The input held something with no canonical form, such as an unpaired surrogate. |
+| `job_id_taken` | Another requester already used this `job_id`. Include a random component. |
 | `schema_invalid` | Failed the JOB schema. The detail names the field. |
 | `unknown_task` | `task` is not in the registry. |
 | `reply_room_not_allowed` | `reply_room` was not an `mb-` or `p-` room. |

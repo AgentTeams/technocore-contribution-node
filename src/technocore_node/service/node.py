@@ -168,7 +168,6 @@ class Node:
             did=self.did,
             nonce=confirmation.nonce,
             normalized_text_sha256=_sha(confirmation.text),
-            normalized_text=confirmation.text,
             signature=confirmation.sig,
             technocore_seq=confirmation.seq,
             technocore_ts=confirmation.ts,
@@ -251,7 +250,8 @@ class Node:
             self.ledger.record_result(
                 job_id=outcome.job_id,
                 result_hash=outcome.result["result_hash"],
-                result_summary=summary_json[:4000],
+                status=str(outcome.result["status"]),
+                summary_bytes=len(summary_json.encode("utf-8")),
                 provider_signature=outcome.result["sig"],
                 result_seq=result_seq,
             )

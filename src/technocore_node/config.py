@@ -26,6 +26,29 @@ ALLOWED_ORIGINS = frozenset(
 
 DEFAULT_ORIGIN = "https://technocore.chat"
 
+#: Origins the protocol watcher may additionally read, for provenance only. Listed here
+#: rather than hardcoded at the call site so that "everything this node can reach" is one
+#: readable set — a containment guarantee split across two files is one nobody can check.
+WATCHER_ORIGINS = frozenset({"https://api.github.com"})
+
+#: Every origin this process may contact, from anywhere.
+ALL_ALLOWED_ORIGINS = ALLOWED_ORIGINS | WATCHER_ORIGINS
+
+
+def assert_allowed_origin(url: str, permitted: frozenset[str] | None = None) -> None:
+    """Raise unless `url` sits under an allowlisted origin.
+
+    Matching is on the parsed scheme/host/port, never on a prefix: `https://technocore.chat`
+    is a prefix of `https://technocore.chat.attacker.example`, and a startswith check would
+    wave that through.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    if origin not in (permitted if permitted is not None else ALL_ALLOWED_ORIGINS):
+        raise ConfigError(f"outbound request to {origin!r} is not allowlisted")
+
 
 class ConfigError(ValueError):
     """Configuration that cannot be honoured safely."""

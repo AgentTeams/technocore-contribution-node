@@ -122,6 +122,14 @@ def _serialize(value: Any, out: list[str], depth: int) -> None:
     elif value is False:
         out.append("false")
     elif isinstance(value, str):
+        # A lone surrogate parses happily out of JSON and then cannot be UTF-8 encoded.
+        # Caught here rather than three frames later at `.encode()`, so a caller gets a
+        # CanonicalJSONError the pipeline already knows how to refuse.
+        if any("\ud800" <= c <= "\udfff" for c in value):
+            raise CanonicalJSONError(
+                "unpaired surrogate in a string: not valid UTF-8, so it has no "
+                "canonical form and cannot be hashed"
+            )
         out.append(_dumps_string(value))
     elif isinstance(value, int | float):
         out.append(dumps_number(value))
@@ -161,17 +169,33 @@ def canonical_bytes(value: Any) -> bytes:
 
 
 def parse_strict(text: str) -> Any:
-    """Parse JSON, refusing the extensions Python's parser accepts by default.
+    """Parse JSON the way an evidentiary hash needs it parsed.
 
-    ``json.loads`` accepts ``NaN``, ``Infinity`` and ``-Infinity``, none of which are JSON
-    and none of which can be canonicalised. Refusing them at parse time gives a caller a
-    clear error instead of one from three frames deeper.
+    Python's parser is more forgiving than JSON, and each thing it forgives becomes an
+    ambiguity in a receipt:
+
+    * ``NaN`` / ``Infinity`` / ``-Infinity`` are not JSON and have no canonical form.
+    * **Duplicate keys** are the load-bearing one. Python keeps the last occurrence, so
+      ``{"task":"a","task":"b"}`` hashes as if only ``"b"`` were ever written — while a
+      verifier that rejects duplicates, or keeps the first, reads the same signed bytes
+      differently. The signature would still verify and the two parties would disagree
+      about what was signed, which is exactly the property a receipt exists to rule out.
+      RFC 8785 canonicalises an already-parsed value and so cannot see this; it has to be
+      refused at the parse.
     """
 
-    def _reject(value: str) -> float:
+    def _reject_constant(value: str) -> float:
         raise CanonicalJSONError(f"{value} is not valid JSON")
 
-    return json.loads(
-        text,
-        parse_constant=_reject,
-    )
+    def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        seen: set[str] = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise CanonicalJSONError(
+                    f"duplicate object key {key!r}: the document has no single meaning, "
+                    "so it cannot be canonicalised or hashed as evidence"
+                )
+            seen.add(key)
+        return dict(pairs)
+
+    return json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicates)

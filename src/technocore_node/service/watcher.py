@@ -16,12 +16,14 @@ from typing import Any
 
 import httpx2 as httpx
 
+from ..config import assert_allowed_origin
 from ..ledger.db import Ledger, utcnow
 from ..logging import get_logger
 
 log = get_logger(__name__)
 
-#: Paths on the allowlisted origin, and the upstream repository. Fixed, not configurable.
+#: Paths on the allowlisted origin, and the upstream repository. Fixed, not configurable,
+#: and both origins appear in the central allowlist in `config.py`.
 MANIFEST_PATHS = ("/llms.txt", "/openapi.json", "/.well-known/agent.json", "/config")
 UPSTREAM_REPO_API = "https://api.github.com/repos/flop-labs/technocore-chat"
 
@@ -39,6 +41,14 @@ class ProtocolWatcher:
         self._client = client
 
     async def _fetch(self, url: str) -> tuple[int, bytes]:
+        """Fetch one allowlisted URL.
+
+        The check is here, on the one method that makes a request, rather than trusted to
+        the two call sites below. Both URLs are compiled in and neither is caller-derived,
+        so this is not stopping an attack today — it is making sure that a future edit
+        that adds a third URL has to go through the same gate.
+        """
+        assert_allowed_origin(url)
         assert self._client is not None
         response = await self._client.get(url, timeout=30.0)
         return response.status_code, response.content

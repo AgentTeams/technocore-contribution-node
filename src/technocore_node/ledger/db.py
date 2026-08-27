@@ -70,6 +70,22 @@ class Ledger:
     def _migrate(self) -> None:
         sql = resources.files("technocore_node.ledger").joinpath("schema.sql").read_text()
         self.conn.executescript(sql)
+        self._drop_payload_columns()
+
+    def _drop_payload_columns(self) -> None:
+        """Remove columns that once held request or result text.
+
+        `CREATE TABLE IF NOT EXISTS` cannot retire a column, so a database created before
+        those columns were removed would keep them — and keep being a place someone could
+        put a stranger's data back. Dropping them makes the guarantee structural rather
+        than a convention the next edit might forget.
+        """
+        for table, column in (("messages", "normalized_text"), ("results", "result_summary")):
+            columns = {
+                row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column in columns:
+                self.conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
     def integrity_ok(self) -> bool:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()
@@ -101,7 +117,6 @@ class Ledger:
             "did",
             "nonce",
             "normalized_text_sha256",
-            "normalized_text",
             "signature",
             "technocore_seq",
             "technocore_ts",
@@ -150,6 +165,13 @@ class Ledger:
             self.conn.execute("SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             is not None
         )
+
+    def job_requester(self, job_id: str) -> str | None:
+        """The DID that already holds `job_id`, or None when it is free."""
+        row = self.conn.execute(
+            "SELECT requester_did FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return str(row["requester_did"]) if row else None
 
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return _row(self.conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone())
@@ -263,15 +285,31 @@ class Ledger:
         self,
         job_id: str,
         result_hash: str,
-        result_summary: str,
+        status: str,
+        summary_bytes: int,
         provider_signature: str,
         result_seq: int | None,
     ) -> None:
+        """Record what a result *was*, not what it said.
+
+        `summary_bytes` rather than the summary: the size is what an operator needs to
+        reason about, and the content is a stranger's data this node has no reader for.
+        The hash still binds the result, so nothing verifiable is lost by not keeping it.
+        """
         with self.tx() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO results (job_id, result_hash, result_summary, "
-                "provider_signature, result_seq, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, result_hash, result_summary, provider_signature, result_seq, utcnow()),
+                "INSERT OR REPLACE INTO results (job_id, result_hash, status, "
+                "summary_bytes, provider_signature, result_seq, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    result_hash,
+                    status,
+                    summary_bytes,
+                    provider_signature,
+                    result_seq,
+                    utcnow(),
+                ),
             )
 
     # --------------------------------------------------------------- receipts
@@ -296,7 +334,11 @@ class Ledger:
                     receipt["provider_did"],
                     receipt["request_hash"],
                     receipt["result_hash"],
-                    receipt["sig"],
+                    # The RESULT's detached signature, which is what this column is for.
+                    # `receipt["sig"]` is the receipt's own — storing it here would put
+                    # the wrong signature in the evidence column while receipt_json
+                    # stayed right, so nothing would look broken.
+                    receipt["provider_signature"],
                     receipt["receipt_hash"],
                     receipt_json,
                     technocore_seq,

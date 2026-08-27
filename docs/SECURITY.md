@@ -54,6 +54,22 @@ Not "does not currently" — will not, by construction:
 `tests/integration/test_isolation.py` asserts the first four against the source of every
 registered task, so a future edit that introduces one fails the suite.
 
+## What the ledger holds
+
+Hashes and signatures, never request or result text. Every request is a stranger's bytes
+and may carry anything they chose to put in it, so a column that stores payload text is a
+column that accumulates other people's data indefinitely, on an operator's disk, for no
+reader. There is deliberately nowhere in the schema to put one, and
+`tests/integration/test_review_findings.py` asserts that a caller's string never reaches
+the database file.
+
+**Upgrading from a build that did store payloads:** the migration drops those columns, so
+nothing can be written to them or read from them again. It does **not** scrub bytes already
+in the file — SQLite keeps freed pages until they are reused or the database is `VACUUM`ed.
+A database that ran an earlier build should be treated as still holding whatever it stored.
+To retire it properly, `VACUUM` after upgrading, or start a fresh ledger; the receipts that
+matter are re-derivable from the published chain.
+
 ## Reporting
 
 Open an issue at

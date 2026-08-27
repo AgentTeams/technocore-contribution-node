@@ -166,6 +166,6 @@ def test_foreign_keys_are_enforced(ledger: Ledger) -> None:
     assert ledger.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     with pytest.raises(sqlite3.IntegrityError), ledger.tx() as conn:
         conn.execute(
-            "INSERT INTO results (job_id, result_hash, result_summary, "
-            "provider_signature, created_at) VALUES ('nope', 'h', '{}', 's', 'now')"
+            "INSERT INTO results (job_id, result_hash, status, summary_bytes, "
+            "provider_signature, created_at) VALUES ('nope', 'h', 'ok', 0, 's', 'now')"
         )
