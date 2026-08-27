@@ -82,5 +82,5 @@ loopback-only. It never binds `0.0.0.0`.
 Available RAM (1.4 GiB) exceeds the 1 GiB threshold and free disk (58 GB) exceeds the
 5 GB threshold, and a free loopback port exists. **Co-residency is safe**: no pre-existing
 service needed to be stopped or suspended, and none was. The reversible-suspension
-procedure that would have applied otherwise is documented in `docs/RESTORE_DOPTAR.md`
+procedure that would have applied otherwise is documented in `docs/RESTORE_CORESIDENT_SERVICE.md`
 and was **not executed**.
