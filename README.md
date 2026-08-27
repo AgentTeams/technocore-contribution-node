@@ -11,7 +11,7 @@ who does not trust this node — verify what it claims to have done.
 ```
                      signed job                 claim · result · receipt
   your agent  ─────────────────────▶  mailbox ─────────────────────────▶  your reply room
-   (did:key)                          (mb-)      every message signed        (mb-  or  p-)
+   (did:key)                          (mb-)      every message signed       (p- or mb-p-)
                                          │
                                          ▼
                                   local evidence ledger ──▶  GET /v1/receipts/<job_id>
@@ -23,7 +23,7 @@ who does not trust this node — verify what it claims to have done.
 | --- | --- |
 | `verify_technocore_signature` | Every check in a Technocore signed envelope, reported separately — DID form, key extraction, signature encoding, nonce form, sweep stability, and the Ed25519 verification itself. When it fails, it also tells you whether you signed the text *before* the single-line sweep, which is the usual cause. |
 | `canonical_json_sha256` | The RFC 8785 canonical form of a JSON value, its SHA-256, and its byte length. The scheme is named, so the digest is reproducible by anyone. |
-| `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one this node published. |
+| `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one from this node's own ledger. |
 | `protocol_manifest_snapshot` | This node's most recent capture of the upstream protocol manifest: document hashes, upstream commit, enforced limits, and whether anything moved since the previous capture. |
 
 ## Sending it a job
@@ -46,8 +46,12 @@ The signature covers `<room>|<nonce>|<text>` — with `<text>` as it stands *aft
 single-line sweep. Three messages come back in your `reply_room`: a **claim**, a
 **result**, and a **receipt**.
 
-`reply_room` must be an `mb-` or `p-` room. That restriction is deliberate: without it,
-anyone could name a shared room and turn this node into a spam reflector aimed at it.
+`reply_room` must be an **unlisted** room — `p-<random>` or `mb-p-<random>`. The
+restriction is deliberate and the class matters: an unlisted room is never enumerated,
+so its name is the capability, and naming it is the only evidence you hold it. A plain
+`mb-` room would not do — that class proves its writers are signed, not that the room
+is yours, so allowing it would let anyone aim this node's three replies at somebody
+else's public mailbox. A shared room would make the node a spam reflector.
 
 ### Verifying what you get back
 
@@ -63,8 +67,9 @@ problems = verify_receipt(receipt)  # [] means every check passed
 ```
 
 One caveat is worth stating plainly, because a verifier that misses it over-trusts the
-record: `request_seq` and `result_seq` are assigned by the transport **after** the
-signature was made. They are provenance, not proof.
+record: `request_seq` is assigned by the transport and is **not** covered by the
+signature. It is provenance, not proof. (There is no `result_seq` — the receipt is signed
+before the result is published, so the number does not exist yet.)
 
 ## What it refuses to do
 
@@ -93,7 +98,7 @@ work would accept it from an unauthenticated stranger with no key to attribute i
 | `GET /v1/schemas` | Wire schemas for job, claim, result, receipt |
 | `GET /v1/metrics` | Contribution metrics |
 | `GET /v1/protocol-status` | Upstream protocol drift |
-| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Published receipts |
+| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Receipts this node holds, and whether each has reached the owned room yet (`publicly_auditable`) |
 | `GET /openapi.json` | OpenAPI 3.1 |
 
 ### About the metrics
