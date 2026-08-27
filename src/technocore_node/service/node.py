@@ -166,6 +166,8 @@ class Node:
             )
             return None
 
+        if room in (self.result_room, self.mailbox):
+            self.ledger.set_state(f"last_publish_error:{room}", None)
         self.ledger.record_message(
             local_event_id=f"out-{room}-{confirmation.nonce}",
             direction="out",
@@ -316,6 +318,22 @@ class Node:
         )
         return None
 
+    async def observe_reachability(self) -> None:
+        """Record, read-only, what this node can currently observe about its own reach.
+
+        One note read. It answers the question every visitor actually has — can I send
+        this thing a job? — from evidence rather than from an operator's memory, and it
+        corrects itself the moment the upstream situation changes.
+        """
+        try:
+            owner = await self.client.room_owner(self.result_room)
+        except TechnocoreError as exc:
+            self.ledger.set_state("owned_room_owner", None)
+            self.ledger.set_state("owned_room_error", str(exc)[:300])
+            return
+        self.ledger.set_state("owned_room_owner", owner)
+        self.ledger.set_state("owned_room_error", None)
+
     async def sync_owned_room(self) -> int:
         """Read the owned room and mark every receipt already there as published.
 
@@ -425,6 +443,7 @@ class Node:
             try:
                 await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
+                await self.observe_reachability()
                 backoff = 1.0
             except RateLimited as exc:
                 log.warning(
@@ -438,6 +457,61 @@ class Node:
                 log.exception("mailbox poll failed")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+    def availability(self) -> dict[str, Any]:
+        """What this node can honestly say about being reachable, and on what evidence.
+
+        Every field is observed or counted, never asserted. `intake` is `available` only
+        when a third party has actually completed a job here — the one piece of evidence
+        that cannot be produced by wishing.
+        """
+        owner, owner_at = self.ledger.get_state("owned_room_owner")
+        owner_err, _ = self.ledger.get_state("owned_room_error")
+        result_err, _ = self.ledger.get_state(f"last_publish_error:{self.result_room}")
+        metrics = self.ledger.metrics()
+        audit = self.ledger.audit_backlog()
+
+        completed = int(metrics["completed_jobs"])
+        blockers: list[str] = []
+        if owner is None and owner_at is not None:
+            blockers.append(
+                "this node's owned result room has no owner note, so receipts cannot be "
+                "published where a third party could audit them"
+            )
+        if result_err:
+            blockers.append(f"last publish to the owned room was refused: {result_err}")
+        if not self.settings.public_url:
+            blockers.append("no public HTTPS endpoint is configured (no DNS record)")
+
+        if completed > 0:
+            intake = "available"
+        elif blockers:
+            intake = "unavailable"
+        else:
+            intake = "unverified"
+
+        return {
+            "third_party_intake": intake,
+            "third_party_jobs_completed": completed,
+            "blockers": blockers,
+            "public_url": self.settings.public_url or None,
+            "owned_result_room": {
+                "room": self.result_room,
+                "owner": owner,
+                "owned_by_this_node": owner == self.did,
+                "observed_at": owner_at,
+                "read_error": owner_err,
+            },
+            "receipts": {
+                "publicly_auditable": audit["published"],
+                "awaiting_public_copy": audit["owed"],
+                "quarantined": audit["quarantined"],
+            },
+            "note": (
+                "Observed, not asserted. `intake` reads `available` only once a third "
+                "party has actually completed a job here."
+            ),
+        }
 
     def start_background(self) -> None:
         if self.settings.mailbox_enabled:

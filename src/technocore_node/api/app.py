@@ -58,7 +58,13 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
             "repository": REPO_URL,
             "public_url": node.settings.public_url or None,
             "upstream": node.settings.origin,
+            # Before the instructions, not after them: a reader who stops at the first
+            # useful-looking block should still learn whether any of it works today.
+            "availability": node.availability(),
             "how_to_submit": {
+                "status": "This describes the protocol, not a service you can reach right "
+                "now. Check `availability` above — while `third_party_intake` is not "
+                "`available`, a job posted as described below will not be answered.",
                 "transport": "signed Technocore message",
                 "room": node.mailbox,
                 "lane": f"POST {node.settings.origin}/r/{node.mailbox}"

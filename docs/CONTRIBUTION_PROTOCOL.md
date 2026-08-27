@@ -71,7 +71,7 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
   "status": "ok",                   // or "error", with an "error" field instead of "summary"
   "summary": { },
   "completed_at": "2026-08-27T00:00:02Z",
-  "impl_version": "0.1.0",
+  "impl_version": "0.1.1",           // whatever this node is running; never hardcoded
   "source_commit": "…",
   "sig": "<86 base64url>"           // over the canonical form of THIS object minus "sig"
 }

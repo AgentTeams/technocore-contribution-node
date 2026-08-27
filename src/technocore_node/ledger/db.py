@@ -223,6 +223,24 @@ class Ledger:
         ).fetchone()
         return int(row["n"] or 0)
 
+    # ------------------------------------------------------- deployment state
+
+    def set_state(self, key: str, value: str | None) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO deployment_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, value, utcnow()),
+            )
+
+    def get_state(self, key: str) -> tuple[str | None, str | None]:
+        """`(value, updated_at)`, or `(None, None)` when never observed."""
+        row = self.conn.execute(
+            "SELECT value, updated_at FROM deployment_state WHERE key = ?", (key,)
+        ).fetchone()
+        return (row["value"], row["updated_at"]) if row else (None, None)
+
     # ---------------------------------------------------------------- cursors
 
     def cursor(self, room: str) -> int:
