@@ -167,8 +167,12 @@ def test_a_receipt_is_served_once_recorded(client: TestClient, env: dict[str, st
 
     body = client.get("/v1/receipts/served-job-0001").json()
     assert body["status"] == "completed"
-    assert body["technocore_seq"] == 12
+    assert body["reply_room_seq"] == 12
     assert body["receipt"]["job_id"] == "served-job-0001"
+    # No owned-room copy was recorded, so the receipt is not yet checkable by anyone but
+    # the requester — and the API says so rather than presenting it as fully published.
+    assert body["audit_room_seq"] is None
+    assert body["publicly_auditable"] is False
 
 
 def test_a_rejected_job_is_explained_by_a_read_not_a_reply(

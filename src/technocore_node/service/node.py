@@ -266,16 +266,25 @@ class Node:
             # The same receipt also goes to the room this node owns, where only its key
             # can write. That is the difference between "the requester has a receipt" and
             # "anyone can audit what this node did" — the reply room is the requester's,
-            # and they can post anything they like into it. A third party checking this
-            # node's claims needs a record the node cannot repudiate and nobody else can
-            # forge, and the owned room is the only place that exists.
+            # and they can post anything they like into it.
             #
-            # Internal tests are excluded. The owned room is a public claim about work
+            # Internal tests are excluded: the owned room is a public claim about work
             # done for other agents, and this node's own tests are not that.
+            audit_seq = None
             if not outcome.internal_test:
-                await self.publish(self.result_room, receipt)
+                audit_seq = await self.publish(self.result_room, receipt)
 
-            self.ledger.record_receipt(receipt, receipt_json, published_seq, outcome.internal_test)
+            self.ledger.record_receipt(
+                receipt, receipt_json, published_seq, outcome.internal_test, audit_seq
+            )
+            if audit_seq is None and not outcome.internal_test:
+                # The requester has their copy and the public one is still owed. Recorded
+                # as owed rather than shrugged off: a receipt only they can see does not
+                # meet the contract, and the reconciler below will keep trying.
+                log.warning(
+                    "receipt published to the requester but not yet to the owned room",
+                    extra={"fields": {"job_id": outcome.job_id, "room": self.result_room}},
+                )
 
         log.info(
             "job completed",
@@ -287,6 +296,31 @@ class Node:
                 }
             },
         )
+
+    async def reconcile_audit_copies(self, limit: int = 3) -> int:
+        """Publish owed owned-room copies, a few at a time. Returns how many landed.
+
+        The owned-room write can fail for reasons that have nothing to do with the job —
+        a rate limit, an upstream at capacity, a transient error — and when it does, the
+        requester holds a receipt nobody else can check. Retrying it here means the
+        contract is eventually kept rather than quietly broken, and the bound means a
+        backlog after an outage does not become a write storm on recovery.
+        """
+        landed = 0
+        for row in self.ledger.receipts_awaiting_audit_copy(limit):
+            try:
+                receipt = json.loads(row["receipt_json"])
+            except json.JSONDecodeError:
+                log.error(
+                    "stored receipt is not valid JSON; skipping",
+                    extra={"fields": {"job_id": row["job_id"]}},
+                )
+                continue
+            seq = await self.publish(self.result_room, receipt)
+            if seq is not None:
+                self.ledger.set_audit_seq(str(row["job_id"]), seq)
+                landed += 1
+        return landed
 
     async def poll_mailbox_once(self, *, wait: int = 10) -> int:
         """One long-poll cycle. Returns how many messages were processed."""
@@ -312,6 +346,7 @@ class Node:
         while True:
             try:
                 await self.poll_mailbox_once()
+                await self.reconcile_audit_copies()
                 backoff = 1.0
             except RateLimited as exc:
                 log.warning(

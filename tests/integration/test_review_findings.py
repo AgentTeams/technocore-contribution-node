@@ -574,3 +574,55 @@ def test_the_technocore_adapter_produces_a_valid_receipt(tmp_path: Path) -> None
     assert not list(jsonschema.Draft202012Validator(RECEIPT_SCHEMA).iter_errors(annotated))
     assert receipt is not annotated, "annotation must not mutate the signed receipt"
     assert "network" not in receipt
+
+
+async def test_an_unpublished_audit_copy_is_recorded_as_owed_not_shrugged_off(
+    runner: JobRunner, ledger: Ledger
+) -> None:
+    """A receipt only the requester can see does not meet the contract.
+
+    The owned-room write can fail for reasons unrelated to the job — a rate limit, an
+    upstream at capacity — and when it did, the job was still marked complete and the
+    public copy was simply never written. Nothing recorded it, so nothing could retry it.
+    """
+    outcome = await runner.handle(
+        text=job_line(job_id="owed-000000001"),
+        requester_did=REQUESTER,
+        request_room="mb-test",
+        request_seq=1,
+    )
+    assert outcome is not None and outcome.receipt is not None
+
+    ledger.record_receipt(
+        outcome.receipt, json.dumps(outcome.receipt), 11, internal_test=False, audit_seq=None
+    )
+    assert ledger.audit_backlog() == 1
+    assert [r["job_id"] for r in ledger.receipts_awaiting_audit_copy()] == ["owed-000000001"]
+
+    ledger.set_audit_seq("owed-000000001", 42)
+    assert ledger.audit_backlog() == 0
+    assert ledger.receipts_awaiting_audit_copy() == []
+    assert ledger.get_receipt("owed-000000001")["audit_seq"] == 42
+
+
+async def test_an_internal_test_receipt_is_never_counted_as_owed(
+    runner: JobRunner, ledger: Ledger
+) -> None:
+    """It is deliberately not published to the owned room, so it is not a backlog item."""
+    outcome = await runner.handle(
+        text=job_line(job_id="internal-00001"),
+        requester_did=REQUESTER,
+        request_room="mb-test",
+        request_seq=1,
+        internal_test=True,
+    )
+    assert outcome is not None and outcome.receipt is not None
+    ledger.record_receipt(
+        outcome.receipt, json.dumps(outcome.receipt), 1, internal_test=True, audit_seq=None
+    )
+    assert ledger.audit_backlog() == 0
+
+
+def test_the_reconciler_is_bounded(ledger: Ledger) -> None:
+    """A backlog after an outage must not become a write storm on recovery."""
+    assert len(ledger.receipts_awaiting_audit_copy(limit=3)) <= 3

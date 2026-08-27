@@ -621,3 +621,81 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
         assert owned["messages"] == [], "an internal test must not appear as public work"
     finally:
         await node.aclose()
+
+
+async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
+    ledger: Ledger, provider_key: Ed25519PrivateKey, provider_did: str
+) -> None:
+    """The owned-room copy is owed, not best-effort.
+
+    Simulates the write failing exactly once — a rate limit, an upstream at capacity —
+    and asserts the receipt is recorded as owed and then actually published on the next
+    reconciliation pass, rather than the requester quietly holding the only copy.
+    """
+    from technocore_node.config import Settings
+    from technocore_node.crypto.keystore import Identity
+    from technocore_node.service.node import Node
+
+    settings = Settings(
+        identity_path=Path("/nonexistent"),
+        identity_passphrase_file=None,
+        state_dir=Path(ledger.path).parent,
+        db_path=Path(ledger.path),
+        bind_host="127.0.0.1",
+        bind_port=3020,
+        public_url="",
+        origin=ORIGIN,
+        mailbox_enabled=False,
+        watcher_enabled=False,
+        max_concurrent_jobs=2,
+        job_timeout_seconds=15,
+        requester_jobs_per_hour=60,
+        flop_testnet_enabled=False,
+    )
+    node = Node(
+        settings,
+        identity=Identity(private_key=provider_key, did=provider_did),
+        ledger=ledger,
+    )
+    try:
+        assert await node.client.claim_room(node.result_room) is True
+
+        real_publish = node.publish
+        failed_once = {"done": False}
+
+        async def publish_failing_the_owned_room_once(room: str, obj: dict[str, Any]):
+            if room == node.result_room and not failed_once["done"]:
+                failed_once["done"] = True
+                return None
+            return await real_publish(room, obj)
+
+        node.publish = publish_failing_the_owned_room_once  # type: ignore[method-assign]
+
+        requester_key = Ed25519PrivateKey.generate()
+        job_id = f"retried-{secrets.token_hex(5)}"
+        await node.process_message(
+            {
+                "from": didkey.encode_did(requester_key.public_key()),
+                "text": _job(job_id=job_id, reply_room=f"p-tcn-retry-{secrets.token_hex(8)}"),
+                "seq": 1,
+                "ts": "2026-08-28T00:00:00Z",
+                "nonce": 1,
+            }
+        )
+
+        assert failed_once["done"], "the owned-room write should have been attempted"
+        assert ledger.audit_backlog() == 1, "the public copy must be recorded as owed"
+        assert ledger.get_receipt(job_id)["audit_seq"] is None
+
+        node.publish = real_publish  # type: ignore[method-assign]
+        assert await node.reconcile_audit_copies() == 1
+        assert ledger.audit_backlog() == 0
+        assert ledger.get_receipt(job_id)["audit_seq"] is not None
+
+        owned = await node.client.read_room(node.result_room, limit=20)
+        published = [json.loads(m["text"]) for m in owned["messages"]]
+        matching = [r for r in published if r.get("job_id") == job_id]
+        assert len(matching) == 1, "exactly one copy, not zero and not a duplicate"
+        assert verify_receipt(matching[0]) == []
+    finally:
+        await node.aclose()

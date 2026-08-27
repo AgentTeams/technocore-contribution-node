@@ -93,7 +93,7 @@ work would accept it from an unauthenticated stranger with no key to attribute i
 | `GET /v1/schemas` | Wire schemas for job, claim, result, receipt |
 | `GET /v1/metrics` | Contribution metrics |
 | `GET /v1/protocol-status` | Upstream protocol drift |
-| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Published receipts |
+| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Published receipts, and whether each is publicly auditable yet |
 | `GET /openapi.json` | OpenAPI 3.1 |
 
 ### About the metrics

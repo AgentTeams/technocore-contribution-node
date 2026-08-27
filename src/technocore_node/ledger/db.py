@@ -83,6 +83,7 @@ class Ledger:
     _ADDED_COLUMNS = (
         ("results", "status", "TEXT NOT NULL DEFAULT 'ok'"),
         ("results", "summary_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("receipts", "audit_seq", "INTEGER"),
     )
 
     def _columns(self, table: str) -> set[str]:
@@ -377,13 +378,14 @@ class Ledger:
         receipt_json: str,
         technocore_seq: int | None,
         internal_test: bool,
+        audit_seq: int | None = None,
     ) -> None:
         with self.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO receipts (receipt_id, job_id, requester_did, "
                 "provider_did, request_hash, result_hash, provider_signature, receipt_hash, "
-                "receipt_json, technocore_seq, internal_test, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "receipt_json, technocore_seq, audit_seq, internal_test, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     receipt["receipt_id"],
                     receipt["job_id"],
@@ -399,10 +401,36 @@ class Ledger:
                     receipt["receipt_hash"],
                     receipt_json,
                     technocore_seq,
+                    audit_seq,
                     int(internal_test),
                     receipt["created_at"],
                 ),
             )
+
+    def set_audit_seq(self, job_id: str, audit_seq: int) -> None:
+        """Record that the auditable copy landed in the owned room."""
+        with self.tx() as conn:
+            conn.execute("UPDATE receipts SET audit_seq = ? WHERE job_id = ?", (audit_seq, job_id))
+
+    def receipts_awaiting_audit_copy(self, limit: int = 5) -> Sequence[sqlite3.Row]:
+        """Receipts whose owned-room copy is still owed, oldest first.
+
+        Bounded on purpose: this is drained a few at a time from the poll loop, so a
+        backlog after an outage cannot turn into a write storm against the upstream's
+        rate limit the moment the node recovers.
+        """
+        return self.conn.execute(
+            "SELECT job_id, receipt_json FROM receipts "
+            "WHERE audit_seq IS NULL AND internal_test = 0 "
+            "ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def audit_backlog(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM receipts WHERE audit_seq IS NULL AND internal_test = 0"
+        ).fetchone()
+        return int(row["n"])
 
     def get_receipt(self, job_id: str) -> sqlite3.Row | None:
         return _row(

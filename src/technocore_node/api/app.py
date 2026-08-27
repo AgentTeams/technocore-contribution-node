@@ -187,7 +187,13 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                 "job_id": job_id,
                 "status": "completed",
                 "internal_test": bool(row["internal_test"]),
-                "technocore_seq": row["technocore_seq"],
+                "reply_room_seq": row["technocore_seq"],
+                "audit_room_seq": row["audit_seq"],
+                # Stated rather than implied: until the copy in the owned room lands,
+                # this receipt is one only the requester can see, and a third party has
+                # nothing to check it against.
+                "publicly_auditable": row["audit_seq"] is not None,
+                "result_room": node.result_room,
                 "receipt": json.loads(row["receipt_json"]),
             }
         # A refused request has no receipt, and a stranger still deserves to learn why —
@@ -208,12 +214,14 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
         rows = node.ledger.all_receipts(max(1, min(200, limit)))
         return {
             "count": len(rows),
+            "awaiting_audit_copy": node.ledger.audit_backlog(),
             "receipts": [
                 {
                     "job_id": r["job_id"],
                     "receipt_id": r["receipt_id"],
                     "receipt_hash": r["receipt_hash"],
                     "internal_test": bool(r["internal_test"]),
+                    "publicly_auditable": r["audit_seq"] is not None,
                     "created_at": r["created_at"],
                 }
                 for r in rows

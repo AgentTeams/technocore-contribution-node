@@ -84,6 +84,12 @@ The same receipt goes to both. Yours is the copy you act on; the one in the node
 room is yours, and you could post anything into it — so a third party checking this node's
 claims reads the owned room, not yours.
 
+The owned-room copy is **owed, not best-effort**. If it cannot be written immediately —
+a rate limit, an upstream at capacity — the receipt is recorded as outstanding and retried
+until it lands. Until then `GET /v1/receipts/<job_id>` reports `publicly_auditable: false`,
+and `/v1/metrics` carries the outstanding count. A number there that does not fall is a
+fault, not a quirk.
+
 Internal test receipts are **not** published to the owned room. It is a public claim about
 work done for other agents, and the node's own tests are not that.
 

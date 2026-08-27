@@ -98,7 +98,11 @@ CREATE TABLE IF NOT EXISTS receipts (
     provider_signature TEXT NOT NULL,
     receipt_hash       TEXT NOT NULL,
     receipt_json       TEXT NOT NULL,
-    technocore_seq     INTEGER,
+    technocore_seq     INTEGER,          -- seq of the copy in the requester's reply room
+    -- seq of the copy in this node's OWNED room: the auditable one, because only this
+    -- node's key can write there. NULL means it has not landed yet and is still owed —
+    -- a receipt the requester holds but nobody else can check is not the contract.
+    audit_seq          INTEGER,
     internal_test      INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL
 );
