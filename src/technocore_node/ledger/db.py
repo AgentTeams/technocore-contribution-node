@@ -103,33 +103,46 @@ class Ledger:
         `PRAGMA table_info` rather than against a version number, so a database at any
         past shape converges — including one this code has never seen.
         """
-        retired = False
         for table, column in self._RETIRED_COLUMNS:
             if self._table_exists(table) and column in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-                retired = True
 
         for table, column, definition in self._ADDED_COLUMNS:
             if self._table_exists(table) and column not in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-        if retired:
-            # Dropping a column stops it being written or read; it does not remove the
-            # bytes already in the file, because SQLite keeps freed pages until they are
-            # reused. For a column that held strangers' payloads that is half a job, so
-            # the migration finishes it: VACUUM rewrites the database without them.
-            #
-            # Best effort by design. VACUUM needs room for a second copy, and a node that
-            # cannot start because it could not tidy up would be a worse outcome than one
-            # that starts and says so.
+        self._scrub_once()
+
+    #: Bumped when a one-off maintenance step must run against every existing database,
+    #: recorded in `PRAGMA user_version` so it runs exactly once per file.
+    _SCRUB_VERSION = 1
+
+    def _scrub_once(self) -> None:
+        """Rewrite the database once, to retire bytes a dropped column left behind.
+
+        Conditioning this on "did *this* startup drop a column" was the obvious thing and
+        the wrong one: a database upgraded by a build that dropped the columns but did not
+        vacuum would never qualify again, and that is exactly the file most likely to
+        still hold payloads. The marker is stored in the database instead, so the scrub
+        happens once per file regardless of which build did the dropping.
+
+        Best effort. VACUUM needs room for a second copy, and a node that refuses to start
+        because it could not tidy up would be a worse outcome than one that starts and
+        says so.
+        """
+        current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if current >= self._SCRUB_VERSION:
+            return
+        try:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            try:
-                self.conn.execute("VACUUM")
-            except sqlite3.OperationalError:
-                logging.getLogger(__name__).warning(
-                    "retired a payload column but could not VACUUM; the old bytes remain "
-                    "in the database file until it is vacuumed or replaced"
-                )
+            self.conn.execute("VACUUM")
+        except sqlite3.OperationalError:
+            logging.getLogger(__name__).warning(
+                "could not VACUUM the ledger; bytes from any retired payload column "
+                "remain in the database file until it is vacuumed or replaced"
+            )
+            return
+        self.conn.execute(f"PRAGMA user_version = {self._SCRUB_VERSION}")
 
     def integrity_ok(self) -> bool:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()

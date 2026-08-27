@@ -34,9 +34,18 @@ class StubContext:
         return []
 
 
-def _file_contains(path: Path, needle: str) -> bool:
-    """Read a temp file's bytes from sync code, so the async tests stay free of file IO."""
-    return needle.encode() in Path(path).read_bytes()
+def _database_contains(path: Path, needle: str) -> bool:
+    """True if `needle` appears anywhere in the database — main file, WAL or shm.
+
+    Checking only the main file would be the flattering version of this assertion: in WAL
+    mode a just-written value usually lives in `-wal` and has not reached `.db` yet, so a
+    main-file-only check can pass while the bytes are plainly on disk next to it.
+    """
+    base = Path(path)
+    for candidate in (base, base.with_name(base.name + "-wal"), base.with_name(base.name + "-shm")):
+        if candidate.exists() and needle.encode() in candidate.read_bytes():
+            return True
+    return False
 
 
 @pytest.fixture
@@ -86,7 +95,7 @@ async def test_no_request_or_result_text_is_ever_persisted(
         status="confirmed",
     )
 
-    assert not _file_contains(ledger.path, secret), "caller data reached the database file"
+    assert not _database_contains(ledger.path, secret), "caller data reached the database file"
 
 
 def test_the_schema_has_nowhere_to_put_a_payload(ledger: Ledger) -> None:
@@ -121,18 +130,16 @@ def test_an_older_database_has_its_payload_columns_dropped(tmp_path: Path) -> No
     )
     legacy.commit()
     legacy.close()
-    assert _file_contains(path, "a stranger's text")
+    assert _database_contains(path, "a stranger's text")
 
     reopened = Ledger(path)
     for table, column in (("messages", "normalized_text"), ("results", "result_summary")):
         names = {row[1] for row in reopened.conn.execute(f"PRAGMA table_info({table})").fetchall()}
         assert column not in names, f"{table}.{column} survived the migration"
 
-    # Readable through SQL is the property the migration actually delivers, and it is the
-    # one asserted. Dropping a column does NOT scrub the bytes already written into the
-    # file — freed pages keep their contents until reused or VACUUMed — so a database
-    # that ran the old build should be treated as still holding whatever it stored.
-    # docs/SECURITY.md says so rather than this test pretending otherwise.
+    # The column is gone from the schema. That the *bytes* also go is a separate
+    # property, asserted by test_retiring_a_payload_column_also_scrubs_the_file and by
+    # test_a_file_already_stripped_by_an_older_build_is_still_scrubbed.
     row = reopened.conn.execute("SELECT * FROM messages WHERE local_event_id = 'a'").fetchone()
     assert row is not None
     assert "normalized_text" not in set(row.keys())
@@ -393,10 +400,10 @@ def test_retiring_a_payload_column_also_scrubs_the_file(tmp_path: Path) -> None:
     )
     legacy.commit()
     legacy.close()
-    assert _file_contains(path, "a-strangers-private-payload-7c1f")
+    assert _database_contains(path, "a-strangers-private-payload-7c1f")
 
     Ledger(path).close()
-    assert not _file_contains(path, "a-strangers-private-payload-7c1f")
+    assert not _database_contains(path, "a-strangers-private-payload-7c1f")
 
 
 async def test_losing_the_insert_race_still_refuses_a_foreign_job_id(
@@ -458,3 +465,41 @@ def test_the_published_job_id_contract_says_globally_unique() -> None:
     description = JOB_SCHEMA["properties"]["job_id"]["description"]
     assert "GLOBALLY unique" in description
     assert "per requester" not in description
+
+
+def test_a_file_already_stripped_by_an_older_build_is_still_rewritten(tmp_path: Path) -> None:
+    """The database most likely to still hold payloads is the half-upgraded one.
+
+    Conditioning the rewrite on "did *this* startup drop a column" was the obvious rule
+    and the wrong one: a file whose columns an earlier build had already dropped would
+    never qualify again. The marker lives in the database instead, so the rewrite happens
+    once per file whichever build dropped the columns.
+
+    What is asserted is that the rewrite *runs* on such a file. Whether any bytes were
+    still there to remove depends on SQLite's page reuse — on 3.45 `DROP COLUMN` rewrites
+    the table and usually takes them with it — so this test does not claim otherwise.
+    """
+    path = tmp_path / "half-upgraded.db"
+    Ledger(path).close()
+
+    legacy = sqlite3.connect(path, isolation_level=None)
+    legacy.execute("ALTER TABLE messages ADD COLUMN normalized_text TEXT")
+    legacy.execute("ALTER TABLE messages DROP COLUMN normalized_text")
+    legacy.execute("PRAGMA user_version = 0")  # the state the older build left behind
+    legacy.close()
+
+    reopened = Ledger(path)
+    assert int(reopened.conn.execute("PRAGMA user_version").fetchone()[0]) == Ledger._SCRUB_VERSION
+    assert reopened.integrity_ok()
+    reopened.close()
+
+
+def test_the_scrub_runs_once_and_records_that_it_did(tmp_path: Path) -> None:
+    path = tmp_path / "once.db"
+    first = Ledger(path)
+    assert int(first.conn.execute("PRAGMA user_version").fetchone()[0]) == Ledger._SCRUB_VERSION
+    first.close()
+
+    reopened = Ledger(path)
+    assert int(reopened.conn.execute("PRAGMA user_version").fetchone()[0]) == Ledger._SCRUB_VERSION
+    assert reopened.integrity_ok()

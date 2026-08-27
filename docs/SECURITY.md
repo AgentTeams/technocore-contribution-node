@@ -63,12 +63,19 @@ reader. There is deliberately nowhere in the schema to put one, and
 `tests/integration/test_review_findings.py` asserts that a caller's string never reaches
 the database file.
 
-**Upgrading from a build that did store payloads:** the migration drops those columns, so
-nothing can be written to them or read from them again. It does **not** scrub bytes already
-in the file — SQLite keeps freed pages until they are reused or the database is `VACUUM`ed.
-A database that ran an earlier build should be treated as still holding whatever it stored.
-To retire it properly, `VACUUM` after upgrading, or start a fresh ledger; the receipts that
-matter are re-derivable from the published chain.
+**Upgrading from a build that did store payloads:** the migration drops those columns *and*
+rewrites the database once. On SQLite 3.35+ `DROP COLUMN` rewrites the table, which in
+practice takes the old rows with it — but that is page-reuse behaviour, not a guarantee,
+and freed pages can retain their contents. So the rewrite is belt and braces rather than
+the only thing standing between a stranger's payload and someone with the file. It is
+recorded in `PRAGMA user_version`, so it happens once per database whichever build dropped
+the columns, including a file already half-upgraded by an earlier version.
+
+It is best effort: `VACUUM` needs room for a second copy of the database, and a node that
+refused to start because it could not tidy up would be worse than one that starts and says
+so. If the warning `could not VACUUM the ledger` appears in the journal, the old bytes are
+still in the file — vacuum it manually or start a fresh ledger. Nothing verifiable is lost
+by starting fresh; the receipts that matter are re-derivable from the published chain.
 
 ## Reporting
 
