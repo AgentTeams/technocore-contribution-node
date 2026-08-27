@@ -1,0 +1,194 @@
+# Continuous integration.
+#
+# Two jobs. `checks` is everything that needs no network peer: lint, types, tests, audit,
+# secret scan, build metadata. `e2e` stands up a real instance of the upstream server —
+# pinned to the exact commit this implementation was verified against — and runs the live
+# suite against it on loopback.
+#
+# What this workflow deliberately does not do:
+#
+#   * It never writes to the public Technocore instance. The end-to-end suite is pointed at
+#     a local server and nothing else; a CI run that posted to a shared service would be
+#     spending somebody else's resources on every push.
+#   * It never handles a private key or a passphrase, and uploads no artifact that could
+#     contain one. The tests that need an identity generate a throwaway in a temp dir.
+#   * Every action is pinned to a commit SHA. A tag is a moving pointer, and "pinned to v4"
+#     means "whatever the owner of that tag decides tomorrow".
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The interpreter is pinned here and in .python-version so a local run and CI agree.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  checks:
+    name: lint, types, tests, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.1
+        with:
+          version: "0.9.5"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync from the lockfile
+        # --frozen fails rather than resolving: if uv.lock does not satisfy pyproject.toml,
+        # that is a defect to see here, not something to paper over by re-resolving.
+        run: uv sync --frozen --all-extras
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy (strict)
+        run: uv run mypy
+
+      - name: pytest (unit + integration)
+        # The live suite is skipped here; it has its own job with a server to talk to.
+        run: uv run pytest tests/unit tests/integration -q
+
+      - name: pip-audit
+        run: uv run pip-audit --progress-spinner off
+
+      - name: Secret scan
+        run: python3 scripts/secret_scan.py
+
+      - name: Build the package and check its metadata
+        run: |
+          uv build
+          uv run --with twine twine check dist/*
+          ls -la dist/
+
+      - name: Working tree is clean
+        # Nothing above may modify a tracked file. A formatter that rewrites source, or a
+        # build that drops a generated file into the tree, shows up here rather than in
+        # somebody's next diff.
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)" || {
+            echo "::error::the working tree was modified by a CI step (see above)"
+            exit 1
+          }
+
+  e2e:
+    name: end-to-end against a pinned upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.1
+        with:
+          version: "0.9.5"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync from the lockfile
+        run: uv sync --frozen --all-extras
+
+      - name: Read the upstream commit this implementation was verified against
+        id: pin
+        # Taken from proof/protocol-snapshot.json rather than written here, so the server
+        # CI tests against and the specification the code was built from cannot drift
+        # apart silently.
+        run: |
+          commit=$(python3 -c "import json;print(json.load(open('proof/protocol-snapshot.json'))['upstream_commit'])")
+          repo=$(python3 -c "import json;print(json.load(open('proof/protocol-snapshot.json'))['upstream_repo'])")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "pinned to $repo @ $commit"
+
+      - name: Fetch the upstream server at that commit
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            "${{ steps.pin.outputs.repo }}" "$RUNNER_TEMP/tc-upstream"
+          git -C "$RUNNER_TEMP/tc-upstream" checkout --detach "${{ steps.pin.outputs.commit }}"
+          test "$(git -C "$RUNNER_TEMP/tc-upstream" rev-parse HEAD)" = "${{ steps.pin.outputs.commit }}"
+
+      - name: Start it on loopback
+        # The three raised limits are why this needs its own instance: a default one allows
+        # 20 new rooms per IP per day, and the suite opens a fresh room per test so that no
+        # two tests can contaminate each other.
+        run: |
+          cd "$RUNNER_TEMP/tc-upstream"
+          uv sync
+          mkdir -p "$RUNNER_TEMP/tc-data"
+          CHAT_ROOT="$RUNNER_TEMP/tc-data" \
+          CHAT_RATE_WRITE=6000 CHAT_RATE_READ=6000 CHAT_RATE_ROOMS_PER_DAY=2000 \
+            .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8080 --app-dir src \
+            > "$RUNNER_TEMP/tc-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/tc-server.pid"
+
+      - name: Wait for it to answer
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "upstream ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the upstream server did not become ready"
+          cat "$RUNNER_TEMP/tc-server.log" || true
+          exit 1
+
+      - name: Confirm it is the expected version
+        run: |
+          version=$(curl -fsS http://127.0.0.1:8080/.well-known/agent.json \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['version'])")
+          expected=$(python3 -c "import json;print(json.load(open('proof/protocol-snapshot.json'))['service_version'])")
+          echo "running $version, snapshot records $expected"
+          test "$version" = "$expected"
+
+      - name: Run the live suite
+        env:
+          # The only origin the suite is given. It cannot reach the public instance.
+          TCN_E2E_ORIGIN: http://127.0.0.1:8080
+        run: uv run pytest tests/e2e -v
+
+      - name: Stop the upstream server
+        # `always()` so the server is torn down even when the suite fails or the job is
+        # cancelled — a leaked process would hold the runner's port and its disk.
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/tc-server.pid" ]; then
+            pid=$(cat "$RUNNER_TEMP/tc-server.pid")
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            kill -9 "$pid" 2>/dev/null || true
+            echo "stopped $pid"
+          fi
+          rm -rf "$RUNNER_TEMP/tc-data"
+
+      - name: Upstream server log on failure
+        # Printed into the job log rather than uploaded. It is only the pinned upstream's
+        # own request log, but an artifact is a file that outlives the run and this
+        # workflow uploads none.
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/tc-server.log" || true
