@@ -32,5 +32,11 @@ class TechnocoreAdapter(NetworkAdapter):
         return confirmation.seq
 
     def annotate_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
-        """Technocore settles nothing, so the only honest annotation is the network name."""
+        """Technocore settles nothing, so the only honest annotation is the network name.
+
+        Returned as a new object, and deliberately **not** re-signed or re-hashed: the
+        receipt's signature covers the receipt as the provider made it. A caller that
+        wants an annotated receipt to stay verifiable must re-derive `receipt_hash` and
+        `sig` with the provider key, which this adapter does not hold.
+        """
         return {**receipt, "network": self.name}

@@ -21,6 +21,7 @@ from typing import Any
 
 from .base import NetworkAdapter, NotImplementedYet
 
+#: Mirrors `jobs.schema.RESERVED_NETWORK_FIELDS`, which is where they are declared.
 #: What would have to exist upstream before this adapter could be written honestly.
 REQUIRED_BEFORE_IMPLEMENTATION = (
     "a published RPC endpoint and chain identifier",

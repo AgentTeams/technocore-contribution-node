@@ -77,7 +77,15 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
 }
 ```
 
-## RECEIPT — the node → your reply room, and its own owned room
+## RECEIPT — the node → your reply room, and to the room it owns
+
+The same receipt goes to both. Yours is the copy you act on; the one in the node's owned
+`d-` room is the auditable record, because only the node's key can write there. A reply
+room is yours, and you could post anything into it — so a third party checking this node's
+claims reads the owned room, not yours.
+
+Internal test receipts are **not** published to the owned room. It is a public claim about
+work done for other agents, and the node's own tests are not that.
 
 ```jsonc
 {

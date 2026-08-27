@@ -503,3 +503,74 @@ def test_the_scrub_runs_once_and_records_that_it_did(tmp_path: Path) -> None:
     reopened = Ledger(path)
     assert int(reopened.conn.execute("PRAGMA user_version").fetchone()[0]) == Ledger._SCRUB_VERSION
     assert reopened.integrity_ok()
+
+
+def test_the_reserved_network_fields_are_declared_not_merely_described(tmp_path: Path) -> None:
+    """`additionalProperties: false` means a documented-but-undeclared field is refused.
+
+    The docs promised six optional settlement fields and the schema declared none, so the
+    adapter written against the documented contract produced receipts invalid under it. A
+    reservation the schema rejects is not a reservation.
+    """
+    import jsonschema
+
+    from technocore_node.jobs.schema import RECEIPT_SCHEMA, RESERVED_NETWORK_FIELDS
+
+    for field in RESERVED_NETWORK_FIELDS:
+        assert field in RECEIPT_SCHEMA["properties"], field
+
+    receipt = {
+        "v": "1",
+        "type": "receipt",
+        "receipt_id": "rcpt-abcdef123456",
+        "job_id": "job-abcdef12",
+        "requester_did": REQUESTER,
+        "provider_did": OTHER,
+        "request_hash": "sha256:" + "0" * 64,
+        "result_hash": "sha256:" + "1" * 64,
+        "internal_test": False,
+        "created_at": "2026-08-28T00:00:00Z",
+        "receipt_hash": "sha256:" + "2" * 64,
+        "sig": "a" * 86,
+    }
+    validator = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
+    assert not list(validator.iter_errors(receipt))
+
+    annotated = {
+        **receipt,
+        "network": "technocore",
+        "tx_hash": "0x" + "a" * 64,
+        "block_number": 1234,
+        "testnet_job_id": "tn-1",
+        "compute_units": 2.5,
+        "verifier_did": OTHER,
+    }
+    assert not list(validator.iter_errors(annotated)), "an annotated receipt must validate"
+
+
+def test_the_technocore_adapter_produces_a_valid_receipt(tmp_path: Path) -> None:
+    """The adapter and the schema have to agree, or the seam is decorative."""
+    import jsonschema
+
+    from technocore_node.jobs.schema import RECEIPT_SCHEMA
+    from technocore_node.testnet.technocore import TechnocoreAdapter
+
+    receipt = {
+        "v": "1",
+        "type": "receipt",
+        "receipt_id": "rcpt-abcdef123456",
+        "job_id": "job-abcdef12",
+        "requester_did": REQUESTER,
+        "provider_did": OTHER,
+        "request_hash": "sha256:" + "0" * 64,
+        "result_hash": "sha256:" + "1" * 64,
+        "internal_test": False,
+        "created_at": "2026-08-28T00:00:00Z",
+        "receipt_hash": "sha256:" + "2" * 64,
+        "sig": "a" * 86,
+    }
+    annotated = TechnocoreAdapter.annotate_receipt(object.__new__(TechnocoreAdapter), receipt)
+    assert annotated["network"] == "technocore"
+    assert not list(jsonschema.Draft202012Validator(RECEIPT_SCHEMA).iter_errors(annotated))
+    assert receipt is not annotated, "annotation must not mutate the signed receipt"
+    assert "network" not in receipt

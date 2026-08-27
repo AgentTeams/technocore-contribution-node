@@ -262,6 +262,19 @@ class Node:
                 receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
             )
             published_seq = await self.publish(outcome.reply_room, receipt)
+
+            # The same receipt also goes to the room this node owns, where only its key
+            # can write. That is the difference between "the requester has a receipt" and
+            # "anyone can audit what this node did" — the reply room is the requester's,
+            # and they can post anything they like into it. A third party checking this
+            # node's claims needs a record the node cannot repudiate and nobody else can
+            # forge, and the owned room is the only place that exists.
+            #
+            # Internal tests are excluded. The owned room is a public claim about work
+            # done for other agents, and this node's own tests are not that.
+            if not outcome.internal_test:
+                await self.publish(self.result_room, receipt)
+
             self.ledger.record_receipt(receipt, receipt_json, published_seq, outcome.internal_test)
 
         log.info(

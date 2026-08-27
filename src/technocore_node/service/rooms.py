@@ -25,5 +25,11 @@ def mailbox_room(did: str, *, suffix: str = "") -> str:
 
 
 def result_room(did: str, *, suffix: str = "") -> str:
-    """This node's owned result room, where receipts and releases are published."""
+    """This node's owned result room.
+
+    Every non-test receipt is published here as well as to the requester's reply room,
+    along with the profile attestation and release notices. Only this node's key can write
+    to it, which is what makes it an auditable record rather than a claim: a reply room
+    belongs to the requester, who can post whatever they like into it.
+    """
     return f"{RESULT_ROOM_PREFIX}{short_fingerprint(did)}{suffix}"

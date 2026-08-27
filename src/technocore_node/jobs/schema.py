@@ -188,8 +188,33 @@ RECEIPT_SCHEMA: Final[dict[str, Any]] = {
         "created_at": {"type": "string", "pattern": TIMESTAMP_PATTERN},
         "receipt_hash": {"type": "string", "pattern": HASH_PATTERN},
         "sig": {"type": "string", "pattern": f"^{SIG_PATTERN}$"},
+        # Reserved for a settlement network. Declared rather than merely described,
+        # because `additionalProperties: false` means an undeclared field is refused —
+        # a reservation the schema rejects is not a reservation, and the adapter that
+        # was written against the documented one produced receipts invalid under it.
+        #
+        # Each is populated only from a value a network actually returned. An adapter
+        # that cannot observe a field leaves it absent: a receipt carrying an invented
+        # block height is a forged receipt, however well meant. See
+        # docs/TESTNET_ADAPTER.md.
+        "network": {"type": "string", "maxLength": 48},
+        "tx_hash": {"type": "string", "maxLength": 128},
+        "block_number": {"type": "integer", "minimum": 0},
+        "testnet_job_id": {"type": "string", "maxLength": 128},
+        "compute_units": {"type": "number", "minimum": 0},
+        "verifier_did": {"type": "string", "pattern": f"^{DID_PATTERN}$"},
     },
 }
+
+#: The optional settlement fields, named once so schema, adapters and docs agree.
+RESERVED_NETWORK_FIELDS: Final = (
+    "network",
+    "tx_hash",
+    "block_number",
+    "testnet_job_id",
+    "compute_units",
+    "verifier_did",
+)
 
 #: Per-task input schemas. Absent from this map means the task takes no input at all.
 TASK_INPUT_SCHEMAS: Final[dict[str, dict[str, Any]]] = {

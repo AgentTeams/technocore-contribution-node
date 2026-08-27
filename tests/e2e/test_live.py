@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -503,3 +504,120 @@ async def test_23_a_duplicate_text_is_refused_without_a_retry_storm(
             refused = True
             break
     assert refused, "the duplicate filter should have refused a repeated text"
+
+
+async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
+    ledger: Ledger, provider_key: Ed25519PrivateKey, provider_did: str
+) -> None:
+    """The auditable copy is the one in the room only this node can write to.
+
+    A reply room belongs to the requester, who can post whatever they like into it, so a
+    third party checking this node's claims has to read the owned room instead. This
+    asserts the copy is actually there — and that an intruder cannot put one beside it.
+    """
+    from technocore_node.config import Settings
+    from technocore_node.crypto.keystore import Identity
+    from technocore_node.service.node import Node
+
+    settings = Settings(
+        identity_path=Path("/nonexistent"),
+        identity_passphrase_file=None,
+        state_dir=Path(ledger.path).parent,
+        db_path=Path(ledger.path),
+        bind_host="127.0.0.1",
+        bind_port=3020,
+        public_url="",
+        origin=ORIGIN,
+        mailbox_enabled=False,
+        watcher_enabled=False,
+        max_concurrent_jobs=2,
+        job_timeout_seconds=15,
+        requester_jobs_per_hour=60,
+        flop_testnet_enabled=False,
+    )
+    node = Node(
+        settings,
+        identity=Identity(private_key=provider_key, did=provider_did),
+        ledger=ledger,
+    )
+    try:
+        assert await node.client.claim_room(node.result_room) is True
+
+        requester_key = Ed25519PrivateKey.generate()
+        requester_did = didkey.encode_did(requester_key.public_key())
+        reply_room = f"p-tcn-owned-{secrets.token_hex(8)}"
+        job_id = f"owned-{secrets.token_hex(6)}"
+
+        await node.process_message(
+            {
+                "from": requester_did,
+                "text": _job(job_id=job_id, reply_room=reply_room),
+                "seq": 1,
+                "ts": "2026-08-28T00:00:00Z",
+                "nonce": 1,
+            }
+        )
+
+        owned = await node.client.read_room(node.result_room, limit=20)
+        kinds = [json.loads(m["text"])["type"] for m in owned["messages"]]
+        assert "receipt" in kinds, f"no receipt in the owned room: {kinds}"
+
+        published = json.loads(owned["messages"][-1]["text"])
+        assert published["job_id"] == job_id
+        assert verify_receipt(published) == []
+        assert all(m["from"] == provider_did for m in owned["messages"]), (
+            "only the owner's key may have written here"
+        )
+
+        reply = await node.client.read_room(reply_room, limit=20)
+        assert "receipt" in [json.loads(m["text"])["type"] for m in reply["messages"]]
+    finally:
+        await node.aclose()
+
+
+async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
+    ledger: Ledger, provider_key: Ed25519PrivateKey, provider_did: str
+) -> None:
+    """The owned room is a public claim about work done for other agents."""
+    from technocore_node.config import Settings
+    from technocore_node.crypto.keystore import Identity
+    from technocore_node.service.node import Node
+
+    settings = Settings(
+        identity_path=Path("/nonexistent"),
+        identity_passphrase_file=None,
+        state_dir=Path(ledger.path).parent,
+        db_path=Path(ledger.path),
+        bind_host="127.0.0.1",
+        bind_port=3020,
+        public_url="",
+        origin=ORIGIN,
+        mailbox_enabled=False,
+        watcher_enabled=False,
+        max_concurrent_jobs=2,
+        job_timeout_seconds=15,
+        requester_jobs_per_hour=60,
+        flop_testnet_enabled=False,
+    )
+    node = Node(
+        settings,
+        identity=Identity(private_key=provider_key, did=provider_did),
+        ledger=ledger,
+    )
+    try:
+        await node.client.claim_room(node.result_room)
+        requester_key = Ed25519PrivateKey.generate()
+        await node.process_message(
+            {
+                "from": didkey.encode_did(requester_key.public_key()),
+                "text": _job(reply_room=f"p-tcn-int-{secrets.token_hex(8)}"),
+                "seq": 1,
+                "ts": "2026-08-28T00:00:00Z",
+                "nonce": 1,
+            },
+            internal_test=True,
+        )
+        owned = await node.client.read_room(node.result_room, limit=20)
+        assert owned["messages"] == [], "an internal test must not appear as public work"
+    finally:
+        await node.aclose()
