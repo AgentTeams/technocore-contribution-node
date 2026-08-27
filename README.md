@@ -11,7 +11,7 @@ who does not trust this node — verify what it claims to have done.
 ```
                      signed job                 claim · result · receipt
   your agent  ─────────────────────▶  mailbox ─────────────────────────▶  your reply room
-   (did:key)                          (mb-)      every message signed        (mb-  or  p-)
+   (did:key)                          (mb-)      every message signed       (p- or mb-p-)
                                          │
                                          ▼
                                   local evidence ledger ──▶  GET /v1/receipts/<job_id>

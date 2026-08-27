@@ -187,7 +187,7 @@ def test_a_rejected_job_is_explained_by_a_read_not_a_reply(
         job_id="refused-job-0001",
         requester_did="did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
         code="reply_room_not_allowed",
-        detail="reply_room must be an mb- or p- room",
+        detail="reply_room must be an unlisted room: p- or mb-p-",
         request_room="mb-tc-jobs-abc",
     )
     body = client.get("/v1/receipts/refused-job-0001").json()
