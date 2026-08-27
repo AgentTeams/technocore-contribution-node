@@ -665,6 +665,7 @@ def test_a_receipt_already_in_the_owned_room_is_not_published_again(ledger: Ledg
     receipt it had ever published.
     """
     receipt = {
+        "type": "receipt",
         "receipt_id": "rcpt-abcdef123456",
         "job_id": "already-0000001",
         "requester_did": REQUESTER,
@@ -693,13 +694,14 @@ def test_a_receipt_already_in_the_owned_room_is_not_published_again(ledger: Ledg
     assert ledger.audit_backlog()["owed"] == 1
 
     # What sync_owned_room does after reading the room back.
-    assert ledger.mark_published_by_job_ids({"already-0000001": 77}) == 1
+    observed = {"already-0000001": (77, str(receipt["receipt_hash"]))}
+    assert ledger.mark_published(observed) == 1
     assert ledger.audit_backlog()["owed"] == 0
     assert ledger.get_receipt("already-0000001")["audit_seq"] == 77
     assert ledger.receipts_awaiting_audit_copy() == []
 
     # Idempotent: seeing it again changes nothing.
-    assert ledger.mark_published_by_job_ids({"already-0000001": 77}) == 0
+    assert ledger.mark_published(observed) == 0
 
 
 def test_a_receipt_that_never_publishes_is_quarantined_not_left_blocking(
@@ -785,3 +787,126 @@ def test_the_queue_tries_the_least_failed_receipt_first(ledger: Ledger) -> None:
         "order-0000000001",
         "order-0000000000",
     ]
+
+
+# ------------------------------ the audit copy must not be re-announced
+
+
+def _receipt(job_id: str, receipt_hash: str = "sha256:" + "2" * 64) -> dict[str, object]:
+    return {
+        "v": "1",
+        "type": "receipt",
+        "receipt_id": f"rcpt-{job_id[:12]:>012}",
+        "job_id": job_id,
+        "requester_did": REQUESTER,
+        "provider_did": OTHER,
+        "request_hash": "sha256:" + "0" * 64,
+        "result_hash": "sha256:" + "1" * 64,
+        "provider_signature": "b" * 86,
+        "internal_test": False,
+        "receipt_hash": receipt_hash,
+        "sig": "a" * 86,
+        "created_at": "2026-08-28T00:00:00Z",
+    }
+
+
+def _with_job(ledger: Ledger, job_id: str) -> None:
+    ledger.insert_job(
+        job_id=job_id,
+        protocol_version="1",
+        requester_did=REQUESTER,
+        provider_did=OTHER,
+        request_room="mb-x",
+        reply_room="mb-p-y",
+        request_seq=1,
+        request_hash="sha256:" + "0" * 64,
+        task_type="canonical_json_sha256",
+        status="completed",
+        internal_test=False,
+    )
+
+
+def test_a_migrated_database_does_not_re_announce_what_it_already_published(
+    tmp_path: Path,
+) -> None:
+    """`ADD COLUMN ... DEFAULT 'owed'` writes that default into every existing row.
+
+    Including receipts an earlier build had already published and recorded an audit_seq
+    for — so the first reconciliation pass would have announced a whole ledger's worth of
+    them again. The column that says which ones those are is right there, so it is asked.
+    """
+    path = tmp_path / "migrated.db"
+    ledger = Ledger(path)
+    _with_job(ledger, "published-0001")
+    _with_job(ledger, "stillowed-0001")
+    ledger.record_receipt(_receipt("published-0001"), json.dumps(_receipt("published-0001")), False)
+    ledger.record_receipt(_receipt("stillowed-0001"), json.dumps(_receipt("stillowed-0001")), False)
+    ledger.set_audit_seq("published-0001", 5)
+
+    # Rewind to what the older build's migration produced: the state column absent, so
+    # reopening re-adds it with its default for every row.
+    ledger.conn.execute("ALTER TABLE receipts DROP COLUMN audit_state")
+    ledger.close()
+
+    reopened = Ledger(path)
+    assert reopened.audit_backlog() == {"owed": 1, "quarantined": 0, "published": 1}
+    assert [r["job_id"] for r in reopened.receipts_awaiting_audit_copy()] == ["stillowed-0001"]
+
+
+def test_a_row_with_an_audit_seq_is_never_queued(tmp_path: Path) -> None:
+    """Two ways of saying published, and either one must keep a row out of the queue."""
+    ledger = Ledger(tmp_path / "belt.db")
+    _with_job(ledger, "seqonly-000001")
+    ledger.record_receipt(_receipt("seqonly-000001"), json.dumps(_receipt("seqonly-000001")), False)
+    with ledger.tx() as conn:
+        conn.execute("UPDATE receipts SET audit_seq = 9 WHERE job_id = 'seqonly-000001'")
+    assert ledger.receipts_awaiting_audit_copy() == []
+
+
+def test_sync_matches_the_receipt_not_merely_the_job_id(ledger: Ledger) -> None:
+    """`publicly_auditable` is the claim that must not be taken on faith.
+
+    Matching on job_id alone would let any message this key ever wrote carrying that id
+    mark a *different* receipt as publicly auditable.
+    """
+    _with_job(ledger, "matched-0000001")
+    stored = _receipt("matched-0000001", receipt_hash="sha256:" + "a" * 64)
+    ledger.record_receipt(stored, json.dumps(stored), False)
+
+    # A message with the right job_id but a different receipt changes nothing.
+    assert ledger.mark_published({"matched-0000001": (3, "sha256:" + "f" * 64)}) == 0
+    assert ledger.audit_backlog()["owed"] == 1
+
+    assert ledger.mark_published({"matched-0000001": (3, "sha256:" + "a" * 64)}) == 1
+    assert ledger.audit_backlog()["owed"] == 0
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("not json at all", "not valid JSON"),
+        ("[]", "not an object"),
+        ('"a string"', "not an object"),
+        ("{}", "not a receipt"),
+        ('{"type":"result","job_id":"bad-0000000001"}', "not a receipt"),
+        ('{"type":"receipt","job_id":"someone-else","receipt_hash":"x"}', "different job_id"),
+    ],
+)
+def test_a_stored_row_that_is_not_a_receipt_is_quarantined(stored: str, expected: str) -> None:
+    """Checking only that the JSON parses let `{}`, `[]` and `"text"` through — each
+    either posted into the audit room as something that is not a receipt, or raised
+    inside the publisher without ever counting as an attempt."""
+    from technocore_node.service.node import _unpublishable
+
+    problem = _unpublishable(stored, "bad-0000000001", "sha256:" + "2" * 64)
+    assert problem is not None
+    assert expected in problem
+
+
+def test_a_well_formed_receipt_is_publishable() -> None:
+    from technocore_node.service.node import _unpublishable
+
+    receipt = _receipt("good-0000000001")
+    assert (
+        _unpublishable(json.dumps(receipt), "good-0000000001", str(receipt["receipt_hash"])) is None
+    )

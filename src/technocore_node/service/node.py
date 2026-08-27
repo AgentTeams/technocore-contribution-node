@@ -18,10 +18,13 @@ import asyncio
 import json
 from typing import Any
 
+import jsonschema
+
 from ..config import Settings
 from ..crypto import didkey
 from ..crypto.keystore import Identity, load
 from ..jobs.runner import JobRunner, RejectedJob
+from ..jobs.schema import RECEIPT_SCHEMA
 from ..ledger.db import Ledger, utcnow
 from ..logging import get_logger
 from ..protocol.client import (
@@ -36,6 +39,8 @@ from .rooms import mailbox_room, result_room
 from .watcher import ProtocolWatcher
 
 log = get_logger(__name__)
+
+_RECEIPT_VALIDATOR = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
 
 
 class NodeContext:
@@ -327,7 +332,24 @@ class Node:
             # Neither is a reason to fail a job; the next pass tries again.
             return 0
 
-        seq_by_job: dict[str, int] = {}
+        first_seq = data.get("first_seq")
+        if since and first_seq is not None and int(first_seq) > since + 1:
+            # The room is a ring and it dropped messages we never read. Anything lost is
+            # genuinely no longer in the room, so republishing it restores the audit
+            # record rather than duplicating it — but an operator should know the gap
+            # happened, because it means the room is turning over faster than we read it.
+            log.warning(
+                "owned room dropped messages before they were read",
+                extra={
+                    "fields": {
+                        "room": self.result_room,
+                        "since": since,
+                        "first_seq": int(first_seq),
+                    }
+                },
+            )
+
+        observed: dict[str, tuple[int, str]] = {}
         for message in data.get("messages", []):
             if message.get("from") != self.did:
                 continue
@@ -335,12 +357,16 @@ class Node:
                 published = json.loads(str(message.get("text", "")))
             except json.JSONDecodeError:
                 continue
-            if isinstance(published, dict) and published.get("type") == "receipt":
-                job_id = published.get("job_id")
-                if isinstance(job_id, str):
-                    seq_by_job[job_id] = int(message.get("seq", 0))
+            if not isinstance(published, dict) or published.get("type") != "receipt":
+                continue
+            job_id = published.get("job_id")
+            receipt_hash = published.get("receipt_hash")
+            # Both, and matched against the stored row: the job_id alone would let any
+            # message carrying that id mark a different receipt publicly auditable.
+            if isinstance(job_id, str) and isinstance(receipt_hash, str):
+                observed[job_id] = (int(message.get("seq", 0)), receipt_hash)
 
-        marked = self.ledger.mark_published_by_job_ids(seq_by_job)
+        marked = self.ledger.mark_published(observed)
         last_seq = data.get("last_seq")
         if last_seq is not None:
             self.ledger.set_cursor(self.result_room, int(last_seq))
@@ -358,16 +384,18 @@ class Node:
         landed = 0
         for row in self.ledger.receipts_awaiting_audit_copy(limit):
             job_id = str(row["job_id"])
-            try:
-                receipt = json.loads(row["receipt_json"])
-            except json.JSONDecodeError:
-                # No number of retries will fix this one, so it leaves the queue now
-                # rather than occupying a slot in it forever.
-                self.ledger.quarantine_receipt(job_id, "stored receipt is not valid JSON")
+            problem = _unpublishable(row["receipt_json"], job_id, str(row["receipt_hash"]))
+            if problem is not None:
+                # No number of retries fixes a stored row that is not a receipt, so it
+                # leaves the queue now rather than occupying a slot in it forever — or,
+                # worse, being posted into the audit room as whatever it actually is.
+                self.ledger.quarantine_receipt(job_id, problem)
                 log.error(
-                    "quarantined an unparseable receipt", extra={"fields": {"job_id": job_id}}
+                    "quarantined an unpublishable receipt",
+                    extra={"fields": {"job_id": job_id, "problem": problem}},
                 )
                 continue
+            receipt = json.loads(row["receipt_json"])
             if await self.publish_audit_copy(job_id, receipt) is not None:
                 landed += 1
         return landed
@@ -416,6 +444,32 @@ class Node:
             self._tasks.append(asyncio.create_task(self.run_mailbox(), name="mailbox"))
         if self.settings.watcher_enabled:
             self._tasks.append(asyncio.create_task(self.watcher.run_forever(), name="watcher"))
+
+
+def _unpublishable(receipt_json: Any, job_id: str, receipt_hash: str) -> str | None:
+    """Why this stored row must not be published, or None if it is fine to publish.
+
+    Checking only that the JSON parses was not enough: `{}`, `[]` and `"text"` all parse,
+    and each would either be posted into the audit room as something that is not a
+    receipt, or raise inside the publisher and stall the queue without ever counting as
+    an attempt.
+    """
+    try:
+        parsed = json.loads(str(receipt_json))
+    except json.JSONDecodeError:
+        return "stored receipt is not valid JSON"
+    if not isinstance(parsed, dict):
+        return f"stored receipt is a {type(parsed).__name__}, not an object"
+    if parsed.get("type") != "receipt":
+        return "stored value is not a receipt"
+    if parsed.get("job_id") != job_id:
+        return "stored receipt names a different job_id"
+    if parsed.get("receipt_hash") != receipt_hash:
+        return "stored receipt does not match its recorded hash"
+    errors = list(_RECEIPT_VALIDATOR.iter_errors(parsed))
+    if errors:
+        return f"stored receipt fails its own schema: {errors[0].message}"[:200]
+    return None
 
 
 def _sha(text: str) -> str:

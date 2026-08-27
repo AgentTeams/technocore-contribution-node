@@ -115,7 +115,26 @@ class Ledger:
             if self._table_exists(table) and column not in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+        self._backfill_audit_state()
         self._scrub_once()
+
+    def _backfill_audit_state(self) -> None:
+        """Derive `audit_state` for rows that predate it.
+
+        `ADD COLUMN ... DEFAULT 'owed'` writes that default into every existing row,
+        including receipts an earlier build had already published and recorded an
+        `audit_seq` for. Left alone, the first reconciliation pass would treat a whole
+        ledger's worth of published receipts as outstanding and announce them all again.
+        The column's own `audit_seq` says which ones those are, so it is asked.
+        """
+        if not self._table_exists("receipts"):
+            return
+        if "audit_state" not in self._columns("receipts"):
+            return
+        self.conn.execute(
+            "UPDATE receipts SET audit_state = 'published' "
+            "WHERE audit_state = 'owed' AND (audit_seq IS NOT NULL OR internal_test = 1)"
+        )
 
     #: Bumped when a one-off maintenance step must run against every existing database,
     #: recorded in `PRAGMA user_version` so it runs exactly once per file.
@@ -467,8 +486,10 @@ class Ledger:
         that has already failed twice.
         """
         return self.conn.execute(
-            "SELECT job_id, receipt_json, audit_attempts FROM receipts "
-            "WHERE audit_state = 'owed' AND internal_test = 0 "
+            "SELECT job_id, receipt_json, receipt_hash, audit_attempts FROM receipts "
+            # `audit_seq IS NULL` as well as the state: two ways of saying published, and
+            # a row that satisfies either must never be announced a second time.
+            "WHERE audit_state = 'owed' AND audit_seq IS NULL AND internal_test = 0 "
             "ORDER BY audit_attempts, created_at LIMIT ?",
             (limit,),
         ).fetchall()
@@ -485,23 +506,24 @@ class Ledger:
             "published": counts.get("published", 0),
         }
 
-    def mark_published_by_job_ids(self, seq_by_job: dict[str, int]) -> int:
+    def mark_published(self, observed: dict[str, tuple[int, str]]) -> int:
         """Fill in `audit_seq` for receipts observed in the owned room.
 
-        This is what makes republishing safe after a crash, and what stops a database
-        migrated from an older build from re-announcing everything it already published:
-        the room is the authority on what is in it, so it is read before anything is
-        written to it again.
+        `observed` maps job_id to `(seq, receipt_hash)`. The hash has to match the stored
+        row: matching on `job_id` alone would let any message this key ever wrote that
+        happened to carry the same id mark a *different* receipt as publicly auditable —
+        and "publicly auditable" is precisely the claim that must not be taken on faith.
         """
-        if not seq_by_job:
+        if not observed:
             return 0
         updated = 0
         with self.tx() as conn:
-            for job_id, seq in seq_by_job.items():
+            for job_id, (seq, receipt_hash) in observed.items():
                 cur = conn.execute(
                     "UPDATE receipts SET audit_seq = ?, audit_state = 'published', "
-                    "audit_error = NULL WHERE job_id = ? AND audit_state != 'published'",
-                    (seq, job_id),
+                    "audit_error = NULL "
+                    "WHERE job_id = ? AND receipt_hash = ? AND audit_state != 'published'",
+                    (seq, job_id, receipt_hash),
                 )
                 updated += cur.rowcount
         return updated

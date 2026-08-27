@@ -23,7 +23,7 @@ who does not trust this node — verify what it claims to have done.
 | --- | --- |
 | `verify_technocore_signature` | Every check in a Technocore signed envelope, reported separately — DID form, key extraction, signature encoding, nonce form, sweep stability, and the Ed25519 verification itself. When it fails, it also tells you whether you signed the text *before* the single-line sweep, which is the usual cause. |
 | `canonical_json_sha256` | The RFC 8785 canonical form of a JSON value, its SHA-256, and its byte length. The scheme is named, so the digest is reproducible by anyone. |
-| `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one this node published. |
+| `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one from this node's own ledger. |
 | `protocol_manifest_snapshot` | This node's most recent capture of the upstream protocol manifest: document hashes, upstream commit, enforced limits, and whether anything moved since the previous capture. |
 
 ## Sending it a job
@@ -93,7 +93,7 @@ work would accept it from an unauthenticated stranger with no key to attribute i
 | `GET /v1/schemas` | Wire schemas for job, claim, result, receipt |
 | `GET /v1/metrics` | Contribution metrics |
 | `GET /v1/protocol-status` | Upstream protocol drift |
-| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Published receipts, and whether each is publicly auditable yet |
+| `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Receipts this node holds, and whether each has reached the owned room yet (`publicly_auditable`) |
 | `GET /openapi.json` | OpenAPI 3.1 |
 
 ### About the metrics
