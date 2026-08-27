@@ -1,0 +1,243 @@
+# Continuous integration.
+#
+# Two jobs. `checks` is everything that needs no network peer: lint, types, tests, audit,
+# secret scan, build metadata. `e2e` stands up a real instance of the upstream server —
+# pinned to the exact commit this implementation was verified against — and runs the live
+# suite against it on loopback.
+#
+# ## Why fork pull requests do not run here
+#
+# A workflow triggered by `pull_request` executes the *fork's* code. Nothing about running
+# the test suite constrains what that code may do: a modified test, or a build hook in a
+# changed dependency, can open a socket to anywhere the runner can reach.
+#
+# That matters more than usual for this project. Technocore accepts signed writes from
+# anyone with no credential at all, so a fork PR would not need to steal a secret to post
+# from GitHub's infrastructure — under this repository's name, from an IP nobody here
+# controls, at a service somebody else pays for.
+#
+# There is no egress filter on a GitHub-hosted runner, so pointing the suite at
+# `127.0.0.1` does not prevent that; `TCN_E2E_ORIGIN` is an instruction to our tests, not a
+# boundary around the job. The boundary that does hold is not running fork code at all, so
+# both jobs are gated on the ref belonging to this repository. A contribution from a fork
+# gets reviewed by a person, who pushes the branch here to run CI against it.
+#
+# ## Other deliberate absences
+#
+#   * No secret is used, no artifact is uploaded, and no private key or passphrase is ever
+#     present — the tests that need an identity generate a throwaway in a temp dir.
+#   * Every action is pinned to a commit SHA, and the comment beside it names the immutable
+#     release tag that SHA belongs to, not a moving major tag.
+#   * Values read out of the repository are validated before they reach a shell.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The interpreter is pinned here and in .python-version so a local run and CI agree.
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  checks:
+    name: lint, types, tests, audit
+    # Fork code does not run here — see the header. A same-repo branch or a manual
+    # dispatch does.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.9.5"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync from the lockfile
+        # --frozen fails rather than resolving: if uv.lock does not satisfy pyproject.toml,
+        # that is a defect to see here, not something to paper over by re-resolving.
+        run: uv sync --frozen --all-extras
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy (strict)
+        run: uv run mypy
+
+      - name: pytest (unit + integration)
+        # The live suite is skipped here; it has its own job with a server to talk to.
+        run: uv run pytest tests/unit tests/integration -q
+
+      - name: pip-audit
+        run: uv run pip-audit --progress-spinner off
+
+      - name: Secret scan
+        run: python3 scripts/secret_scan.py
+
+      - name: Build the package and check its metadata
+        run: |
+          uv build
+          uv run --with twine twine check dist/*
+          ls -la dist/
+
+      - name: Working tree is clean
+        # Nothing above may modify a tracked file. A formatter that rewrites source, or a
+        # build that drops a generated file into the tree, shows up here rather than in
+        # somebody's next diff.
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)" || {
+            echo "::error::the working tree was modified by a CI step (see above)"
+            exit 1
+          }
+
+  e2e:
+    name: end-to-end against a pinned upstream
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.9.5"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync from the lockfile
+        run: uv sync --frozen --all-extras
+
+      - name: Read and validate the upstream pin
+        id: pin
+        # The commit comes from proof/protocol-snapshot.json rather than being written
+        # here, so the server CI tests against and the specification the code was built
+        # from cannot drift apart silently.
+        #
+        # It is validated before it is used. That file is part of the tree under review,
+        # so its contents are only as trustworthy as the branch: the repository URL must
+        # equal the one constant this workflow will clone, and the commit must be exactly
+        # forty hex characters. Neither is interpolated into a shell — a `${{ }}`
+        # expansion is substituted into the script before bash parses it, so a crafted
+        # value would be command injection into the workflow itself.
+        env:
+          EXPECTED_REPO: https://github.com/flop-labs/technocore-chat
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+          snap = json.load(open("proof/protocol-snapshot.json"))
+          repo, commit = snap["upstream_repo"], snap["upstream_commit"]
+          if repo != os.environ["EXPECTED_REPO"]:
+              sys.exit(f"upstream_repo is {repo!r}, expected {os.environ['EXPECTED_REPO']!r}")
+          if not re.fullmatch(r"[0-9a-f]{40}", commit):
+              sys.exit("upstream_commit is not a full 40-character hex SHA")
+          version = snap["service_version"]
+          # $GITHUB_OUTPUT is line-based, so an unvalidated value carrying a newline
+          # writes a second output of its choosing — including one that overrides the
+          # commit validated on the line above.
+          if not re.fullmatch(r"[0-9A-Za-z.+-]{1,32}", version):
+              sys.exit(f"service_version is not a plain single-line version: {version!r}")
+          print(f"commit={commit}")
+          print(f"version={version}")
+          EOF
+          echo "pinned upstream commit: $(grep '^commit=' "$GITHUB_OUTPUT" | tail -1)"
+
+      - name: Fetch the upstream server at that commit
+        env:
+          # Passed as environment values, never interpolated into the script text.
+          UPSTREAM_REPO: https://github.com/flop-labs/technocore-chat
+          UPSTREAM_COMMIT: ${{ steps.pin.outputs.commit }}
+        run: |
+          git clone --filter=blob:none --no-checkout "$UPSTREAM_REPO" "$RUNNER_TEMP/tc-upstream"
+          git -C "$RUNNER_TEMP/tc-upstream" checkout --detach "$UPSTREAM_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/tc-upstream" rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+
+      - name: Start it on loopback
+        # The three raised limits are why this needs its own instance: a default one allows
+        # 20 new rooms per IP per day, and the suite opens a fresh room per test so that no
+        # two tests can contaminate each other.
+        run: |
+          cd "$RUNNER_TEMP/tc-upstream"
+          uv sync
+          mkdir -p "$RUNNER_TEMP/tc-data"
+          CHAT_ROOT="$RUNNER_TEMP/tc-data" \
+          CHAT_RATE_WRITE=6000 CHAT_RATE_READ=6000 CHAT_RATE_ROOMS_PER_DAY=2000 \
+            .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8080 --app-dir src \
+            > "$RUNNER_TEMP/tc-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/tc-server.pid"
+
+      - name: Wait for it to answer
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "upstream ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the upstream server did not become ready"
+          cat "$RUNNER_TEMP/tc-server.log" || true
+          exit 1
+
+      - name: Confirm it is the expected version
+        env:
+          EXPECTED_VERSION: ${{ steps.pin.outputs.version }}
+        run: |
+          curl -fsS http://127.0.0.1:8080/.well-known/agent.json -o "$RUNNER_TEMP/agent.json"
+          version=$(python3 -c "import json;print(json.load(open('$RUNNER_TEMP/agent.json'))['version'])")
+          echo "running $version, snapshot records $EXPECTED_VERSION"
+          test "$version" = "$EXPECTED_VERSION"
+
+      - name: Run the live suite
+        env:
+          # The only origin the suite is given. It cannot reach the public instance.
+          TCN_E2E_ORIGIN: http://127.0.0.1:8080
+        run: uv run pytest tests/e2e -v
+
+      - name: Stop the upstream server
+        # `always()` so the server is torn down even when the suite fails or the job is
+        # cancelled — a leaked process would hold the runner's port and its disk.
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/tc-server.pid" ]; then
+            pid=$(cat "$RUNNER_TEMP/tc-server.pid")
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            kill -9 "$pid" 2>/dev/null || true
+            echo "stopped $pid"
+          fi
+          rm -rf "$RUNNER_TEMP/tc-data"
+
+      - name: Upstream server log on failure
+        # Printed into the job log rather than uploaded. It is only the pinned upstream's
+        # own request log, but an artifact is a file that outlives the run and this
+        # workflow uploads none.
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/tc-server.log" || true

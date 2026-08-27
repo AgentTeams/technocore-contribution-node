@@ -28,6 +28,7 @@ from urllib.parse import quote
 import httpx2 as httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from .. import __version__
 from ..crypto import didkey
 from ..logging import get_logger
 from .envelope import SignedMessage, message_payload, note_payload
@@ -164,7 +165,7 @@ class TechnocoreClient:
         did: str | None = None,
         nonces: NonceAllocator | None = None,
         client: httpx.AsyncClient | None = None,
-        user_agent: str = "technocore-contribution-node/0.1.0",
+        user_agent: str | None = None,
     ) -> None:
         from ..config import ALLOWED_ORIGINS
 
@@ -180,7 +181,12 @@ class TechnocoreClient:
             base_url=origin,
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=False,
-            headers={"user-agent": user_agent, "accept": "application/json"},
+            headers={
+                # Derived, never a literal: a hardcoded version silently keeps
+                # announcing the release it was typed for.
+                "user-agent": user_agent or f"technocore-contribution-node/{__version__}",
+                "accept": "application/json",
+            },
         )
 
     async def aclose(self) -> None:
@@ -216,6 +222,19 @@ class TechnocoreClient:
         if response.status_code >= 400:
             raise TechnocoreError(f"HTTP {response.status_code}: {response.text[:300]}")
         return response
+
+    async def _direct(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """One request with no retry, mapping transport faults into our own error type.
+
+        The paths that need to see a raw status — a 404 that means "no such note", a 409
+        that means "you lost the race" — cannot go through `_request`, which raises on
+        both. They still must not leak `httpx` exceptions at their callers, who catch
+        `TechnocoreError` and would otherwise let a DNS blip escape as something else.
+        """
+        try:
+            return await self._http.request(method, path, **kwargs)
+        except httpx.HTTPError as exc:
+            raise TechnocoreError(f"transport failure: {type(exc).__name__}") from exc
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """One request, retrying only what is genuinely retryable.
@@ -280,7 +299,7 @@ class TechnocoreClient:
         if not (valid_name(namespace) and valid_name(key)):
             raise TechnocoreError("invalid note path")
         path = f"/kv/{quote(namespace, safe='')}/{quote(key, safe='')}"
-        response = await self._http.get(path, headers={"accept": "text/plain"})
+        response = await self._direct("GET", path, headers={"accept": "text/plain"})
         if response.status_code == 404:
             return None
         return strip_banner(self._check(response).text)
@@ -377,7 +396,7 @@ class TechnocoreClient:
         if if_match is not None:
             body["if"] = if_match
         path = f"/kv/{quote(namespace, safe='')}/{quote(key, safe='')}"
-        response = await self._http.post(path, json=body)
+        response = await self._direct("POST", path, json=body)
         if response.status_code == 409:
             raise TechnocoreError("note changed since it was read (409)")
         self._check(response)
@@ -406,7 +425,8 @@ class TechnocoreClient:
         nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000))
         payload = note_payload("room-owners", room, nonce, self.did)
         sig = didkey.sign(self._key, payload)
-        response = await self._http.post(
+        response = await self._direct(
+            "POST",
             f"/kv/room-owners/{quote(room, safe='')}",
             json={
                 "value": self.did,

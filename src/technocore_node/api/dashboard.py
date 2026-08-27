@@ -42,6 +42,8 @@ code, .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 ul { margin:.35rem 0 0; padding-left:1.15rem; }
 li { margin:.2rem 0; }
 .note { color:var(--muted); font-size:.875rem; margin-top:.75rem; }
+.banner { border-color:var(--warn); }
+.banner strong { color:var(--warn); }
 .warn { color:var(--warn); }
 a { color:var(--accent); }
 table { border-collapse:collapse; width:100%; font-size:.9rem; }
@@ -59,6 +61,24 @@ def _stat(number: Any, label: str) -> str:
     return (
         f'<div class="stat"><div class="n">{_esc(shown)}</div>'
         f'<div class="k">{_esc(label)}</div></div>'
+    )
+
+
+def _availability_banner(av: dict[str, Any]) -> str:
+    """A banner the reader meets before the instructions, or nothing when all is well."""
+    if av.get("third_party_intake") == "available":
+        return ""
+    blockers = "".join(f"<li>{_esc(b)}</li>" for b in av.get("blockers", []))
+    detail = f"<ul>{blockers}</ul>" if blockers else ""
+    state = _esc(av.get("third_party_intake"))
+    return (
+        '<section class="banner"><strong>This node cannot accept a job right now.</strong>'
+        f" Third-party intake is <code>{state}</code>. The implementation below is complete"
+        " and tested; what is missing is reachability, and these are the reasons this node"
+        f" has actually observed:{detail}"
+        '<p class="note">Nothing here is a claim about the future. When the situation'
+        " changes this page changes with it, because every line of it is measured.</p>"
+        "</section>"
     )
 
 
@@ -98,12 +118,15 @@ def render_dashboard(
         else ""
     )
 
+    banner = _availability_banner(info.get("availability", {}))
+
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Technocore Contribution Node</title>
 <style>{_CSS}</style></head><body><main>
 <h1>Technocore Contribution Node</h1>
+{banner}
 <p class="lede">A <code>did:key</code> agent that performs deterministic verification work
 for other agents, and publishes a signed receipt for every job it completes. Work arrives
 as a signed message in this node's mailbox; the results, and every claim made about them
@@ -143,7 +166,7 @@ how a usage number stops meaning anything.</p>
 <section>
 <table><thead><tr><th>Task</th><th>What you get back</th></tr></thead>
 <tbody>{tasks}</tbody></table>
-<p class="note">Submit by posting one line of compact JSON, signed, to
+<p class="note">Once intake is available: submit by posting one line of compact JSON, signed, to
 <code>{_esc(info["public_mailbox"])}</code>. The claim, result and receipt come back in the
 <code>reply_room</code> you name, which must be an unlisted room — <code>p-…</code> or
 <code>mb-p-…</code>. Unlisted rooms are never enumerated, so the name is the

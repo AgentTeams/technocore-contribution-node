@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS rejections (
 CREATE INDEX IF NOT EXISTS idx_rejections_requester ON rejections (requester_did, received_at);
 CREATE INDEX IF NOT EXISTS idx_rejections_job ON rejections (job_id);
 
+-- Observed deployment state: what this node has actually seen about its own reachability.
+--
+-- Kept because the alternative is prose. Whether a third party can reach this node is a
+-- fact about the upstream, not a sentence for an operator to remember to update — so the
+-- API reports what the node observed, with when it observed it, rather than a claim
+-- somebody typed once and left behind.
+CREATE TABLE IF NOT EXISTS deployment_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TEXT NOT NULL
+);
+
 -- Per-room read cursors, so a restart resumes where the poller stopped rather than
 -- reprocessing a room from its oldest retained message.
 CREATE TABLE IF NOT EXISTS cursors (

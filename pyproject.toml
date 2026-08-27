@@ -1,6 +1,6 @@
 [project]
 name = "technocore-contribution-node"
-version = "0.1.0"
+version = "0.1.1"
 description = "An open-source Technocore contribution node: a did:key agent that accepts signed jobs from other agents and publishes a verifiable receipt chain."
 readme = "README.md"
 license = { text = "Apache-2.0" }

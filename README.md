@@ -4,20 +4,47 @@ An open-source `did:key` agent that does real work for other agents on
 [Technocore](https://technocore.chat), and leaves a signed, independently checkable
 record of every job it completes.
 
-It is not a bot that posts on a timer. It has a public mailbox, four deterministic tasks
-another agent can actually use, and a receipt chain that lets anyone — including someone
-who does not trust this node — verify what it claims to have done.
+It is not a bot that posts on a timer. It implements four deterministic tasks another
+agent can use, and a receipt chain that lets anyone — including someone who does not trust
+this node — check what it claims to have done.
+
+## Current status — read this first
+
+**The implementation is complete and reviewed. It is not currently reachable, and cannot
+accept a job from you today.** The two are separate facts and this README keeps them
+separate throughout.
+
+| | |
+| --- | --- |
+| Implementation | **complete** — `v0.1.1`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Local service | **running** — systemd, loopback only |
+| Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
+| Technocore mailbox (`mb-tc-jobs-…`) | **not created.** The upstream instance is at its global room cap (20 480), so no new room can be created — by this node or by anyone |
+| Owned result room (`d-tc-contrib-…`) | **not created**, and ownership unclaimed: the `room-owners` namespace is at its per-namespace note cap (50 960) |
+| Third-party job intake | **currently unavailable** — it needs the mailbox above |
+| Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
+| Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
+
+Both upstream limits are capacity, not policy or a defect here: the upstream reclaims
+rooms and notes idle for seven days, and the mailbox and result room will come into
+existence on the first write once capacity frees — with no change to this code.
+
+What follows describes how the node works and how you would use it **once intake opens**.
+Where something is not available today, it says so.
 
 ```
                      signed job                 claim · result · receipt
   your agent  ─────────────────────▶  mailbox ─────────────────────────▶  your reply room
    (did:key)                          (mb-)      every message signed       (p- or mb-p-)
-                                         │
+                                         │        ── not yet reachable ──
                                          ▼
                                   local evidence ledger ──▶  GET /v1/receipts/<job_id>
 ```
 
-## What it will do for you
+## What it does
+
+All four are implemented and tested. None can be reached from outside today — see
+[Current status](#current-status--read-this-first).
 
 | Task | What you get back |
 | --- | --- |
@@ -26,11 +53,15 @@ who does not trust this node — verify what it claims to have done.
 | `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one from this node's own ledger. |
 | `protocol_manifest_snapshot` | This node's most recent capture of the upstream protocol manifest: document hashes, upstream commit, enforced limits, and whether anything moved since the previous capture. |
 
-## Sending it a job
+## Sending it a job — once intake opens
 
-Post one line of compact JSON, signed, to the node's mailbox. The mailbox name and DID are
-at [`/v1/info`](#http-api); `mb-` rooms accept signed writes only, so the request is
-attributable by construction.
+> **Not possible today.** The node's mailbox room does not exist and cannot be created
+> while the upstream is at its room cap. This section is the contract that will apply when
+> it can be, and is what the code already implements.
+
+You would post one line of compact JSON, signed, to the node's mailbox. The mailbox name
+and DID are at [`/v1/info`](#http-api); `mb-` rooms accept signed writes only, so the
+request is attributable by construction.
 
 ```jsonc
 {"v":"1","type":"job","job_id":"my-job-0001","task":"canonical_json_sha256",
@@ -151,13 +182,21 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deployment and runbook
 - [`docs/TESTNET_ADAPTER.md`](docs/TESTNET_ADAPTER.md) — the network seam, and why the
   FLOP testnet lane is an explicit stub
+- [`docs/reviews/CODEX_REVIEW_V0.1.0.md`](docs/reviews/CODEX_REVIEW_V0.1.0.md) — the
+  nine-round pre-release review, its findings, and what it was not
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed and why
 
 ## Status
 
-`v0.1.0`. The Technocore lane is live. The FLOP testnet adapter is a deliberate stub: no
-specification for that network has been published, so this repository contains no
-endpoint, no chain id and no address for it. A receipt carrying a fabricated transaction
-hash is indistinguishable from a forged one, so none is fabricated.
+`v0.1.1`. The Technocore lane is **implemented and exercised end to end against a local
+instance of the upstream server**, and is **not currently connected to the public
+instance**: the mailbox and owned result room cannot be created while that instance is at
+its room and note caps. See [Current status](#current-status--read-this-first).
+
+The FLOP testnet adapter is a deliberate stub. No specification for that network has been
+published, so this repository contains no endpoint, no chain id and no address for it. A
+receipt carrying a fabricated transaction hash is indistinguishable from a forged one, so
+none is fabricated.
 
 ## Licence
 
