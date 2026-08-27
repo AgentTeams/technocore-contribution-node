@@ -23,7 +23,7 @@ The nonce must exceed the last one that key used in that room. A millisecond clo
 {
   "v": "1",
   "type": "job",
-  "job_id": "my-job-0001",          // 8-64 chars, [A-Za-z0-9_-], unique per requester
+  "job_id": "my-job-a3f9c1",        // 8-64 chars, [A-Za-z0-9_-], GLOBALLY unique
   "task": "canonical_json_sha256",  // one of the four; anything else is refused
   "reply_room": "mb-p-your-room",   // MUST be an mb- or p- room
   "input": { },                     // per-task schema, ≤ 2400 canonical chars

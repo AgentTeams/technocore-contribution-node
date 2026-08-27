@@ -47,8 +47,10 @@ JOB_SCHEMA: Final[dict[str, Any]] = {
         "job_id": {
             "type": "string",
             "pattern": JOB_ID_PATTERN,
-            "description": "Caller-chosen, unique per requester. A repeat is answered "
-            "from the ledger rather than re-executed.",
+            "description": "Caller-chosen and GLOBALLY unique — it is also the public "
+            "receipt identifier, so include a random component. A repeat from the same "
+            "requester is answered from the ledger; one from a different requester is "
+            "refused with job_id_taken.",
         },
         "task": {"enum": list(TASKS)},
         "reply_room": {

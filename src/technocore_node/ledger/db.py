@@ -8,6 +8,7 @@ plenty — and it keeps the failure mode obvious rather than hiding it behind a 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
@@ -102,13 +103,33 @@ class Ledger:
         `PRAGMA table_info` rather than against a version number, so a database at any
         past shape converges — including one this code has never seen.
         """
+        retired = False
         for table, column in self._RETIRED_COLUMNS:
             if self._table_exists(table) and column in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                retired = True
 
         for table, column, definition in self._ADDED_COLUMNS:
             if self._table_exists(table) and column not in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+        if retired:
+            # Dropping a column stops it being written or read; it does not remove the
+            # bytes already in the file, because SQLite keeps freed pages until they are
+            # reused. For a column that held strangers' payloads that is half a job, so
+            # the migration finishes it: VACUUM rewrites the database without them.
+            #
+            # Best effort by design. VACUUM needs room for a second copy, and a node that
+            # cannot start because it could not tidy up would be a worse outcome than one
+            # that starts and says so.
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            try:
+                self.conn.execute("VACUUM")
+            except sqlite3.OperationalError:
+                logging.getLogger(__name__).warning(
+                    "retired a payload column but could not VACUUM; the old bytes remain "
+                    "in the database file until it is vacuumed or replaced"
+                )
 
     def integrity_ok(self) -> bool:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()

@@ -228,8 +228,17 @@ class JobRunner:
             internal_test=internal_test,
         )
         if not inserted:
-            # Lost a race with a concurrent delivery of the same job_id. The insert is the
-            # arbiter, so the loser simply stops here.
+            # Lost the insert race. The row now exists, so ask whose it is: two different
+            # requesters can both pass the check above before either has written, and the
+            # loser must still be told rather than dropped — otherwise the whole squatting
+            # problem survives inside the race window.
+            winner = self.ledger.job_requester(job_id)
+            if winner is not None and winner != requester_did:
+                raise RejectedJob(
+                    "job_id_taken",
+                    "another requester already used this job_id; choose one with a "
+                    "random component",
+                )
             return None
 
         claim = {

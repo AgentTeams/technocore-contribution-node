@@ -56,6 +56,7 @@ async def test_no_request_or_result_text_is_ever_persisted(
     accumulated other people's data on an operator's disk, indefinitely, for no reader —
     while the schema said the opposite.
     """
+    # secret-scan: allow — a fixture standing in for what a stranger might send.
     secret = "correct-horse-battery-staple-9f3a"
     outcome = await runner.handle(
         text=job_line(input={"value": {"pii": secret}}),
@@ -370,3 +371,90 @@ def test_the_watcher_checks_the_allowlist_on_its_one_request_method() -> None:
     from technocore_node.service.watcher import ProtocolWatcher
 
     assert "assert_allowed_origin" in inspect.getsource(ProtocolWatcher._fetch)
+
+
+def test_retiring_a_payload_column_also_scrubs_the_file(tmp_path: Path) -> None:
+    """Dropping the column is half the job; the bytes were still in the file.
+
+    SQLite keeps freed pages until they are reused, so a database upgraded from a build
+    that stored payloads kept them readable to anyone with the file. The migration now
+    VACUUMs after a retirement, which rewrites the database without them.
+    """
+    path = tmp_path / "payload.db"
+    Ledger(path).close()
+
+    legacy = sqlite3.connect(path)
+    legacy.execute("ALTER TABLE messages ADD COLUMN normalized_text TEXT")
+    legacy.execute(
+        "INSERT INTO messages (local_event_id, direction, room, did, "
+        "normalized_text_sha256, status, created_at, normalized_text) "
+        "VALUES ('a', 'out', 'mb-x', 'did:key:z', 'sha256:0', 'confirmed', 'now', "
+        "'a-strangers-private-payload-7c1f')"
+    )
+    legacy.commit()
+    legacy.close()
+    assert _file_contains(path, "a-strangers-private-payload-7c1f")
+
+    Ledger(path).close()
+    assert not _file_contains(path, "a-strangers-private-payload-7c1f")
+
+
+async def test_losing_the_insert_race_still_refuses_a_foreign_job_id(
+    runner: JobRunner, ledger: Ledger
+) -> None:
+    """Two requesters can both pass the ownership check before either has written.
+
+    The loser of the insert must still be told, or the squatting problem simply moves
+    inside the race window and becomes intermittent instead of fixed.
+    """
+    real_insert = ledger.insert_job
+
+    def insert_then_lose(**fields: object) -> bool:
+        # Stand in for the other requester winning between the check and the insert.
+        real_insert(**{**fields, "requester_did": OTHER})
+        return False
+
+    ledger.insert_job = insert_then_lose  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RejectedJob) as exc:
+            await runner.handle(
+                text=job_line(job_id="raced-00000001"),
+                requester_did=REQUESTER,
+                request_room="mb-test",
+                request_seq=1,
+            )
+    finally:
+        ledger.insert_job = real_insert  # type: ignore[method-assign]
+    assert exc.value.code == "job_id_taken"
+
+
+async def test_losing_the_race_to_yourself_stays_silently_idempotent(
+    runner: JobRunner, ledger: Ledger
+) -> None:
+    """A redelivery of one's own job is not an error, however the race resolves."""
+    real_insert = ledger.insert_job
+
+    def insert_then_lose(**fields: object) -> bool:
+        real_insert(**fields)
+        return False
+
+    ledger.insert_job = insert_then_lose  # type: ignore[method-assign]
+    try:
+        outcome = await runner.handle(
+            text=job_line(job_id="selfrace-00001"),
+            requester_did=REQUESTER,
+            request_room="mb-test",
+            request_seq=1,
+        )
+    finally:
+        ledger.insert_job = real_insert  # type: ignore[method-assign]
+    assert outcome is None
+
+
+def test_the_published_job_id_contract_says_globally_unique() -> None:
+    """The schema is the public contract; it said per-requester while the code did not."""
+    from technocore_node.jobs.schema import JOB_SCHEMA
+
+    description = JOB_SCHEMA["properties"]["job_id"]["description"]
+    assert "GLOBALLY unique" in description
+    assert "per requester" not in description
