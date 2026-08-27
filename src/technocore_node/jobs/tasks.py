@@ -21,7 +21,7 @@ from typing import Any, Protocol
 from ..crypto import didkey
 from ..protocol import canonical
 from ..protocol.envelope import message_payload
-from ..protocol.sweep import sweep
+from ..protocol.sweep import sweep, valid_name
 from ..receipts.receipt import verify_chain
 
 
@@ -51,6 +51,9 @@ def verify_technocore_signature(payload: dict[str, Any], _ctx: TaskContext) -> d
 
     checks: dict[str, Any] = {}
 
+    # A room name outside the server's own pattern could never have carried this
+    # signature, so report that rather than a bare "invalid" the caller has to guess at.
+    checks["room_name_valid"] = valid_name(room)
     checks["did_format"] = didkey.is_did(did)
     checks["signature_encoding"] = bool(didkey.SIG_RE.fullmatch(sig))
     checks["nonce_format"] = bool(didkey.NONCE_RE.fullmatch(str(nonce)))

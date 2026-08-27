@@ -399,6 +399,8 @@ class TechnocoreClient:
         """
         if self.did is None or self._key is None:
             raise TechnocoreError("claiming a room needs a signing key")
+        if not valid_name(room):
+            raise TechnocoreError(f"invalid room name: {room!r}")
         if not room.startswith("d-"):
             raise TechnocoreError("only d- rooms can be owned")
         nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000))

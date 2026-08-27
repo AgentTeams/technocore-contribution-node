@@ -20,6 +20,13 @@ from .sweep import sweep
 
 MESSAGE_SEPARATOR = "|"
 
+# Why `|` is unambiguous here even though the trailing component may contain one: every
+# component before it is constrained to a character set that excludes the separator. A
+# room, namespace and note key must match ^[a-z0-9][a-z0-9_-]{0,47}$ and a nonce must
+# match ^[0-9]{1,19}$, so a leading separator can only ever be a delimiter — a `|` inside
+# the text or value cannot shift where the earlier fields end. The obligation that falls
+# out of this: validate those components *before* signing, which every path here does.
+
 
 def message_payload(room: str, nonce: int | str, text: str) -> str:
     """The exact bytes a room-message signature covers. `text` is swept here."""

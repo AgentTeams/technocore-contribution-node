@@ -147,3 +147,58 @@ def test_rate_limit_is_per_requester(runner: JobRunner, ledger: Ledger, did: str
             job_id=None, requester_did=did, code="not_json", detail="", request_room="mb-test"
         )
     runner.check_rate_limit(other)
+
+
+def test_signature_payload_delimiters_cannot_be_shifted() -> None:
+    """`|` separates the payload fields, and the trailing field may contain one.
+
+    That is only unambiguous because every *earlier* field is drawn from a character set
+    that excludes the separator. This asserts the property the scheme rests on, so a
+    future loosening of the name or nonce pattern fails here rather than silently making
+    two different messages share a signature.
+    """
+    import re
+
+    from technocore_node.crypto.didkey import NONCE_PATTERN
+    from technocore_node.protocol.envelope import message_payload, note_payload
+    from technocore_node.protocol.sweep import NAME_RE
+
+    assert not NAME_RE.fullmatch("has|pipe")
+    assert not re.fullmatch(NONCE_PATTERN, "1|2")
+
+    # Two messages whose fields differ must not collide, even when the trailing field
+    # contains the separator. Without the constraint above, ("room", 1, "2|x") and
+    # ("room", 12, "x") would both render as `room|1|2|x`.
+    assert message_payload("room", 1, "2|x") == "room|1|2|x"
+    assert message_payload("room", 12, "x") == "room|12|x"
+    assert message_payload("room", 1, "2|x") != message_payload("room", 12, "x")
+    assert note_payload("ns", "key", 1, "a|b") != note_payload("ns", "key", 1, "a|c")
+
+
+def test_sweep_equivalent_values_share_one_payload_by_design() -> None:
+    """Not a collision — the same stored bytes.
+
+    The payload covers the value *after* the sweep, so two inputs the server would store
+    identically are one message and legitimately carry one signature. Asserting this keeps
+    a future reader from "fixing" it into signing pre-sweep text, which the server refuses.
+    """
+    from technocore_node.protocol.envelope import note_payload as np
+
+    assert np("ns", "key", 1, "a|b ") == np("ns", "key", 1, "  a|b")
+    assert np("ns", "key", 1, "a|b") == np("ns", "key", 1, "a|b\n")
+
+
+async def test_claiming_a_room_with_a_pipe_in_the_name_is_refused(
+    key: Ed25519PrivateKey, did: str
+) -> None:
+    """The ownership payload is `room-owners|<room>|<nonce>|<did>`; a room name outside
+    the server's pattern must never reach it."""
+    from technocore_node.protocol.client import TechnocoreClient, TechnocoreError
+
+    client = TechnocoreClient("https://technocore.chat", private_key=key, did=did)
+    try:
+        for bad in ["d-a|b", "d-A", "d-" + "x" * 60, "d-has space"]:
+            with pytest.raises(TechnocoreError, match="invalid room name"):
+                await client.claim_room(bad)
+    finally:
+        await client.aclose()
