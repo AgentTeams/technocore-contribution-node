@@ -1,0 +1,321 @@
+"""The job lifecycle: JOB → VALIDATED → CLAIM → EXECUTE → RESULT → RECEIPT → CONFIRMED.
+
+Every stage is a gate, and the order is chosen so the cheapest refusal happens first: a
+malformed line costs a JSON parse, a bad DID costs a regex, and only a request that has
+passed all of those reaches a task. Nothing runs before the request has been recorded, so
+a crash mid-job leaves a job row in a known state rather than silent work that nobody can
+account for.
+
+The one rule this module exists to enforce: **a message is data.** The text arriving in
+the mailbox is a stranger's, its signature proves possession of a key and nothing more,
+and no field in it is ever treated as an instruction. `task` selects from a compiled-in
+registry; it never names code.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import jsonschema
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from .. import __version__
+from ..crypto import didkey
+from ..ledger.db import Ledger, utcnow
+from ..logging import get_logger
+from ..protocol.canonical import canonicalize
+from ..receipts.receipt import build_receipt, canonical_hash, sign_result
+from . import schema as job_schema
+from .tasks import REGISTRY, TaskContext, TaskError
+
+log = get_logger(__name__)
+
+_JOB_VALIDATOR = jsonschema.Draft202012Validator(job_schema.JOB_SCHEMA)
+_INPUT_VALIDATORS = {
+    name: jsonschema.Draft202012Validator(spec)
+    for name, spec in job_schema.TASK_INPUT_SCHEMAS.items()
+}
+
+
+class RejectedJob(Exception):
+    """The request will not be processed. `code` is what gets recorded and reported."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail[:200]
+
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    """What the runner produced for one request, ready for the poster to publish."""
+
+    job_id: str
+    claim: dict[str, Any]
+    result: dict[str, Any]
+    receipt: dict[str, Any] | None
+    reply_room: str
+    internal_test: bool
+    latency_ms: int
+
+
+class JobRunner:
+    """Validates, executes and records jobs. Publishing is somebody else's problem.
+
+    Keeping the transport out of here is what makes the pipeline testable without a
+    network, and what keeps a task from ever reaching one.
+    """
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        identity_did: str,
+        private_key: Ed25519PrivateKey,
+        context: TaskContext,
+        *,
+        max_concurrent: int = 2,
+        timeout_seconds: int = 15,
+        requester_jobs_per_hour: int = 60,
+        source_commit: str = "",
+    ) -> None:
+        self.ledger = ledger
+        self.did = identity_did
+        self._key = private_key
+        self.context = context
+        self.timeout_seconds = timeout_seconds
+        self.requester_jobs_per_hour = requester_jobs_per_hour
+        self.source_commit = source_commit[:40]
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    # ------------------------------------------------------------- validation
+
+    def parse_and_validate(self, text: str) -> dict[str, Any]:
+        """Turn one mailbox line into a validated job object, or raise :class:`RejectedJob`."""
+        if len(text) > job_schema.MAX_INPUT_CHARS + 600:
+            raise RejectedJob("request_too_large", f"{len(text)} characters")
+        try:
+            job = json.loads(text)
+        except json.JSONDecodeError:
+            raise RejectedJob("not_json") from None
+        if not isinstance(job, dict):
+            raise RejectedJob("not_an_object")
+
+        errors = sorted(_JOB_VALIDATOR.iter_errors(job), key=lambda e: list(e.path))
+        if errors:
+            first = errors[0]
+            path = "/".join(str(p) for p in first.path) or "(root)"
+            raise RejectedJob("schema_invalid", f"{path}: {first.message}")
+
+        reply_room = str(job["reply_room"])
+        if not _is_repliable(reply_room):
+            # `reply_room` is a stranger's string, and this node writes three messages
+            # into it. Left open, a request naming `lobby` would turn the node into a
+            # spam reflector aimed at a shared room, triggered by anyone. Replies are
+            # therefore confined to the classes that mean "a room the requester owns":
+            # a mailbox, or an unlisted room whose name is itself the capability.
+            raise RejectedJob(
+                "reply_room_not_allowed",
+                "reply_room must be an mb- or p- room (e.g. mb-p-<unguessable>)",
+            )
+
+        task = str(job["task"])
+        if task not in REGISTRY:
+            # Unreachable via the schema's enum; kept as an independent second gate so a
+            # future schema edit cannot widen the executable surface by itself.
+            raise RejectedJob("unknown_task", task)
+
+        payload = job.get("input", {})
+        if not isinstance(payload, dict):
+            raise RejectedJob("schema_invalid", "input must be an object")
+        if len(canonicalize(payload)) > job_schema.MAX_INPUT_CHARS:
+            raise RejectedJob("input_too_large", f"limit {job_schema.MAX_INPUT_CHARS} characters")
+
+        validator = _INPUT_VALIDATORS.get(task)
+        if validator is not None:
+            input_errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.path))
+            if input_errors:
+                first = input_errors[0]
+                path = "/".join(str(p) for p in first.path) or "input"
+                raise RejectedJob("input_invalid", f"{path}: {first.message}")
+
+        return job
+
+    def check_rate_limit(self, requester_did: str) -> None:
+        since = (
+            (datetime.now(UTC) - timedelta(hours=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        used = self.ledger.requester_job_count_since(requester_did, since)
+        if used >= self.requester_jobs_per_hour:
+            raise RejectedJob("rate_limited", f"{used} jobs in the last hour")
+
+    # ------------------------------------------------------------- execution
+
+    async def handle(
+        self,
+        *,
+        text: str,
+        requester_did: str,
+        request_room: str,
+        request_seq: int | None,
+        internal_test: bool = False,
+    ) -> Outcome | None:
+        """Run one inbound mailbox line all the way to a signed receipt.
+
+        Returns None when the request is a duplicate that was already answered — the
+        idempotency contract: the same `job_id` is never executed twice, whatever it says.
+        """
+        started = datetime.now(UTC)
+
+        if not didkey.is_did(requester_did):
+            raise RejectedJob("unsigned_or_unverified_sender", "sender is not a did:key")
+
+        job = self.parse_and_validate(text)
+        job_id = str(job["job_id"])
+        reply_room = str(job["reply_room"])
+        task = str(job["task"])
+
+        if self.ledger.job_exists(job_id):
+            log.info(
+                "duplicate job ignored",
+                extra={"fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}},
+            )
+            return None
+
+        self.check_rate_limit(requester_did)
+
+        request_hash = canonical_hash(job)
+        inserted = self.ledger.insert_job(
+            job_id=job_id,
+            protocol_version=str(job["v"]),
+            requester_did=requester_did,
+            provider_did=self.did,
+            request_room=request_room,
+            reply_room=reply_room,
+            request_seq=request_seq,
+            request_hash=request_hash,
+            task_type=task,
+            status="validated",
+            internal_test=internal_test,
+        )
+        if not inserted:
+            # Lost a race with a concurrent delivery of the same job_id. The insert is the
+            # arbiter, so the loser simply stops here.
+            return None
+
+        claim = {
+            "v": job_schema.PROTOCOL_VERSION,
+            "type": "claim",
+            "job_id": job_id,
+            "provider_did": self.did,
+            "request_hash": request_hash,
+            "accepted_at": utcnow(),
+            "max_processing_ms": self.timeout_seconds * 1000,
+        }
+        self.ledger.update_job(job_id, status="claimed", claimed_at=utcnow())
+
+        status = "ok"
+        summary: dict[str, Any] = {}
+        error_message = ""
+        failure_code: str | None = None
+
+        try:
+            async with self._semaphore:
+                summary = await asyncio.wait_for(
+                    asyncio.to_thread(REGISTRY[task], job.get("input", {}), self.context),
+                    timeout=self.timeout_seconds,
+                )
+        except TimeoutError:
+            status, failure_code, error_message = "error", "task_timeout", "task exceeded its limit"
+        except TaskError as exc:
+            status, failure_code, error_message = "error", "task_rejected", str(exc)[:200]
+        except Exception as exc:
+            # A task fault becomes a signed error result, never an unhandled crash: the
+            # requester is owed an answer either way, and the poller has to survive.
+            status, failure_code, error_message = "error", "task_failed", type(exc).__name__
+            log.exception("task raised", extra={"fields": {"job_id": job_id, "task": task}})
+
+        latency_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
+
+        result: dict[str, Any] = {
+            "v": job_schema.PROTOCOL_VERSION,
+            "type": "result",
+            "job_id": job_id,
+            "task": task,
+            "requester_did": requester_did,
+            "provider_did": self.did,
+            "request_hash": request_hash,
+            "status": status,
+            "completed_at": utcnow(),
+            "impl_version": __version__,
+        }
+        if self.source_commit:
+            result["source_commit"] = self.source_commit
+        if status == "ok":
+            result["summary"] = summary
+        else:
+            result["error"] = error_message or failure_code or "error"
+
+        result["result_hash"] = canonical_hash(
+            summary if status == "ok" else {"error": error_message}
+        )
+        result["sig"] = sign_result(self._key, result)
+
+        self.ledger.record_result(
+            job_id=job_id,
+            result_hash=result["result_hash"],
+            result_summary=json.dumps(summary, ensure_ascii=True)[:4000],
+            provider_signature=result["sig"],
+            result_seq=None,
+        )
+        self.ledger.update_job(
+            job_id,
+            status="completed" if status == "ok" else "failed",
+            completed_at=utcnow() if status == "ok" else None,
+            failed_at=None if status == "ok" else utcnow(),
+            latency_ms=latency_ms,
+            failure_code=failure_code,
+        )
+
+        receipt = build_receipt(
+            self._key,
+            receipt_id=f"rcpt-{secrets.token_hex(12)}",
+            job_id=job_id,
+            requester_did=requester_did,
+            provider_did=self.did,
+            request_room=request_room,
+            reply_room=reply_room,
+            request_hash_value=request_hash,
+            result_hash_value=result["result_hash"],
+            provider_signature=result["sig"],
+            request_seq=request_seq,
+            result_seq=None,
+            internal_test=internal_test,
+        )
+
+        return Outcome(
+            job_id=job_id,
+            claim=claim,
+            result=result,
+            receipt=receipt,
+            reply_room=reply_room,
+            internal_test=internal_test,
+            latency_ms=latency_ms,
+        )
+
+
+def _is_repliable(room: str) -> bool:
+    """True only for a room class that means "the requester's own inbox".
+
+    `mb-` is signed-writes-only, so a reply there is attributable; `p-` is unlisted, so
+    its name is a capability the requester chose to hand over. Every other class — the
+    shared rooms above all — is refused, because this node must not be steerable into
+    writing somewhere a third party did not ask for.
+    """
+    return room.startswith(("mb-", "p-"))
