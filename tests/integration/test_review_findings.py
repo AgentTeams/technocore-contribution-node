@@ -137,6 +137,64 @@ def test_an_older_database_has_its_payload_columns_dropped(tmp_path: Path) -> No
     assert "normalized_text" not in set(row.keys())
 
 
+def test_an_older_database_gains_the_columns_the_code_now_writes(tmp_path: Path) -> None:
+    """The other half of the migration, and the one that fails loudly in production.
+
+    `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a database from an
+    earlier build kept the old `results` shape while the code had started naming `status`
+    and `summary_bytes`. Nothing failed at startup — it would have failed on the first
+    real job, on a live node.
+    """
+    path = tmp_path / "old.db"
+    first = Ledger(path)
+    for column in ("status", "summary_bytes"):
+        first.conn.execute(f"ALTER TABLE results DROP COLUMN {column}")
+    assert "status" not in {r[1] for r in first.conn.execute("PRAGMA table_info(results)")}
+    first.close()
+
+    reopened = Ledger(path)
+    columns = {r[1] for r in reopened.conn.execute("PRAGMA table_info(results)")}
+    assert {"status", "summary_bytes"} <= columns
+
+    # And the code path that needs them actually works against the migrated table.
+    reopened.insert_job(
+        job_id="migrated-000001",
+        protocol_version="1",
+        requester_did=REQUESTER,
+        provider_did=OTHER,
+        request_room="mb-x",
+        reply_room="mb-p-y",
+        request_seq=1,
+        request_hash="sha256:" + "0" * 64,
+        task_type="canonical_json_sha256",
+        status="completed",
+        internal_test=False,
+    )
+    reopened.record_result(
+        job_id="migrated-000001",
+        result_hash="sha256:" + "1" * 64,
+        status="ok",
+        summary_bytes=42,
+        provider_signature="c" * 86,
+        result_seq=3,
+    )
+    stored = reopened.conn.execute(
+        "SELECT status, summary_bytes FROM results WHERE job_id = 'migrated-000001'"
+    ).fetchone()
+    assert (stored["status"], stored["summary_bytes"]) == ("ok", 42)
+
+
+def test_the_migration_is_idempotent_across_repeated_opens(tmp_path: Path) -> None:
+    path = tmp_path / "repeat.db"
+    for _ in range(3):
+        Ledger(path).close()
+    ledger = Ledger(path)
+    assert ledger.integrity_ok()
+    assert {"status", "summary_bytes"} <= {
+        r[1] for r in ledger.conn.execute("PRAGMA table_info(results)")
+    }
+
+
 # ------------------------------- P1: canonicalisation failures are refusals
 
 

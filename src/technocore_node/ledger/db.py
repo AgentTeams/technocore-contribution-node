@@ -70,22 +70,45 @@ class Ledger:
     def _migrate(self) -> None:
         sql = resources.files("technocore_node.ledger").joinpath("schema.sql").read_text()
         self.conn.executescript(sql)
-        self._drop_payload_columns()
+        self._reconcile_columns()
 
-    def _drop_payload_columns(self) -> None:
-        """Remove columns that once held request or result text.
+    #: Columns that must not exist. Retired because they held request or result text.
+    _RETIRED_COLUMNS = (("messages", "normalized_text"), ("results", "result_summary"))
 
-        `CREATE TABLE IF NOT EXISTS` cannot retire a column, so a database created before
-        those columns were removed would keep them — and keep being a place someone could
-        put a stranger's data back. Dropping them makes the guarantee structural rather
-        than a convention the next edit might forget.
+    #: Columns added after a table's first release, with the backfill for existing rows.
+    #: `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so without this a
+    #: database from an earlier build keeps the old shape and the first INSERT that names
+    #: a new column fails at runtime — on a live node, on somebody's first real job.
+    _ADDED_COLUMNS = (
+        ("results", "status", "TEXT NOT NULL DEFAULT 'ok'"),
+        ("results", "summary_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
+    def _columns(self, table: str) -> set[str]:
+        return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _table_exists(self, table: str) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()
+            is not None
+        )
+
+    def _reconcile_columns(self) -> None:
+        """Bring an existing database to the current shape.
+
+        Drops first, then adds. Both are idempotent and both are checked against
+        `PRAGMA table_info` rather than against a version number, so a database at any
+        past shape converges — including one this code has never seen.
         """
-        for table, column in (("messages", "normalized_text"), ("results", "result_summary")):
-            columns = {
-                row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            if column in columns:
+        for table, column in self._RETIRED_COLUMNS:
+            if self._table_exists(table) and column in self._columns(table):
                 self.conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+        for table, column, definition in self._ADDED_COLUMNS:
+            if self._table_exists(table) and column not in self._columns(table):
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def integrity_ok(self) -> bool:
         row = self.conn.execute("PRAGMA integrity_check").fetchone()
