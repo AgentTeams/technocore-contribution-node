@@ -1,0 +1,31 @@
+# One additional site block for the contribution node.
+#
+# Append this to an existing Caddyfile; never replace the file, and never repoint a
+# hostname another service already answers on. Validate before reloading:
+#
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Only add this once DNS for the hostname already resolves to this host — without a
+# record Caddy cannot obtain a certificate.
+
+agent.example.com {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+        # The API is read-only and self-contained; nothing needs to embed it.
+        Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
+        -Server
+    }
+
+    # The API takes no request bodies at all; this is a floor, not a working limit.
+    request_body {
+        max_size 64KB
+    }
+
+    reverse_proxy 127.0.0.1:3020
+}

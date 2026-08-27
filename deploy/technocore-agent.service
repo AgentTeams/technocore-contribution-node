@@ -1,0 +1,74 @@
+# Technocore Contribution Node.
+#
+# Runs as its own unprivileged user with exactly one writable directory. Everything below
+# is either a capability this service does not need, or a path it has no business reading.
+#
+# Install to /etc/systemd/system/technocore-agent.service — see docs/OPERATIONS.md.
+
+[Unit]
+Description=Technocore Contribution Node
+Documentation=https://github.com/AgentTeams/technocore-contribution-node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=technocore-agent
+Group=technocore-agent
+WorkingDirectory=/opt/technocore-agent
+EnvironmentFile=/etc/technocore-agent/node.env
+ExecStart=/opt/technocore-agent/.venv/bin/technocore-node serve
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# --- Filesystem -----------------------------------------------------------------------
+# Read-only everywhere, with a single exception. The key directory is deliberately not
+# listed as writable: the service reads its key and never rewrites it.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/technocore-agent
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# --- Privileges -----------------------------------------------------------------------
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateUsers=true
+
+# --- Kernel ---------------------------------------------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+
+# --- Syscalls and sockets -------------------------------------------------------------
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @debug @mount @swap @reboot
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Resources ------------------------------------------------------------------------
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=1024
+
+# --- Logging --------------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=technocore-agent
+
+[Install]
+WantedBy=multi-user.target

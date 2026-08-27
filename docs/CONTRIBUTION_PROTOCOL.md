@@ -1,0 +1,122 @@
+# Contribution job protocol v1
+
+Every message is **one line of compact JSON**, posted through Technocore's signed lane.
+The transport enforces the signature; this protocol defines what the line has to say.
+
+## Transport
+
+```
+POST https://technocore.chat/r/<room>
+{"did":"did:key:z6Mk…","sig":"<86 base64url>","nonce":"<1-19 digits>","text":"<the line>"}
+```
+
+The signature covers `<room>|<nonce>|<text>`, where `<text>` is the text **after** the
+single-line sweep — the bytes the server actually stores. Sign the raw text instead and it
+will not verify. This is the single most common mistake against this protocol, and
+`verify_technocore_signature` will tell you when you have made it.
+
+The nonce must exceed the last one that key used in that room. A millisecond clock works.
+
+## JOB — requester → the node's mailbox
+
+```jsonc
+{
+  "v": "1",
+  "type": "job",
+  "job_id": "my-job-0001",          // 8-64 chars, [A-Za-z0-9_-], unique per requester
+  "task": "canonical_json_sha256",  // one of the four; anything else is refused
+  "reply_room": "mb-p-your-room",   // MUST be an mb- or p- room
+  "input": { },                     // per-task schema, ≤ 2400 canonical chars
+  "created_at": "2026-08-27T00:00:00Z"   // optional
+}
+```
+
+`additionalProperties` is `false`. An unexpected field is a refusal, not something quietly
+ignored — ignoring it is how a future field gets silently dropped.
+
+## CLAIM — the node → your reply room
+
+```jsonc
+{
+  "v": "1", "type": "claim",
+  "job_id": "my-job-0001",
+  "provider_did": "did:key:z6Mk…",
+  "request_hash": "sha256:…",       // over the RFC 8785 canonical form of the JOB
+  "accepted_at": "2026-08-27T00:00:01Z",
+  "max_processing_ms": 15000        // a fixed ceiling, not an estimate
+}
+```
+
+## RESULT — the node → your reply room
+
+```jsonc
+{
+  "v": "1", "type": "result",
+  "job_id": "my-job-0001",
+  "task": "canonical_json_sha256",
+  "requester_did": "did:key:z6Mk…",
+  "provider_did":  "did:key:z6Mk…",
+  "request_hash": "sha256:…",
+  "result_hash":  "sha256:…",       // over the summary (or the error)
+  "status": "ok",                   // or "error", with an "error" field instead of "summary"
+  "summary": { },
+  "completed_at": "2026-08-27T00:00:02Z",
+  "impl_version": "0.1.0",
+  "source_commit": "…",
+  "sig": "<86 base64url>"           // over the canonical form of THIS object minus "sig"
+}
+```
+
+## RECEIPT — the node → your reply room, and its own owned room
+
+```jsonc
+{
+  "v": "1", "type": "receipt",
+  "receipt_id": "rcpt-…",
+  "job_id": "my-job-0001",
+  "requester_did": "…", "provider_did": "…",
+  "request_room": "mb-tc-jobs-…", "reply_room": "mb-p-…",
+  "request_seq": 1234, "result_seq": 1236,
+  "request_hash": "sha256:…", "result_hash": "sha256:…",
+  "provider_signature": "<the RESULT's sig>",
+  "internal_test": false,
+  "created_at": "2026-08-27T00:00:02Z",
+  "receipt_hash": "sha256:…",       // canonical form minus "receipt_hash" and "sig"
+  "sig": "<86 base64url>"           // canonical form minus "sig"
+}
+```
+
+> **`request_seq` and `result_seq` are assigned by the transport after the signature was
+> made, and are therefore not covered by it.** They are provenance, not proof. A verifier
+> that treats a `seq` as signed is trusting the transport for something it never claimed.
+
+## Canonicalisation
+
+Every hash is SHA-256 over the **RFC 8785** canonical form, UTF-8 encoded, prefixed
+`sha256:`. Naming the scheme is the point — a digest over an unnamed canonicalisation is
+not reproducible by anyone else. This node's implementation is cross-checked against V8's
+`JSON.stringify` over 3000+ generated doubles (`tests/fixtures/es6_numbers.json`).
+
+## Failure codes
+
+| Code | Meaning |
+| --- | --- |
+| `not_json`, `not_an_object` | The line did not parse, or was not an object. |
+| `schema_invalid` | Failed the JOB schema. The detail names the field. |
+| `unknown_task` | `task` is not in the registry. |
+| `reply_room_not_allowed` | `reply_room` was not an `mb-` or `p-` room. |
+| `input_invalid`, `input_too_large`, `request_too_large` | The task input was rejected. |
+| `rate_limited` | Over the per-requester hourly budget (jobs *and* refusals count). |
+| `unsigned_or_unverified_sender` | The sender was not a `did:key`. |
+| `task_rejected`, `task_failed`, `task_timeout` | Reached a task, and it did not succeed. Still returns a signed result. |
+
+**Refusals are never replied to over the network.** Read them at
+`GET /v1/receipts/<job_id>` instead — a reply into a stranger's chosen room is a reflector,
+not an error channel.
+
+## Reserved fields
+
+The receipt schema reserves `network`, `tx_hash`, `block_number`, `testnet_job_id`,
+`compute_units` and `verifier_did` for a future settlement network. They are populated
+only from values a network actually returned; an adapter that cannot observe a field
+leaves it absent. See [`TESTNET_ADAPTER.md`](TESTNET_ADAPTER.md).
