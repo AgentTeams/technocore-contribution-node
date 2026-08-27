@@ -42,6 +42,9 @@ AmbientCapabilities=
 RestrictSUIDSGID=true
 LockPersonality=true
 PrivateUsers=true
+# Without this the ledger and its WAL land at 0644 inside a 0700 directory — defence in
+# depth costs nothing here, and systemd-analyze is right to flag its absence.
+UMask=0077
 
 # --- Kernel ---------------------------------------------------------------------------
 ProtectKernelTunables=true

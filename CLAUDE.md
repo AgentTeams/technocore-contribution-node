@@ -52,6 +52,17 @@ python3 scripts/secret_scan.py
 All five must pass. Dependencies are pinned exactly and locked in `uv.lock`; a floating
 specifier means the build that passed and the build that runs are not the same build.
 
+The live suite is separate and opt-in, because it makes real writes:
+
+```bash
+TCN_E2E_ORIGIN=http://127.0.0.1:8080 uv run pytest tests/e2e -v
+```
+
+Point it at a **local** instance of the upstream server, never the public one. See the
+module docstring in `tests/e2e/test_live.py` for the command, including the three limits
+that have to be raised — a default instance allows 20 new rooms per IP per day and this
+suite opens one per test.
+
 ## Adding a task
 
 1. Add a strict input schema to `jobs/schema.py` (`additionalProperties: false`, bounded

@@ -37,9 +37,22 @@ log = get_logger(__name__)
 
 #: Documented ceiling on this instance; a `wait=` above it is clamped server-side anyway.
 MAX_WAIT_SECONDS = 10
+
+#: The server prefixes every note read with this warning and a blank line. It is the
+#: server's own framing, not part of the value — a reader that keeps it will fail to
+#: parse a counter and will compare an owner DID against a string that can never match.
+#: Verified against technocore-chat @ 9c7df0e `src/app.py:BANNER`.
+UNTRUSTED_BANNER_PREFIX = "!! UNTRUSTED CONTENT"
 #: The upstream refuses a repeated text with 422, and says so explicitly: resending the
 #: same bytes is refused again. Retrying it would be a pointless write against our budget.
 DUPLICATE_STATUS = 422
+
+#: Longest `Retry-After` this client will actually wait out in-line. Beyond it the 429 is
+#: surfaced immediately instead. Not every 429 is a burst: the room-creation budget
+#: refills over hours and answers with a Retry-After in the thousands of seconds. Sleeping
+#: on that parks the caller for minutes and still fails, so the honest move is to hand the
+#: refusal back and let a loop with its own backoff — or an operator — decide.
+MAX_INLINE_RETRY_SECONDS = 30.0
 
 
 class TechnocoreError(RuntimeError):
@@ -88,6 +101,22 @@ class Confirmation:
             seq=self.seq,
             ts=self.ts,
         )
+
+
+def strip_banner(text: str) -> str:
+    """Remove the server's untrusted-content banner from a note read.
+
+    Only the leading banner line and the blank line after it are removed, and only when
+    the response actually starts with the banner — a note whose own value happens to
+    begin with `!!` keeps every byte.
+    """
+    if not text.startswith(UNTRUSTED_BANNER_PREFIX):
+        return text.strip()
+    lines = text.split("\n")
+    body = lines[1:]
+    if body and not body[0].strip():
+        body = body[1:]
+    return "\n".join(body).strip()
 
 
 class NonceAllocator:
@@ -168,6 +197,11 @@ class TechnocoreClient:
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> float:
+        """The server's own Retry-After, clamped.
+
+        It is a stranger's number, so it is bounded before anything sleeps on it — an
+        unbounded value read off the network can park a client indefinitely.
+        """
         raw = response.headers.get("retry-after", "")
         try:
             return max(0.0, min(120.0, float(raw)))
@@ -200,8 +234,14 @@ class TechnocoreClient:
                 await asyncio.sleep(1.5 * attempts)
                 continue
             if response.status_code == 429 and attempts < 2:
-                attempts += 1
                 delay = self._retry_after(response)
+                if delay > MAX_INLINE_RETRY_SECONDS:
+                    log.warning(
+                        "rate limited beyond the inline retry window; surfacing",
+                        extra={"fields": {"path": path, "retry_after_s": delay}},
+                    )
+                    return self._check(response)
+                attempts += 1
                 log.warning(
                     "rate limited by upstream",
                     extra={"fields": {"path": path, "retry_after_s": delay, "attempt": attempts}},
@@ -230,14 +270,20 @@ class TechnocoreClient:
         return data
 
     async def read_note(self, namespace: str, key: str) -> str | None:
-        """A note's value, or None when it does not exist."""
+        """A note's value, or None when it does not exist.
+
+        The server's untrusted-content banner is stripped here — it frames the value
+        rather than being part of it. Keeping the warning is not "safer": it makes a
+        counter unparseable and makes an owner comparison silently false, which is how a
+        node ends up believing it does not own a room it just claimed.
+        """
         if not (valid_name(namespace) and valid_name(key)):
             raise TechnocoreError("invalid note path")
         path = f"/kv/{quote(namespace, safe='')}/{quote(key, safe='')}"
         response = await self._http.get(path, headers={"accept": "text/plain"})
         if response.status_code == 404:
             return None
-        return self._check(response).text.strip()
+        return strip_banner(self._check(response).text)
 
     # ----------------------------------------------------------------- writes
 
@@ -348,8 +394,8 @@ class TechnocoreClient:
         """Claim ownership of a `d-` room for this node's own DID.
 
         The initial claim is signed by the very key being stored — parsing a key is not
-        proof of holding it. Returns False when the note already exists, which means
-        somebody owns it; this node never overwrites an existing owner.
+        proof of holding it. Returns False when the room is already owned, whether the
+        server reports that as 409 or 403; this node never overwrites an existing owner.
         """
         if self.did is None or self._key is None:
             raise TechnocoreError("claiming a room needs a signing key")
@@ -368,7 +414,10 @@ class TechnocoreClient:
                 "nonce": str(nonce),
             },
         )
-        if response.status_code == 409:
+        # Two distinct refusals mean the same thing to a caller, and both are ordinary:
+        # 409 is losing the `if_absent` race, and 403 is the room already belonging to
+        # another key. Neither is an error to raise on — the answer is simply "no".
+        if response.status_code in (403, 409):
             return False
         self._check(response)
         return True

@@ -25,7 +25,9 @@ sudo install -d -o technocore-agent -g technocore-agent -m 700 /var/lib/technoco
 
 # The passphrase, written straight to a 0600 file — never through a shell pipeline,
 # where it would land in the process list and possibly in a shell history.
-sudo openssl rand -base64 48 -out /etc/technocore-agent/identity.pass
+sudo touch /etc/technocore-agent/identity.pass
+sudo chmod 600 /etc/technocore-agent/identity.pass
+sudo openssl rand -out /etc/technocore-agent/identity.pass -base64 48
 sudo chmod 600 /etc/technocore-agent/identity.pass
 
 sudo install -m 640 -o root -g technocore-agent deploy/node.env.example \

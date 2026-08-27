@@ -192,6 +192,28 @@ async def test_a_rate_limit_is_retried_then_surfaced(
     assert exc.value.retry_after == 2.0
 
 
+async def test_a_long_retry_after_is_surfaced_rather_than_slept_through(
+    key: Ed25519PrivateKey, did: str
+) -> None:
+    """A room-creation 429 answers with thousands of seconds. Sleeping on it parks the
+    caller for minutes and still fails, so it is handed back on the first response."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429, headers={"retry-after": "3709"}, text="room-creation budget spent"
+        )
+
+    client = make_client(handler, key, did)
+    try:
+        with pytest.raises(RateLimited):
+            await client.say_signed("p-new-room", "hello")
+    finally:
+        await client.aclose()
+    assert calls["n"] == 1, "a long Retry-After must not be retried in-line"
+
+
 async def test_an_absurd_retry_after_is_clamped(key: Ed25519PrivateKey, did: str) -> None:
     """Retry-After is a stranger's number; a client that obeys it blindly can be parked."""
     client = make_client(lambda r: httpx.Response(200), key, did)
