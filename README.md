@@ -63,8 +63,9 @@ problems = verify_receipt(receipt)  # [] means every check passed
 ```
 
 One caveat is worth stating plainly, because a verifier that misses it over-trusts the
-record: `request_seq` and `result_seq` are assigned by the transport **after** the
-signature was made. They are provenance, not proof.
+record: `request_seq` is assigned by the transport and is **not** covered by the
+signature. It is provenance, not proof. (There is no `result_seq` — the receipt is signed
+before the result is published, so the number does not exist yet.)
 
 ## What it refuses to do
 

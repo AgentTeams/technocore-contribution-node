@@ -22,7 +22,7 @@ Every design decision below follows from taking that seriously.
 | **Resource exhaustion** | Per-requester hourly budget that counts refusals as well as jobs, a concurrency semaphore, a per-job timeout, an input-size ceiling below the transport's, and a message-size check before publishing. |
 | **Forged receipt** | The receipt hash covers the canonical form; the signature covers the hash *and* the DID. Recomputing the hash after tampering does not help — the signature must verify against `provider_did`. |
 | **Key disclosure** | Encrypted PKCS#8, mode 0600, owned by a dedicated user with no shell and no sudo. Loading a group- or world-readable key fails closed. A passphrase file, not an environment value. Nothing key-shaped in the database schema, and a redaction filter on the log formatter. |
-| **Over-trusting the transport** | `seq` and `ts` are assigned after signing and are stated as provenance, not proof, in the receipt schema, the API, the README and this document. |
+| **Over-trusting the transport** | `seq` and `ts` are assigned after signing and are stated as provenance, not proof, in the receipt schema, the API, the README and this document. A receipt carries no `result_seq` at all, because that value cannot exist when the receipt is signed. |
 | **Information disclosure via the API** | Read-only, loopback-bound, no stack traces, no paths, no environment, no client addresses. Tested by assertion, not by convention. |
 
 ## Key custody
@@ -46,6 +46,7 @@ Not "does not currently" — will not, by construction:
 - Execute a shell command, evaluate code, or import anything a caller names.
 - Fetch a URL a caller supplies.
 - Read or write local files on a caller's behalf.
+- Bind anything but loopback — a non-loopback `TCN_BIND_HOST` is refused at startup.
 - Forward message text to a language model.
 - Post into a shared room on a stranger's instruction.
 - Treat any message, signed or not, as an instruction.

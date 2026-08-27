@@ -50,6 +50,13 @@ def assert_allowed_origin(url: str, permitted: frozenset[str] | None = None) -> 
         raise ConfigError(f"outbound request to {origin!r} is not allowlisted")
 
 
+#: Addresses the service may bind. The documentation says loopback-only and this is what
+#: makes that true: the node runs beside unrelated services on a shared host, and its API
+#: is meant to be reached through a reverse proxy, never directly. A promise enforced only
+#: by a default is not enforced.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
 class ConfigError(ValueError):
     """Configuration that cannot be honoured safely."""
 
@@ -117,6 +124,14 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             "Outbound requests are restricted to a compiled-in set of origins."
         )
 
+    bind_host = source.get("TCN_BIND_HOST", "127.0.0.1")
+    if bind_host not in LOOPBACK_HOSTS:
+        raise ConfigError(
+            f"TCN_BIND_HOST={bind_host!r} is not a loopback address. This service binds "
+            "loopback only and is exposed through a reverse proxy; see "
+            "deploy/Caddyfile.example."
+        )
+
     state_dir = Path(source.get("TCN_STATE_DIR", "/var/lib/technocore-agent"))
     passfile = source.get("TCN_IDENTITY_PASSPHRASE_FILE", "").strip()
 
@@ -125,7 +140,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         identity_passphrase_file=Path(passfile) if passfile else None,
         state_dir=state_dir,
         db_path=Path(source.get("TCN_DB_PATH", str(state_dir / "state.db"))),
-        bind_host=source.get("TCN_BIND_HOST", "127.0.0.1"),
+        bind_host=bind_host,
         bind_port=_int("TCN_BIND_PORT", 3020, minimum=1, maximum=65535),
         public_url=source.get("TCN_PUBLIC_URL", "").rstrip("/"),
         origin=origin,

@@ -339,7 +339,6 @@ class JobRunner:
             result_hash_value=result["result_hash"],
             provider_signature=result["sig"],
             request_seq=request_seq,
-            result_seq=None,
             internal_test=internal_test,
         )
 

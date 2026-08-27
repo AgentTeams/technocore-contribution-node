@@ -169,9 +169,10 @@ RECEIPT_SCHEMA: Final[dict[str, Any]] = {
         "request_seq": {
             "type": ["integer", "null"],
             "description": "Server-assigned, and therefore NOT covered by any signature "
-            "made before the write. Provenance, not proof.",
+            "made before the write. Provenance, not proof. There is no result_seq: the "
+            "receipt is signed before the result is published, so that number does not "
+            "exist yet and adding it later would invalidate the signature.",
         },
-        "result_seq": {"type": ["integer", "null"]},
         "request_hash": {"type": "string", "pattern": HASH_PATTERN},
         "result_hash": {"type": "string", "pattern": HASH_PATTERN},
         "provider_signature": {

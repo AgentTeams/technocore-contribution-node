@@ -5,10 +5,15 @@ a JSON object with its own signature fields removed, hash it with SHA-256, and s
 compare that. Stating the rule once — and naming the canonicalisation, rather than
 inventing one — is what makes a receipt checkable by somebody who did not write this code.
 
-One property is stated in the receipt itself rather than left implicit: `request_seq` and
-`result_seq` come from the server *after* the signature was made, so they are provenance
-and never proof. A verifier that treats a seq as signed would be trusting the transport
-for something the transport never claimed.
+One property is stated in the receipt itself rather than left implicit: `request_seq`
+comes from the server, so it is provenance and never proof. A verifier that treats a seq
+as signed would be trusting the transport for something the transport never claimed.
+
+There is deliberately no `result_seq`. The receipt is built and signed before the result
+is published, so the result's seq does not exist yet — and adding it afterwards would
+invalidate the signature that makes the receipt worth anything. A field that can only ever
+be null is worse than an absent one: it invites a reader to wait for a value that is not
+coming.
 """
 
 from __future__ import annotations
@@ -81,7 +86,6 @@ def build_receipt(
     result_hash_value: str,
     provider_signature: str,
     request_seq: int | None,
-    result_seq: int | None,
     internal_test: bool,
 ) -> dict[str, Any]:
     """Assemble a receipt, hash it, sign it, and return it ready to publish."""
@@ -95,7 +99,6 @@ def build_receipt(
         "request_room": request_room,
         "reply_room": reply_room,
         "request_seq": request_seq,
-        "result_seq": result_seq,
         "request_hash": request_hash_value,
         "result_hash": result_hash_value,
         "provider_signature": provider_signature,

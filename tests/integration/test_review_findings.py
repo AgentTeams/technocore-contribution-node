@@ -910,3 +910,42 @@ def test_a_well_formed_receipt_is_publishable() -> None:
     assert (
         _unpublishable(json.dumps(receipt), "good-0000000001", str(receipt["receipt_hash"])) is None
     )
+
+
+def test_a_non_loopback_bind_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three documents promised loopback-only and nothing enforced it.
+
+    The node runs beside unrelated services on a shared host and is meant to be reached
+    through a reverse proxy. A promise kept only by a default is not kept.
+    """
+    from technocore_node.config import load_settings
+
+    for host in ("0.0.0.0", "::", "10.0.0.5", "example.com"):  # noqa: S104
+        monkeypatch.setenv("TCN_BIND_HOST", host)
+        with pytest.raises(ConfigError, match="loopback"):
+            load_settings()
+
+    for host in ("127.0.0.1", "::1", "localhost"):
+        monkeypatch.setenv("TCN_BIND_HOST", host)
+        assert load_settings().bind_host == host
+
+
+async def test_a_receipt_carries_no_result_seq(runner: JobRunner) -> None:
+    """A field that can only ever be null is worse than an absent one.
+
+    The receipt is built and signed before the result is published, so the result's seq
+    does not exist yet — and adding it afterwards would invalidate the signature that
+    makes the receipt worth anything. The docs showed a number there.
+    """
+    from technocore_node.jobs.schema import RECEIPT_SCHEMA
+
+    outcome = await runner.handle(
+        text=job_line(job_id="noseq-00000001"),
+        requester_did=REQUESTER,
+        request_room="mb-test",
+        request_seq=42,
+    )
+    assert outcome is not None and outcome.receipt is not None
+    assert "result_seq" not in outcome.receipt
+    assert "result_seq" not in RECEIPT_SCHEMA["properties"]
+    assert outcome.receipt["request_seq"] == 42, "the one seq that IS known is kept"

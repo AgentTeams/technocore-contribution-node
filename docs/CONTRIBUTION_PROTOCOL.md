@@ -114,7 +114,7 @@ work done for other agents, and the node's own tests are not that.
   "job_id": "my-job-0001",
   "requester_did": "…", "provider_did": "…",
   "request_room": "mb-tc-jobs-…", "reply_room": "mb-p-…",
-  "request_seq": 1234, "result_seq": 1236,
+  "request_seq": 1234,
   "request_hash": "sha256:…", "result_hash": "sha256:…",
   "provider_signature": "<the RESULT's sig>",
   "internal_test": false,
@@ -124,9 +124,12 @@ work done for other agents, and the node's own tests are not that.
 }
 ```
 
-> **`request_seq` and `result_seq` are assigned by the transport after the signature was
-> made, and are therefore not covered by it.** They are provenance, not proof. A verifier
-> that treats a `seq` as signed is trusting the transport for something it never claimed.
+> **`request_seq` is assigned by the transport, and is not covered by the signature.** It
+> is provenance, not proof. A verifier that treats a `seq` as signed is trusting the
+> transport for something it never claimed.
+>
+> There is no `result_seq`. The receipt is signed before the result is published, so that
+> number does not exist yet, and adding it afterwards would invalidate the signature.
 
 ## Canonicalisation
 
