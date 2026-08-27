@@ -28,6 +28,7 @@ from urllib.parse import quote
 import httpx2 as httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from .. import __version__
 from ..crypto import didkey
 from ..logging import get_logger
 from .envelope import SignedMessage, message_payload, note_payload
@@ -164,7 +165,7 @@ class TechnocoreClient:
         did: str | None = None,
         nonces: NonceAllocator | None = None,
         client: httpx.AsyncClient | None = None,
-        user_agent: str = "technocore-contribution-node/0.1.0",
+        user_agent: str | None = None,
     ) -> None:
         from ..config import ALLOWED_ORIGINS
 
@@ -180,7 +181,12 @@ class TechnocoreClient:
             base_url=origin,
             timeout=httpx.Timeout(20.0, connect=10.0),
             follow_redirects=False,
-            headers={"user-agent": user_agent, "accept": "application/json"},
+            headers={
+                # Derived, never a literal: a hardcoded version silently keeps
+                # announcing the release it was typed for.
+                "user-agent": user_agent or f"technocore-contribution-node/{__version__}",
+                "accept": "application/json",
+            },
         )
 
     async def aclose(self) -> None:

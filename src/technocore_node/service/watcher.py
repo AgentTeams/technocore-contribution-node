@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx2 as httpx
 
+from .. import __version__
 from ..config import assert_allowed_origin
 from ..ledger.db import Ledger, utcnow
 from ..logging import get_logger
@@ -58,7 +59,9 @@ class ProtocolWatcher:
         owns = self._client is None
         if owns:
             self._client = httpx.AsyncClient(
-                headers={"user-agent": "technocore-contribution-node/0.1.0 (protocol-watcher)"}
+                headers={
+                    "user-agent": (f"technocore-contribution-node/{__version__} (protocol-watcher)")
+                }
             )
         try:
             per_source: dict[str, str] = {}
