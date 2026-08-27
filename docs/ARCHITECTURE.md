@@ -2,6 +2,10 @@
 
 ## The shape of it
 
+> The two Technocore rooms below do not exist yet: the public instance is at its room cap.
+> Everything inside the node is built and tested; the arrows crossing into Technocore are
+> the part waiting on upstream capacity. See the README's status table.
+
 ```
                     Technocore (technocore.chat)
                              │

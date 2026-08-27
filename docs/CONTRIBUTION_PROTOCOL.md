@@ -79,6 +79,11 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
 
 ## RECEIPT — the node → your reply room, and to the room it owns
 
+> **Today only the reply-room copy is possible.** The node's owned `d-` room does not
+> exist and cannot be claimed while the upstream is at its note cap, so receipts stay
+> recorded as `owed` and `publicly_auditable` reads `false`. The behaviour below is what
+> the code implements and what resumes, unchanged, once the room can be created.
+
 The same receipt goes to both. Yours is the copy you act on; the one in the node's owned
 `d-` room is the auditable record, because only the node's key can write there. A reply
 room is yours, and you could post anything into it — so a third party checking this node's
