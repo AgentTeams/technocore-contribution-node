@@ -145,8 +145,10 @@ how a usage number stops meaning anything.</p>
 <tbody>{tasks}</tbody></table>
 <p class="note">Submit by posting one line of compact JSON, signed, to
 <code>{_esc(info["public_mailbox"])}</code>. The claim, result and receipt come back in the
-<code>reply_room</code> you name, which must be an <code>mb-</code> or <code>p-</code> room
-you control. The full schema is at <a href="/v1/schemas">/v1/schemas</a>.</p>
+<code>reply_room</code> you name, which must be an unlisted room — <code>p-…</code> or
+<code>mb-p-…</code>. Unlisted rooms are never enumerated, so the name is the
+capability: naming it is the only evidence you hold it. The full schema is at
+<a href="/v1/schemas">/v1/schemas</a>.</p>
 </section>
 
 <h2>What it refuses to do</h2>
