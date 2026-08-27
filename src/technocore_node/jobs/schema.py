@@ -259,7 +259,11 @@ TASK_INPUT_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
             "job_id": {
                 "type": "string",
                 "pattern": JOB_ID_PATTERN,
-                "description": "Verify a chain this node itself published, end to end.",
+                "description": "Verify a receipt this node holds in its own ledger. It "
+                "checks the stored receipt's hashes and signature; it does not re-read "
+                "the published copy, so it says the receipt is internally sound, not "
+                "that it is currently visible in the owned room. Ask /v1/receipts/"
+                "<job_id> for that.",
             },
         },
     },

@@ -84,6 +84,9 @@ class Ledger:
         ("results", "status", "TEXT NOT NULL DEFAULT 'ok'"),
         ("results", "summary_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("receipts", "audit_seq", "INTEGER"),
+        ("receipts", "audit_state", "TEXT NOT NULL DEFAULT 'owed'"),
+        ("receipts", "audit_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("receipts", "audit_error", "TEXT"),
     )
 
     def _columns(self, table: str) -> set[str]:
@@ -376,16 +379,23 @@ class Ledger:
         self,
         receipt: dict[str, Any],
         receipt_json: str,
-        technocore_seq: int | None,
         internal_test: bool,
-        audit_seq: int | None = None,
     ) -> None:
+        """Persist a receipt before it is announced anywhere.
+
+        Order matters and this is the whole reason for it: the job is already marked
+        complete by the time a receipt exists, so if the row were written after
+        publishing, a crash in between would leave a completed job whose receipt does not
+        exist and whose duplicate check suppresses every retry. Written first, the worst
+        a crash costs is a copy that has not been announced yet — which the row says.
+        """
         with self.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO receipts (receipt_id, job_id, requester_did, "
                 "provider_did, request_hash, result_hash, provider_signature, receipt_hash, "
-                "receipt_json, technocore_seq, audit_seq, internal_test, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "receipt_json, technocore_seq, audit_seq, audit_state, audit_attempts, "
+                "internal_test, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?)",
                 (
                     receipt["receipt_id"],
                     receipt["job_id"],
@@ -394,43 +404,107 @@ class Ledger:
                     receipt["request_hash"],
                     receipt["result_hash"],
                     # The RESULT's detached signature, which is what this column is for.
-                    # `receipt["sig"]` is the receipt's own — storing it here would put
-                    # the wrong signature in the evidence column while receipt_json
-                    # stayed right, so nothing would look broken.
                     receipt["provider_signature"],
                     receipt["receipt_hash"],
                     receipt_json,
-                    technocore_seq,
-                    audit_seq,
+                    # An internal test is never announced publicly, so it is not owed.
+                    "published" if internal_test else "owed",
                     int(internal_test),
                     receipt["created_at"],
                 ),
             )
 
+    def record_receipt_reply_seq(self, job_id: str, seq: int) -> None:
+        with self.tx() as conn:
+            conn.execute("UPDATE receipts SET technocore_seq = ? WHERE job_id = ?", (seq, job_id))
+
     def set_audit_seq(self, job_id: str, audit_seq: int) -> None:
         """Record that the auditable copy landed in the owned room."""
         with self.tx() as conn:
-            conn.execute("UPDATE receipts SET audit_seq = ? WHERE job_id = ?", (audit_seq, job_id))
+            conn.execute(
+                "UPDATE receipts SET audit_seq = ?, audit_state = 'published', "
+                "audit_error = NULL WHERE job_id = ?",
+                (audit_seq, job_id),
+            )
+
+    def note_audit_attempt(self, job_id: str, error: str, max_attempts: int) -> bool:
+        """Count a failed attempt, quarantining the row once it has had enough.
+
+        Returns True when the row was quarantined. Without this, one receipt that can
+        never be published sits at the head of an ordered queue and every receipt behind
+        it waits forever — the backlog stops being a backlog and becomes a blockage.
+        """
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE receipts SET audit_attempts = audit_attempts + 1, audit_error = ? "
+                "WHERE job_id = ?",
+                (error[:200], job_id),
+            )
+            row = conn.execute(
+                "SELECT audit_attempts FROM receipts WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            quarantine = row is not None and int(row["audit_attempts"]) >= max_attempts
+            if quarantine:
+                conn.execute(
+                    "UPDATE receipts SET audit_state = 'quarantined' WHERE job_id = ?",
+                    (job_id,),
+                )
+        return quarantine
+
+    def quarantine_receipt(self, job_id: str, error: str) -> None:
+        """Take a row out of the queue immediately — for one that can never succeed."""
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE receipts SET audit_state = 'quarantined', audit_error = ? WHERE job_id = ?",
+                (error[:200], job_id),
+            )
 
     def receipts_awaiting_audit_copy(self, limit: int = 5) -> Sequence[sqlite3.Row]:
-        """Receipts whose owned-room copy is still owed, oldest first.
+        """Receipts whose owned-room copy is still owed: fewest attempts first.
 
-        Bounded on purpose: this is drained a few at a time from the poll loop, so a
-        backlog after an outage cannot turn into a write storm against the upstream's
-        rate limit the moment the node recovers.
+        Ordering by attempts rather than by age is what keeps a struggling row from
+        starving the queue before it is quarantined — a fresh receipt is tried before one
+        that has already failed twice.
         """
         return self.conn.execute(
-            "SELECT job_id, receipt_json FROM receipts "
-            "WHERE audit_seq IS NULL AND internal_test = 0 "
-            "ORDER BY created_at LIMIT ?",
+            "SELECT job_id, receipt_json, audit_attempts FROM receipts "
+            "WHERE audit_state = 'owed' AND internal_test = 0 "
+            "ORDER BY audit_attempts, created_at LIMIT ?",
             (limit,),
         ).fetchall()
 
-    def audit_backlog(self) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) n FROM receipts WHERE audit_seq IS NULL AND internal_test = 0"
-        ).fetchone()
-        return int(row["n"])
+    def audit_backlog(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT audit_state, COUNT(*) n FROM receipts WHERE internal_test = 0 "
+            "GROUP BY audit_state"
+        ).fetchall()
+        counts = {str(r["audit_state"]): int(r["n"]) for r in rows}
+        return {
+            "owed": counts.get("owed", 0),
+            "quarantined": counts.get("quarantined", 0),
+            "published": counts.get("published", 0),
+        }
+
+    def mark_published_by_job_ids(self, seq_by_job: dict[str, int]) -> int:
+        """Fill in `audit_seq` for receipts observed in the owned room.
+
+        This is what makes republishing safe after a crash, and what stops a database
+        migrated from an older build from re-announcing everything it already published:
+        the room is the authority on what is in it, so it is read before anything is
+        written to it again.
+        """
+        if not seq_by_job:
+            return 0
+        updated = 0
+        with self.tx() as conn:
+            for job_id, seq in seq_by_job.items():
+                cur = conn.execute(
+                    "UPDATE receipts SET audit_seq = ?, audit_state = 'published', "
+                    "audit_error = NULL WHERE job_id = ? AND audit_state != 'published'",
+                    (seq, job_id),
+                )
+                updated += cur.rowcount
+        return updated
 
     def get_receipt(self, job_id: str) -> sqlite3.Row | None:
         return _row(

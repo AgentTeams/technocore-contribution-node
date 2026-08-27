@@ -163,7 +163,8 @@ def test_a_receipt_is_served_once_recorded(client: TestClient, env: dict[str, st
         "receipt_hash": "sha256:" + "2" * 64,
         "created_at": "2026-08-27T00:00:00Z",
     }
-    ledger.record_receipt(receipt, json.dumps(receipt), 12, False)
+    ledger.record_receipt(receipt, json.dumps(receipt), internal_test=False)
+    ledger.record_receipt_reply_seq("served-job-0001", 12)
 
     body = client.get("/v1/receipts/served-job-0001").json()
     assert body["status"] == "completed"
@@ -213,4 +214,4 @@ def test_a_receipt_without_its_job_is_refused(env: dict[str, str]) -> None:
         "created_at": "2026-08-27T00:00:00Z",
     }
     with pytest.raises(sqlite3.IntegrityError):
-        Ledger(env["TCN_DB_PATH"]).record_receipt(orphan, json.dumps(orphan), None, False)
+        Ledger(env["TCN_DB_PATH"]).record_receipt(orphan, json.dumps(orphan), internal_test=False)

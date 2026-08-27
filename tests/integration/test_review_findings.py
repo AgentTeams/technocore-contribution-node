@@ -305,7 +305,7 @@ async def test_the_receipt_row_stores_the_results_signature(
         text=job_line(), requester_did=REQUESTER, request_room="mb-test", request_seq=1
     )
     assert outcome is not None and outcome.receipt is not None
-    ledger.record_receipt(outcome.receipt, json.dumps(outcome.receipt), 5, internal_test=False)
+    ledger.record_receipt(outcome.receipt, json.dumps(outcome.receipt), internal_test=False)
 
     row = ledger.get_receipt(outcome.job_id)
     assert row is not None
@@ -593,14 +593,13 @@ async def test_an_unpublished_audit_copy_is_recorded_as_owed_not_shrugged_off(
     )
     assert outcome is not None and outcome.receipt is not None
 
-    ledger.record_receipt(
-        outcome.receipt, json.dumps(outcome.receipt), 11, internal_test=False, audit_seq=None
-    )
-    assert ledger.audit_backlog() == 1
+    ledger.record_receipt(outcome.receipt, json.dumps(outcome.receipt), internal_test=False)
+    assert ledger.audit_backlog()["owed"] == 1
     assert [r["job_id"] for r in ledger.receipts_awaiting_audit_copy()] == ["owed-000000001"]
 
     ledger.set_audit_seq("owed-000000001", 42)
-    assert ledger.audit_backlog() == 0
+    assert ledger.audit_backlog()["owed"] == 0
+    assert ledger.audit_backlog()["published"] == 1
     assert ledger.receipts_awaiting_audit_copy() == []
     assert ledger.get_receipt("owed-000000001")["audit_seq"] == 42
 
@@ -617,12 +616,172 @@ async def test_an_internal_test_receipt_is_never_counted_as_owed(
         internal_test=True,
     )
     assert outcome is not None and outcome.receipt is not None
-    ledger.record_receipt(
-        outcome.receipt, json.dumps(outcome.receipt), 1, internal_test=True, audit_seq=None
-    )
-    assert ledger.audit_backlog() == 0
+    ledger.record_receipt(outcome.receipt, json.dumps(outcome.receipt), internal_test=True)
+    assert ledger.audit_backlog()["owed"] == 0
 
 
 def test_the_reconciler_is_bounded(ledger: Ledger) -> None:
     """A backlog after an outage must not become a write storm on recovery."""
     assert len(ledger.receipts_awaiting_audit_copy(limit=3)) <= 3
+
+
+# ------------------------------------- the receipt must survive a crash
+
+
+async def test_a_receipt_is_durable_before_it_is_announced(
+    runner: JobRunner, ledger: Ledger
+) -> None:
+    """A crash between finishing the work and announcing it must not lose the receipt.
+
+    The job is already marked complete by the time a receipt exists, so if the row were
+    written after publishing, a crash in between would leave a completed job whose
+    receipt does not exist — and whose duplicate check suppresses every retry. It would
+    be gone, silently and permanently.
+    """
+    outcome = await runner.handle(
+        text=job_line(job_id="durable-000001"),
+        requester_did=REQUESTER,
+        request_room="mb-test",
+        request_seq=1,
+    )
+    assert outcome is not None and outcome.receipt is not None
+
+    # Exactly what process_message does before it publishes anything at all.
+    ledger.record_receipt(outcome.receipt, json.dumps(outcome.receipt), internal_test=False)
+
+    row = ledger.get_receipt("durable-000001")
+    assert row is not None
+    assert row["technocore_seq"] is None, "not yet announced to the requester"
+    assert row["audit_seq"] is None, "not yet announced publicly"
+    assert row["audit_state"] == "owed"
+    assert [r["job_id"] for r in ledger.receipts_awaiting_audit_copy()] == ["durable-000001"]
+
+
+def test_a_receipt_already_in_the_owned_room_is_not_published_again(ledger: Ledger) -> None:
+    """The room is the authority on what is in it.
+
+    Without consulting it, a crash between publishing and recording would republish on
+    the next pass, and a database migrated from an older build would re-announce every
+    receipt it had ever published.
+    """
+    receipt = {
+        "receipt_id": "rcpt-abcdef123456",
+        "job_id": "already-0000001",
+        "requester_did": REQUESTER,
+        "provider_did": OTHER,
+        "request_hash": "sha256:" + "0" * 64,
+        "result_hash": "sha256:" + "1" * 64,
+        "provider_signature": "b" * 86,
+        "receipt_hash": "sha256:" + "2" * 64,
+        "sig": "a" * 86,
+        "created_at": "2026-08-28T00:00:00Z",
+    }
+    ledger.insert_job(
+        job_id="already-0000001",
+        protocol_version="1",
+        requester_did=REQUESTER,
+        provider_did=OTHER,
+        request_room="mb-x",
+        reply_room="mb-p-y",
+        request_seq=1,
+        request_hash="sha256:" + "0" * 64,
+        task_type="canonical_json_sha256",
+        status="completed",
+        internal_test=False,
+    )
+    ledger.record_receipt(receipt, json.dumps(receipt), internal_test=False)
+    assert ledger.audit_backlog()["owed"] == 1
+
+    # What sync_owned_room does after reading the room back.
+    assert ledger.mark_published_by_job_ids({"already-0000001": 77}) == 1
+    assert ledger.audit_backlog()["owed"] == 0
+    assert ledger.get_receipt("already-0000001")["audit_seq"] == 77
+    assert ledger.receipts_awaiting_audit_copy() == []
+
+    # Idempotent: seeing it again changes nothing.
+    assert ledger.mark_published_by_job_ids({"already-0000001": 77}) == 0
+
+
+def test_a_receipt_that_never_publishes_is_quarantined_not_left_blocking(
+    ledger: Ledger,
+) -> None:
+    """One unpublishable receipt at the head of an ordered queue would stall every
+    receipt behind it. The backlog would stop being a backlog and become a blockage."""
+    for i in range(2):
+        job_id = f"stuck-{i:010d}"
+        ledger.insert_job(
+            job_id=job_id,
+            protocol_version="1",
+            requester_did=REQUESTER,
+            provider_did=OTHER,
+            request_room="mb-x",
+            reply_room="mb-p-y",
+            request_seq=i,
+            request_hash="sha256:" + "0" * 64,
+            task_type="canonical_json_sha256",
+            status="completed",
+            internal_test=False,
+        )
+        receipt = {
+            "receipt_id": f"rcpt-{i:012d}",
+            "job_id": job_id,
+            "requester_did": REQUESTER,
+            "provider_did": OTHER,
+            "request_hash": "sha256:" + "0" * 64,
+            "result_hash": "sha256:" + "1" * 64,
+            "provider_signature": "b" * 86,
+            "receipt_hash": "sha256:" + "2" * 64,
+            "sig": "a" * 86,
+            "created_at": f"2026-08-28T00:00:0{i}Z",
+        }
+        ledger.record_receipt(receipt, json.dumps(receipt), internal_test=False)
+
+    for attempt in range(1, 6):
+        quarantined = ledger.note_audit_attempt("stuck-0000000000", "upstream refused", 5)
+        assert quarantined is (attempt == 5)
+
+    assert ledger.audit_backlog() == {"owed": 1, "quarantined": 1, "published": 0}
+    # The healthy receipt behind it is now at the head of the queue.
+    assert [r["job_id"] for r in ledger.receipts_awaiting_audit_copy()] == ["stuck-0000000001"]
+
+
+def test_the_queue_tries_the_least_failed_receipt_first(ledger: Ledger) -> None:
+    """Ordering by age alone lets a struggling row hold the head slot until it is
+    quarantined, delaying every fresh receipt behind it."""
+    for i in range(2):
+        job_id = f"order-{i:010d}"
+        ledger.insert_job(
+            job_id=job_id,
+            protocol_version="1",
+            requester_did=REQUESTER,
+            provider_did=OTHER,
+            request_room="mb-x",
+            reply_room="mb-p-y",
+            request_seq=i,
+            request_hash="sha256:" + "0" * 64,
+            task_type="canonical_json_sha256",
+            status="completed",
+            internal_test=False,
+        )
+        ledger.record_receipt(
+            {
+                "receipt_id": f"rcpt-o{i:011d}",
+                "job_id": job_id,
+                "requester_did": REQUESTER,
+                "provider_did": OTHER,
+                "request_hash": "sha256:" + "0" * 64,
+                "result_hash": "sha256:" + "1" * 64,
+                "provider_signature": "b" * 86,
+                "receipt_hash": "sha256:" + "2" * 64,
+                "sig": "a" * 86,
+                "created_at": f"2026-08-28T00:00:0{i}Z",
+            },
+            "{}",
+            internal_test=False,
+        )
+
+    ledger.note_audit_attempt("order-0000000000", "upstream refused", 5)
+    assert [r["job_id"] for r in ledger.receipts_awaiting_audit_copy()] == [
+        "order-0000000001",
+        "order-0000000000",
+    ]

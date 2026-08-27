@@ -99,10 +99,19 @@ CREATE TABLE IF NOT EXISTS receipts (
     receipt_hash       TEXT NOT NULL,
     receipt_json       TEXT NOT NULL,
     technocore_seq     INTEGER,          -- seq of the copy in the requester's reply room
-    -- seq of the copy in this node's OWNED room: the auditable one, because only this
-    -- node's key can write there. NULL means it has not landed yet and is still owed —
-    -- a receipt the requester holds but nobody else can check is not the contract.
+    -- The copy in this node's OWNED room: the auditable one, because only this node's
+    -- key can write there.
+    --
+    -- The row is written BEFORE either publish, so a crash between doing the work and
+    -- announcing it leaves a record that says what is still owed. Written afterwards, the
+    -- job would already be marked complete, the duplicate check would suppress any retry,
+    -- and the receipt would simply be gone.
     audit_seq          INTEGER,
+    -- owed | published | quarantined. Quarantined rows are excluded from the retry queue
+    -- so that one unpublishable receipt cannot starve every receipt behind it.
+    audit_state        TEXT NOT NULL DEFAULT 'owed',
+    audit_attempts     INTEGER NOT NULL DEFAULT 0,
+    audit_error        TEXT,
     internal_test      INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL
 );

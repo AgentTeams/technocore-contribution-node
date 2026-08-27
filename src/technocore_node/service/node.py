@@ -243,6 +243,18 @@ class Node:
         if outcome is None:
             return
 
+        receipt = outcome.receipt
+        receipt_json = ""
+        if receipt is not None:
+            # Recorded before anything is announced. A crash after this point costs an
+            # unannounced copy, which the row says is owed; a crash before it, with the
+            # job already marked complete, would lose the receipt entirely — the
+            # duplicate check would suppress every retry.
+            receipt_json = json.dumps(
+                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+            )
+            self.ledger.record_receipt(receipt, receipt_json, outcome.internal_test)
+
         await self.publish(outcome.reply_room, outcome.claim)
         result_seq = await self.publish(outcome.reply_room, outcome.result)
         if result_seq is not None:
@@ -256,35 +268,19 @@ class Node:
                 result_seq=result_seq,
             )
 
-        receipt = outcome.receipt
         if receipt is not None:
-            receipt_json = json.dumps(
-                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-            )
-            published_seq = await self.publish(outcome.reply_room, receipt)
+            reply_seq = await self.publish(outcome.reply_room, receipt)
+            if reply_seq is not None:
+                self.ledger.record_receipt_reply_seq(outcome.job_id, reply_seq)
 
-            # The same receipt also goes to the room this node owns, where only its key
-            # can write. That is the difference between "the requester has a receipt" and
-            # "anyone can audit what this node did" — the reply room is the requester's,
-            # and they can post anything they like into it.
+            # The auditable copy goes to the room only this node's key can write to. It
+            # is owed rather than best-effort: if it does not land now, the row stays
+            # `owed` and the reconciler keeps trying.
             #
             # Internal tests are excluded: the owned room is a public claim about work
             # done for other agents, and this node's own tests are not that.
-            audit_seq = None
             if not outcome.internal_test:
-                audit_seq = await self.publish(self.result_room, receipt)
-
-            self.ledger.record_receipt(
-                receipt, receipt_json, published_seq, outcome.internal_test, audit_seq
-            )
-            if audit_seq is None and not outcome.internal_test:
-                # The requester has their copy and the public one is still owed. Recorded
-                # as owed rather than shrugged off: a receipt only they can see does not
-                # meet the contract, and the reconciler below will keep trying.
-                log.warning(
-                    "receipt published to the requester but not yet to the owned room",
-                    extra={"fields": {"job_id": outcome.job_id, "room": self.result_room}},
-                )
+                await self.publish_audit_copy(outcome.job_id, receipt)
 
         log.info(
             "job completed",
@@ -297,28 +293,82 @@ class Node:
             },
         )
 
+    #: Attempts before a receipt is taken out of the retry queue.
+    MAX_AUDIT_ATTEMPTS = 5
+
+    async def publish_audit_copy(self, job_id: str, receipt: dict[str, Any]) -> int | None:
+        """Publish one receipt to the owned room and record the outcome."""
+        seq = await self.publish(self.result_room, receipt)
+        if seq is not None:
+            self.ledger.set_audit_seq(job_id, seq)
+            return seq
+        quarantined = self.ledger.note_audit_attempt(
+            job_id, "publish to the owned room failed", self.MAX_AUDIT_ATTEMPTS
+        )
+        log.warning(
+            "receipt not yet publicly auditable",
+            extra={"fields": {"job_id": job_id, "quarantined": quarantined}},
+        )
+        return None
+
+    async def sync_owned_room(self) -> int:
+        """Read the owned room and mark every receipt already there as published.
+
+        The room is the authority on what is in it, so it is consulted before anything is
+        written to it again. This is what makes retrying safe after a crash between the
+        publish and the record, and what stops a database migrated from an older build
+        from re-announcing receipts it published long ago.
+        """
+        since = self.ledger.cursor(self.result_room)
+        try:
+            data = await self.client.read_room(self.result_room, since=since)
+        except TechnocoreError:
+            # The owned room may not exist yet, or the upstream may be refusing reads.
+            # Neither is a reason to fail a job; the next pass tries again.
+            return 0
+
+        seq_by_job: dict[str, int] = {}
+        for message in data.get("messages", []):
+            if message.get("from") != self.did:
+                continue
+            try:
+                published = json.loads(str(message.get("text", "")))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(published, dict) and published.get("type") == "receipt":
+                job_id = published.get("job_id")
+                if isinstance(job_id, str):
+                    seq_by_job[job_id] = int(message.get("seq", 0))
+
+        marked = self.ledger.mark_published_by_job_ids(seq_by_job)
+        last_seq = data.get("last_seq")
+        if last_seq is not None:
+            self.ledger.set_cursor(self.result_room, int(last_seq))
+        return marked
+
     async def reconcile_audit_copies(self, limit: int = 3) -> int:
         """Publish owed owned-room copies, a few at a time. Returns how many landed.
 
-        The owned-room write can fail for reasons that have nothing to do with the job —
-        a rate limit, an upstream at capacity, a transient error — and when it does, the
-        requester holds a receipt nobody else can check. Retrying it here means the
-        contract is eventually kept rather than quietly broken, and the bound means a
-        backlog after an outage does not become a write storm on recovery.
+        Bounded so that a backlog after an outage cannot become a write storm the moment
+        the node recovers, and preceded by a room sync so a copy that did land during a
+        crash is recognised rather than posted twice.
         """
+        await self.sync_owned_room()
+
         landed = 0
         for row in self.ledger.receipts_awaiting_audit_copy(limit):
+            job_id = str(row["job_id"])
             try:
                 receipt = json.loads(row["receipt_json"])
             except json.JSONDecodeError:
+                # No number of retries will fix this one, so it leaves the queue now
+                # rather than occupying a slot in it forever.
+                self.ledger.quarantine_receipt(job_id, "stored receipt is not valid JSON")
                 log.error(
-                    "stored receipt is not valid JSON; skipping",
-                    extra={"fields": {"job_id": row["job_id"]}},
+                    "quarantined an unparseable receipt", extra={"fields": {"job_id": job_id}}
                 )
                 continue
-            seq = await self.publish(self.result_room, receipt)
-            if seq is not None:
-                self.ledger.set_audit_seq(str(row["job_id"]), seq)
+            if await self.publish_audit_copy(job_id, receipt) is not None:
                 landed += 1
         return landed
 

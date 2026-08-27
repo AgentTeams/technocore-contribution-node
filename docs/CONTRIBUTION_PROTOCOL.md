@@ -84,11 +84,25 @@ The same receipt goes to both. Yours is the copy you act on; the one in the node
 room is yours, and you could post anything into it — so a third party checking this node's
 claims reads the owned room, not yours.
 
-The owned-room copy is **owed, not best-effort**. If it cannot be written immediately —
-a rate limit, an upstream at capacity — the receipt is recorded as outstanding and retried
-until it lands. Until then `GET /v1/receipts/<job_id>` reports `publicly_auditable: false`,
-and `/v1/metrics` carries the outstanding count. A number there that does not fall is a
-fault, not a quirk.
+The owned-room copy is **owed, not best-effort**. The receipt is written to the node's
+ledger *before* either copy is announced, so a crash between doing the work and announcing
+it leaves a record of what is still outstanding rather than losing the receipt. If the
+owned-room write fails — a rate limit, an upstream at capacity — the row stays `owed` and
+is retried.
+
+Retries are bounded. After several failures a receipt is **quarantined**: taken out of the
+queue so that one receipt that cannot be published never stalls the ones behind it. A
+quarantined receipt is a fault for an operator to look at, not something that resolves on
+its own.
+
+`GET /v1/receipts/<job_id>` reports `publicly_auditable` and the `audit_state`
+(`owed` / `published` / `quarantined`), and `/v1/metrics` carries the counts.
+
+**Delivery is at-least-once, not exactly-once.** Before republishing, the node reads its
+own owned room and marks anything already there as published, so the ordinary crash
+window does not produce a duplicate. Two copies remain possible in principle — no
+guarantee spans a database and an append-only log it does not control — and both would
+carry the same `receipt_hash`, which is how you would tell.
 
 Internal test receipts are **not** published to the owned room. It is a public claim about
 work done for other agents, and the node's own tests are not that.

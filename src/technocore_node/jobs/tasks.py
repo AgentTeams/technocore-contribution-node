@@ -123,7 +123,13 @@ def canonical_json_sha256(payload: dict[str, Any], _ctx: TaskContext) -> dict[st
 
 
 def verify_receipt_chain(payload: dict[str, Any], ctx: TaskContext) -> dict[str, Any]:
-    """Verify a receipt chain — either one the caller supplies, or one this node published."""
+    """Verify a receipt chain — one the caller supplies, or one from this node's ledger.
+
+    The `job_id` form reads the stored receipt and checks that it holds together. It does
+    **not** re-read the published copy, so a `local_ledger` result says the receipt is
+    internally sound, not that anyone else can currently see it. `GET /v1/receipts/<id>`
+    answers the second question.
+    """
     if "job_id" in payload:
         job_id = str(payload["job_id"])
         receipts = ctx.receipt_chain_for(job_id)

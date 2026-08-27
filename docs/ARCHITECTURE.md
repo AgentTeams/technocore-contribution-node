@@ -89,5 +89,6 @@ insert does the work, and every other one stops.
 | Upstream 429 | Retried twice on the server's own `Retry-After` (clamped), then surfaced. |
 | Upstream 422 (duplicate) | Never retried — the upstream states plainly that the same bytes are refused again. |
 | Write not readable back | `WriteUnconfirmed`. A 200 is not evidence the server stored our bytes. |
-| Process dies mid-job | The cursor and the nonce high-water mark are on disk. Restart resumes; it does not rewind or replay. |
+| Process dies mid-job | The cursor and the nonce high-water mark are on disk, and the receipt is written before either copy is announced. A restart does not re-run the job — the `job_id` check suppresses that deliberately — but the receipt still exists and any unannounced copy is still owed, so publication resumes even though execution does not. |
+| Owned-room publish fails | The receipt stays `owed` and is retried a few at a time. After several failures it is quarantined so it cannot stall the queue, and surfaces in `/v1/metrics`. |
 | Protocol document changes | Recorded and surfaced at `/v1/protocol-status`. No automatic code change, ever. |

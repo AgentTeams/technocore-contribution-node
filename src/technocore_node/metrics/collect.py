@@ -51,12 +51,14 @@ def build_metrics(ledger: Ledger, *, started_at: str, source_commit: str = "") -
             "note": "Third-party jobs only. Null until at least one has completed.",
         },
         "completed_by_task": ledger.task_breakdown(),
-        "receipts_awaiting_audit_copy": {
-            "count": ledger.audit_backlog(),
+        "audit_copies": {
+            **ledger.audit_backlog(),
             "note": (
-                "Receipts published to the requester but not yet to this node's owned "
-                "room. Until that copy lands, a third party has nothing to check them "
-                "against. Retried automatically; a number that does not fall is a fault."
+                "Where each receipt's auditable copy stands. `owed` means published to "
+                "the requester but not yet to this node's owned room, so a third party "
+                "has nothing to check it against yet; it is retried automatically. "
+                "`quarantined` means retries were given up on — that is a fault to look "
+                "at, not a number to watch."
             ),
         },
         "rejections_by_code": ledger.rejection_counts(),

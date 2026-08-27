@@ -224,8 +224,7 @@ async def test_verify_receipt_chain_over_this_nodes_own_receipt(
     ledger.record_receipt(
         first.receipt,
         json.dumps(first.receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
-        99,
-        False,
+        internal_test=False,
     )
 
     second = await runner.handle(
