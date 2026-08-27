@@ -159,8 +159,14 @@ jobs:
               sys.exit(f"upstream_repo is {repo!r}, expected {os.environ['EXPECTED_REPO']!r}")
           if not re.fullmatch(r"[0-9a-f]{40}", commit):
               sys.exit("upstream_commit is not a full 40-character hex SHA")
+          version = snap["service_version"]
+          # $GITHUB_OUTPUT is line-based, so an unvalidated value carrying a newline
+          # writes a second output of its choosing — including one that overrides the
+          # commit validated on the line above.
+          if not re.fullmatch(r"[0-9A-Za-z.+-]{1,32}", version):
+              sys.exit(f"service_version is not a plain single-line version: {version!r}")
           print(f"commit={commit}")
-          print(f"version={snap['service_version']}")
+          print(f"version={version}")
           EOF
           echo "pinned upstream commit: $(grep '^commit=' "$GITHUB_OUTPUT" | tail -1)"
 

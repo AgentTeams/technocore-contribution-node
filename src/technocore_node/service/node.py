@@ -18,6 +18,7 @@ import asyncio
 import json
 from typing import Any
 
+import httpx2 as httpx
 import jsonschema
 
 from ..config import Settings
@@ -149,6 +150,12 @@ class Node:
         try:
             confirmation = await self.client.say_signed(room, text)
         except (RateLimited, DuplicateRefused, TechnocoreError) as exc:
+            # Keep the server's own words. When the reason a receipt cannot be published
+            # is upstream capacity, that sentence is the most useful thing this node can
+            # hand a reader asking whether it works — and it is observed rather than
+            # typed into a README.
+            if room in (self.result_room, self.mailbox):
+                self.ledger.set_state(f"last_publish_error:{room}", str(exc)[:300])
             self.ledger.record_message(
                 local_event_id=f"out-{obj.get('type')}-{obj.get('job_id', '')}-{utcnow()}",
                 direction="out",
@@ -327,7 +334,7 @@ class Node:
         """
         try:
             owner = await self.client.room_owner(self.result_room)
-        except TechnocoreError as exc:
+        except (TechnocoreError, httpx.HTTPError) as exc:
             self.ledger.set_state("owned_room_owner", None)
             self.ledger.set_state("owned_room_error", str(exc)[:300])
             return
@@ -483,10 +490,13 @@ class Node:
         if not self.settings.public_url:
             blockers.append("no public HTTPS endpoint is configured (no DNS record)")
 
-        if completed > 0:
-            intake = "available"
-        elif blockers:
+        # Blockers are about now; a completed job is about the past. A node that once
+        # served somebody and is unreachable today is unreachable today, so the current
+        # facts decide and history only distinguishes "working" from "never tried".
+        if blockers:
             intake = "unavailable"
+        elif completed > 0:
+            intake = "available"
         else:
             intake = "unverified"
 

@@ -60,19 +60,48 @@ def test_an_unobserved_node_says_so_rather_than_guessing(node: Node) -> None:
     assert availability["owned_result_room"]["owned_by_this_node"] is True
 
 
-def test_an_upstream_refusal_becomes_a_stated_blocker(node: Node) -> None:
-    """The server's own words, kept.
+async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) -> None:
+    """Driven through `publish()`, not by seeding the state by hand.
 
-    When the reason a receipt cannot be published is upstream capacity, that sentence is
-    the most useful thing this node can hand a reader asking whether it works.
+    The first version of this test wrote the state itself and passed while the recording
+    side was never wired up at all — it proved the reporting worked and nothing about
+    whether anything would ever call it. A test that supplies its own precondition cannot
+    tell you the production path exists.
     """
-    node.ledger.set_state(
-        f"last_publish_error:{node.result_room}",
-        "HTTP 400: 400 room limit reached (20480 is the cap, and this would be a new one).",
-    )
+    from technocore_node.protocol.client import TechnocoreError
+
+    async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
+        raise TechnocoreError(
+            "HTTP 400: 400 room limit reached (20480 is the cap, and this would be a new one)."
+        )
+
+    node.client.say_signed = refuse  # type: ignore[method-assign]
+    assert await node.publish(node.result_room, {"type": "receipt", "job_id": "x"}) is None
+
     availability = node.availability()
     assert availability["third_party_intake"] == "unavailable"
-    assert any("room limit reached" in b for b in availability["blockers"])
+    assert any("room limit reached" in b for b in availability["blockers"]), availability
+
+
+async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
+    """The record has to be able to go away again, or it is a permanent scar."""
+    from technocore_node.protocol.client import Confirmation, TechnocoreError
+
+    async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
+        raise TechnocoreError("HTTP 400: 400 room limit reached")
+
+    node.client.say_signed = refuse  # type: ignore[method-assign]
+    await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
+    assert any("room limit" in b for b in node.availability()["blockers"])
+
+    async def accept(room: str, text: str, *, confirm: bool = True) -> Confirmation:
+        return Confirmation(
+            room=room, did=node.did, nonce=1, text=text, sig="a" * 86, seq=9, ts="now"
+        )
+
+    node.client.say_signed = accept  # type: ignore[method-assign]
+    await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
+    assert not any("room limit" in b for b in node.availability()["blockers"])
 
 
 def test_a_missing_public_url_is_a_blocker_not_a_footnote(node: Node) -> None:
@@ -116,11 +145,9 @@ def test_availability_reports_the_receipt_split(client: TestClient) -> None:
     }
 
 
-def test_a_completed_third_party_job_is_what_flips_intake(node: Node, env: dict[str, str]) -> None:
-    """The only route to `available`, and it goes through the ledger's own counter."""
-    ledger = Ledger(env["TCN_DB_PATH"])
+def _completed_third_party_job(ledger: Ledger, node: Node, job_id: str = "real-job-0001") -> None:
     ledger.insert_job(
-        job_id="real-job-000001",
+        job_id=job_id,
         protocol_version="1",
         requester_did=REQUESTER,
         provider_did=node.did,
@@ -132,7 +159,35 @@ def test_a_completed_third_party_job_is_what_flips_intake(node: Node, env: dict[
         status="completed",
         internal_test=False,
     )
-    ledger.update_job("real-job-000001", status="completed", latency_ms=12)
+    ledger.update_job(job_id, status="completed", latency_ms=12)
+
+
+def test_past_success_does_not_override_a_current_blocker(node: Node, env: dict[str, str]) -> None:
+    """Blockers are about now; a completed job is about the past.
+
+    A node that once served somebody and is unreachable today is unreachable today. Left
+    the other way round, one historical job would have pinned the banner to `available`
+    for good.
+    """
+    _completed_third_party_job(Ledger(env["TCN_DB_PATH"]), node)
+    availability = node.availability()
+    assert availability["third_party_jobs_completed"] == 1
+    assert availability["blockers"], "public_url is unset in this fixture"
+    assert availability["third_party_intake"] == "unavailable"
+
+
+def test_intake_reads_available_only_with_a_job_and_no_blockers(
+    node: Node, env: dict[str, str]
+) -> None:
+    """Both halves are required, and each is checked without the other."""
+    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    node.ledger.set_state("owned_room_owner", node.did)
+
+    # No blockers, but nobody has used it: not `available`.
+    assert node.availability()["blockers"] == []
+    assert node.availability()["third_party_intake"] == "unverified"
+
+    _completed_third_party_job(Ledger(env["TCN_DB_PATH"]), node)
     assert node.availability()["third_party_intake"] == "available"
 
 

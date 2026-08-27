@@ -223,6 +223,19 @@ class TechnocoreClient:
             raise TechnocoreError(f"HTTP {response.status_code}: {response.text[:300]}")
         return response
 
+    async def _direct(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """One request with no retry, mapping transport faults into our own error type.
+
+        The paths that need to see a raw status — a 404 that means "no such note", a 409
+        that means "you lost the race" — cannot go through `_request`, which raises on
+        both. They still must not leak `httpx` exceptions at their callers, who catch
+        `TechnocoreError` and would otherwise let a DNS blip escape as something else.
+        """
+        try:
+            return await self._http.request(method, path, **kwargs)
+        except httpx.HTTPError as exc:
+            raise TechnocoreError(f"transport failure: {type(exc).__name__}") from exc
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         """One request, retrying only what is genuinely retryable.
 
@@ -286,7 +299,7 @@ class TechnocoreClient:
         if not (valid_name(namespace) and valid_name(key)):
             raise TechnocoreError("invalid note path")
         path = f"/kv/{quote(namespace, safe='')}/{quote(key, safe='')}"
-        response = await self._http.get(path, headers={"accept": "text/plain"})
+        response = await self._direct("GET", path, headers={"accept": "text/plain"})
         if response.status_code == 404:
             return None
         return strip_banner(self._check(response).text)
@@ -383,7 +396,7 @@ class TechnocoreClient:
         if if_match is not None:
             body["if"] = if_match
         path = f"/kv/{quote(namespace, safe='')}/{quote(key, safe='')}"
-        response = await self._http.post(path, json=body)
+        response = await self._direct("POST", path, json=body)
         if response.status_code == 409:
             raise TechnocoreError("note changed since it was read (409)")
         self._check(response)
@@ -412,7 +425,8 @@ class TechnocoreClient:
         nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000))
         payload = note_payload("room-owners", room, nonce, self.did)
         sig = didkey.sign(self._key, payload)
-        response = await self._http.post(
+        response = await self._direct(
+            "POST",
             f"/kv/room-owners/{quote(room, safe='')}",
             json={
                 "value": self.did,
