@@ -208,3 +208,30 @@ def test_an_internal_test_job_does_not_flip_intake(node: Node, env: dict[str, st
         internal_test=True,
     )
     assert node.availability()["third_party_intake"] != "available"
+
+
+def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
+    node: Node, env: dict[str, str]
+) -> None:
+    """Stronger than being unowned, not weaker.
+
+    An unclaimed room can still be claimed; one held by another key never will be, and
+    the entire value of that room is that only this node can write to it. Reported the
+    other way round, a node whose audit room belonged to a stranger could still have
+    announced itself `available`.
+    """
+    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    _completed_third_party_job(Ledger(env["TCN_DB_PATH"]), node)
+    stranger = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+    node.ledger.set_state("owned_room_owner", stranger)
+
+    availability = node.availability()
+    assert availability["owned_result_room"]["owned_by_this_node"] is False
+    assert any("different key" in b for b in availability["blockers"]), availability
+    assert availability["third_party_intake"] == "unavailable"
+
+
+def test_our_own_ownership_is_not_a_blocker(node: Node, env: dict[str, str]) -> None:
+    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    node.ledger.set_state("owned_room_owner", node.did)
+    assert node.availability()["blockers"] == []

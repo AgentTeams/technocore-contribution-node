@@ -480,10 +480,19 @@ class Node:
 
         completed = int(metrics["completed_jobs"])
         blockers: list[str] = []
-        if owner is None and owner_at is not None:
+        if owner_at is not None and owner is None:
             blockers.append(
                 "this node's owned result room has no owner note, so receipts cannot be "
                 "published where a third party could audit them"
+            )
+        elif owner_at is not None and owner != self.did:
+            # Stronger than being unowned, not weaker. An unclaimed room can still be
+            # claimed; one held by another key never will be, and the whole value of that
+            # room is that only this node can write to it. A receipt published there by
+            # somebody else's key is not an audit record of anything.
+            blockers.append(
+                "this node's owned result room is held by a different key, so nothing it "
+                "publishes there could serve as an audit record"
             )
         if result_err:
             blockers.append(f"last publish to the owned room was refused: {result_err}")
