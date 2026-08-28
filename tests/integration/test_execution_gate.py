@@ -20,6 +20,7 @@ a reader.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -587,3 +588,86 @@ def test_a_whitespace_public_url_does_not_open_the_gate(
     _own_the_room(node)
     object.__setattr__(node.settings, "public_url", "")
     assert node.can_accept_third_party_jobs() is False
+
+
+# ------------------- "confirmed by a read" has to mean confirmed *recently*
+
+
+def _age_the_observation(node: Node, seconds: int) -> None:
+    """Backdate the stored observation, as a restart after downtime would leave it."""
+    from datetime import UTC, datetime, timedelta
+
+    when = (
+        (datetime.now(UTC) - timedelta(seconds=seconds))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    with node.ledger.tx() as conn:
+        conn.execute(
+            "UPDATE deployment_state SET updated_at = ? WHERE key = 'owned_room_owner'",
+            (when,),
+        )
+
+
+def test_a_stale_ownership_record_does_not_open_the_gate(node: Node) -> None:
+    """The restart hole.
+
+    The guard reads persisted state, and persisted state is only as good as when it was
+    written. A node coming back up with an ownership record from a previous run would
+    otherwise process a cycle's worth of jobs — and publish for them — before ever
+    checking whether it still owns the room. The room may have changed hands, or been
+    reaped and recreated by somebody else, while the node was down.
+    """
+    _own_the_room(node)
+    assert node.can_accept_third_party_jobs() is True
+
+    _age_the_observation(node, node.OWNERSHIP_MAX_AGE_SECONDS + 60)
+    assert node.can_accept_third_party_jobs() is False
+    assert node.owns_result_room() is False
+    assert any("stale" in r for r in node.safety_state()[1])
+
+
+async def test_a_stale_record_also_blocks_the_result_room_write(node: Node) -> None:
+    _own_the_room(node)
+    _age_the_observation(node, node.OWNERSHIP_MAX_AGE_SECONDS + 60)
+    recorder = _Recorder(node)
+    node.client.say_signed = recorder.say_signed  # type: ignore[method-assign]
+
+    assert await node.publish(node.result_room, {"type": "receipt", "job_id": "j"}) is None
+    assert recorder.writes == []
+
+
+def test_a_recent_observation_is_accepted(node: Node) -> None:
+    """The bound exists to catch a stopped loop, not to second-guess a running one."""
+    _own_the_room(node)
+    _age_the_observation(node, node.OWNERSHIP_MAX_AGE_SECONDS - 60)
+    assert node.can_accept_third_party_jobs() is True
+
+
+async def test_the_loop_observes_before_it_processes_anything(node: Node) -> None:
+    """Order matters even with the freshness bound: observe, then act.
+
+    Asserted by recording the call order, because a future edit that moves the
+    observation back below the poll would restore the window silently.
+    """
+    calls: list[str] = []
+
+    async def observe() -> None:
+        calls.append("observe")
+
+    async def poll(**kwargs: Any) -> int:
+        calls.append("poll")
+        raise asyncio.CancelledError
+
+    async def reconcile(limit: int = 3) -> int:
+        calls.append("reconcile")
+        return 0
+
+    node.observe_reachability = observe  # type: ignore[method-assign]
+    node.poll_mailbox_once = poll  # type: ignore[method-assign]
+    node.reconcile_audit_copies = reconcile  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_mailbox()
+
+    assert calls == ["observe", "poll"], calls

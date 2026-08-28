@@ -16,7 +16,7 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.1`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Implementation | **complete** — `v0.1.2`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, loopback only |
 | Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
 | Technocore mailbox (`mb-tc-jobs-…`) | **not created.** The upstream instance is at its global room cap (20 480), so no new room can be created — by this node or by anyone |
@@ -188,7 +188,7 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 
 ## Status
 
-`v0.1.1`. The Technocore lane is **implemented and exercised end to end against a local
+`v0.1.2`. The Technocore lane is **implemented and exercised end to end against a local
 instance of the upstream server**, and is **not currently connected to the public
 instance**: the mailbox and owned result room cannot be created while that instance is at
 its room and note caps. See [Current status](#current-status--read-this-first).

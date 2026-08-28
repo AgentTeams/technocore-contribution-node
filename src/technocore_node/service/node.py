@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx2 as httpx
@@ -527,8 +528,10 @@ class Node:
         does not move**. Advancing it would be the quiet failure: the node would look
         healthy, the queue would look empty, and every job that arrived while it was
         unsafe would have been thrown away without the requester ever being told.
-        Leaving the cursor still means the work is simply deferred, and the same messages
-        are there to process once the room is owned again.
+        Leaving the cursor still means the work is deferred rather than discarded — but
+        deferred is not preserved. The mailbox is a ring, so a long enough closure ages
+        unread messages out upstream, where no cursor can reach them. That gap is detected
+        from `first_seq`, logged at `error` and recorded; it cannot be undone.
         """
         safe, reasons = self.safety_state()
         since = self.ledger.cursor(self.mailbox)
@@ -602,9 +605,15 @@ class Node:
         backoff = 1.0
         while True:
             try:
+                # Observe first. The gate reads persisted state, and persisted state is
+                # only as good as when it was written: a node restarting with an
+                # ownership record from a previous run would otherwise process a cycle's
+                # worth of jobs, and publish for them, before ever checking whether it
+                # still owns the room. Reordering closes the window; the freshness bound
+                # in `_ownership_observation` is what closes it for good.
+                await self.observe_reachability()
                 await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
-                await self.observe_reachability()
                 backoff = 1.0
             except RateLimited as exc:
                 log.warning(
@@ -618,6 +627,35 @@ class Node:
                 log.exception("mailbox poll failed")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+    #: How old an ownership observation may be and still be acted on. The mailbox loop
+    #: refreshes it every cycle, so this is many cycles of slack — it exists to catch a
+    #: node that restarted, or whose loop stopped, not to second-guess a healthy one.
+    OWNERSHIP_MAX_AGE_SECONDS = 900
+
+    def _ownership_observation(self) -> tuple[str | None, str | None, str | None, float | None]:
+        """`(owner, observed_flag, error, age_seconds)` for the result room.
+
+        `age_seconds` is None when nothing has ever been observed. It is the reason this
+        is a helper rather than three `get_state` calls: "confirmed by a read" has to mean
+        confirmed *recently*, or a record written before the room changed hands would keep
+        authorising writes indefinitely.
+        """
+        owner, owner_at = self.ledger.get_state("owned_room_owner")
+        observed, _ = self.ledger.get_state("owned_room_observed")
+        error, _ = self.ledger.get_state("owned_room_error")
+
+        age: float | None = None
+        if owner_at:
+            try:
+                seen = datetime.fromisoformat(owner_at.replace("Z", "+00:00"))
+                age = max(0.0, (datetime.now(UTC) - seen).total_seconds())
+            except ValueError:
+                age = None
+        return owner, observed, error, age
+
+    def _ownership_is_fresh(self, age: float | None) -> bool:
+        return age is not None and age <= self.OWNERSHIP_MAX_AGE_SECONDS
 
     def safety_state(self) -> tuple[bool, list[str]]:
         """Whether it is safe to do work for a stranger, and why not when it is not.
@@ -636,11 +674,15 @@ class Node:
         """
         reasons: list[str] = []
 
-        owner, _ = self.ledger.get_state("owned_room_owner")
-        observed, _ = self.ledger.get_state("owned_room_observed")
-        owner_err, _ = self.ledger.get_state("owned_room_error")
+        owner, observed, owner_err, age = self._ownership_observation()
 
-        if owner_err:
+        if observed and not owner_err and not self._ownership_is_fresh(age):
+            reasons.append(
+                "the result room ownership check is stale "
+                f"({int(age) if age is not None else 'unknown'}s old, limit "
+                f"{self.OWNERSHIP_MAX_AGE_SECONDS}s); it will re-check before accepting work"
+            )
+        elif owner_err:
             reasons.append(f"result room ownership could not be verified: {owner_err}")
         elif not observed:
             reasons.append("result room ownership has never been successfully checked")
@@ -671,10 +713,10 @@ class Node:
         audit room must be refused on the ownership fact alone, whatever else is or is
         not true, and whichever caller thought it had already checked.
         """
-        owner, _ = self.ledger.get_state("owned_room_owner")
-        observed, _ = self.ledger.get_state("owned_room_observed")
-        owner_err, _ = self.ledger.get_state("owned_room_error")
-        return bool(observed) and not owner_err and owner == self.did
+        owner, observed, owner_err, age = self._ownership_observation()
+        return (
+            bool(observed) and not owner_err and owner == self.did and self._ownership_is_fresh(age)
+        )
 
     def availability(self) -> dict[str, Any]:
         """What this node can honestly say about being reachable, and on what evidence.
