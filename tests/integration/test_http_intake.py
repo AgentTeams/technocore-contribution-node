@@ -748,3 +748,91 @@ async def test_abandoning_a_request_does_not_start_the_work_twice(
     assert runs == 1
     assert outcome is not None
     assert node.ledger.get_receipt("abandoned-000001") is not None
+
+
+async def test_a_stranger_cannot_join_somebody_elses_running_job(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """`job_id` is public. Guessing an in-flight one must not hand over its answer.
+
+    Two submissions of one id are made to join rather than run beside each other — which
+    is right, and was keyed on the id alone. The ownership check lives inside the run,
+    and a joining caller never enters it, so a stranger who guessed an id in flight was
+    handed the first requester's result, receipt, reply room and DID.
+    """
+    _, first_did = requester
+    intruder = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    text = json.dumps(_job("guessable-000001"))
+    loop = asyncio.get_running_loop()
+    started, release = asyncio.Event(), threading.Event()
+
+    def slow(payload: dict[str, Any], context: Any) -> dict[str, Any]:
+        loop.call_soon_threadsafe(started.set)
+        release.wait(5)
+        return {"canonical": "{}", "sha256": "sha256:" + "0" * 64, "bytes": 2}
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(REGISTRY, "canonical_json_sha256", slow)
+        first = asyncio.create_task(
+            node.runner.handle(
+                text=text, requester_did=first_did, request_room="http", request_seq=None
+            )
+        )
+        await started.wait()
+
+        with pytest.raises(RejectedJob) as refused:
+            await node.runner.handle(
+                text=text, requester_did=intruder, request_room="http", request_seq=None
+            )
+
+        release.set()
+        outcome = await first
+
+    assert refused.value.code == "job_id_taken"
+    assert outcome is not None
+    assert outcome.receipt is not None
+    assert outcome.receipt["requester_did"] == first_did
+
+
+def test_an_answered_retry_is_not_refused_by_the_rate_limit(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """An answer that already exists costs nothing to hand over again.
+
+    The limit was applied before the route looked for one, so a client retrying after a
+    dropped response was told to slow down instead of being given the receipt it had
+    already earned — and a job left unanswered by a crash could not be resumed at all,
+    because the same check refused it before the runner's resume path was reached.
+    """
+    key, did = requester
+    job = _job("underlimit-00001")
+    assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 200
+
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+
+    retried = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "already_completed"
+
+    # New work is still refused, which is what the limit is for.
+    fresh = client.post("/v1/jobs", json=_envelope(key, did, _job("overlimit-000001"), 3))
+    assert fresh.status_code == 429
+
+
+def test_a_crashed_job_resumes_over_http_even_at_the_limit(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The runner's resume path is only reachable if the route lets the request through."""
+    key, did = requester
+    job = _job("httpresume-00001")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", _explode)
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+
+    resumed = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+
+    assert resumed.status_code == 200
+    assert node.ledger.get_receipt("httpresume-00001") is not None

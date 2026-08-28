@@ -50,6 +50,18 @@ route answers `404` while it is, and enabling it requires the result room first.
   not "already answered": a row without a receipt now resumes, serialised per `job_id` so
   two concurrent submissions of one id cannot both run it, and an answered one still
   returns its first answer rather than running again.
+- **A stranger could join somebody else's running job.** Two submissions of one `job_id`
+  are made to join rather than run beside each other, and that was keyed on the id alone
+  — but `job_id` is public, and the ownership check lives inside the run, which a joining
+  caller never enters. Anyone who guessed an id in flight was handed the first
+  requester's result, receipt, reply room and DID. The requester is held beside the task
+  now, and a different one gets the same `job_id_taken` refusal it would have got a
+  moment earlier or later.
+- **An answered retry could be refused by the rate limit.** The limit was applied before
+  the route looked for an existing answer, so a client retrying after a dropped response
+  was told to slow down instead of being handed the receipt it had already earned — and
+  a job left unanswered by a crash could not be resumed at all, because the same check
+  refused it before the runner's resume path was reached.
 - **A resume was charged the rate limit twice.** The counter reads job rows, and the row
   it was reading is the job being recovered — so at a low limit the one retry that exists
   to recover an answer the requester already paid for was the request the limit refused,

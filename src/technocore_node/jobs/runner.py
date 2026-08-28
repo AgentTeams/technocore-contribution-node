@@ -92,8 +92,12 @@ class JobRunner:
         self.requester_jobs_per_hour = requester_jobs_per_hour
         self.source_commit = source_commit[:40]
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        #: The running attempt for each `job_id`, so a second submission of one id joins
-        #: the first rather than starting beside it.
+        #: The running attempt for each `job_id`, as `(requester, task)`, so a second
+        #: submission of one id joins the first rather than starting beside it — and only
+        #: if it is the same requester. The DID is held here because the ownership check
+        #: lives inside `_run`, which a joining caller never enters: keyed on `job_id`
+        #: alone, a stranger who guessed an in-flight id was handed somebody else's
+        #: result, receipt, reply room and DID.
         #:
         #: A lock was not enough. A job whose row exists but whose receipt does not is
         #: resumable (see `handle`), and the work runs in a worker thread that no
@@ -102,7 +106,7 @@ class JobRunner:
         #: the *task* and awaiting it through a shield means the disconnect abandons the
         #: waiting, never the work — and the entry is dropped by the task's own callback,
         #: when it has actually finished.
-        self._in_flight: dict[str, asyncio.Task[Outcome | None]] = {}
+        self._in_flight: dict[str, tuple[str, asyncio.Task[Outcome | None]]] = {}
 
     # ------------------------------------------------------------- validation
 
@@ -207,7 +211,16 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         task = str(job["task"])
 
-        running = self._in_flight.get(job_id)
+        entry = self._in_flight.get(job_id)
+        if entry is not None and entry[0] != requester_did:
+            # The same refusal `_run` would give, given here because the joining caller
+            # never reaches it. `job_id` is globally unique and public; without this, one
+            # requester's in-flight work is readable by anyone who guesses its id.
+            raise RejectedJob(
+                "job_id_taken",
+                "another requester already used this job_id; choose one with a random component",
+            )
+        running = entry[1] if entry is not None else None
         if running is None:
             running = asyncio.create_task(
                 self._run(
@@ -222,7 +235,7 @@ class JobRunner:
                     started=started,
                 )
             )
-            self._in_flight[job_id] = running
+            self._in_flight[job_id] = (requester_did, running)
             running.add_done_callback(lambda done: self._retire(job_id, done))
         # Shielded: cancelling the caller must not cancel work that is already underway,
         # because the thread running it would not stop anyway and the receipt is owed

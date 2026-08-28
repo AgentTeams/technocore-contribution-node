@@ -116,27 +116,34 @@ def register(router: APIRouter, node: Node) -> None:
         except (HttpEnvelopeError, CanonicalJSONError) as exc:
             return _problem("bad_signature", str(exc), status.HTTP_401_UNAUTHORIZED)
 
-        # Rate limit before the nonce is spent: a refused request should not cost the
-        # caller a counter they then have to reason about.
-        try:
-            node.runner.check_rate_limit(did)
-        except RejectedJob as exc:
-            return _problem(exc.code, exc.detail, status.HTTP_429_TOO_MANY_REQUESTS)
-
         job_id = job.get("job_id")
-        if isinstance(job_id, str):
-            existing = node.ledger.get_receipt(job_id)
-            if existing is not None and node.ledger.job_requester(job_id) == did:
-                # Idempotent: the same submission gets the same answer rather than the
-                # work being done twice. Checked before the nonce, so a client that
-                # retries after a dropped response is not punished for it.
-                response.status_code = status.HTTP_200_OK
-                return {
-                    "job_id": job_id,
-                    "status": "already_completed",
-                    "receipt": json.loads(existing["receipt_json"]),
-                    "receipt_url": f"{node.settings.public_url}/v1/receipts/{job_id}",
-                }
+        owner = node.ledger.job_requester(job_id) if isinstance(job_id, str) else None
+        existing = node.ledger.get_receipt(job_id) if isinstance(job_id, str) else None
+        if isinstance(job_id, str) and existing is not None and owner == did:
+            # Idempotent: the same submission gets the same answer rather than the work
+            # being done twice. Checked before the rate limit and before the nonce, so a
+            # client that retries after a dropped response is not punished for it — an
+            # answer that already exists costs nothing to hand over again.
+            response.status_code = status.HTTP_200_OK
+            return {
+                "job_id": job_id,
+                "status": "already_completed",
+                "receipt": json.loads(existing["receipt_json"]),
+                "receipt_url": f"{node.settings.public_url}/v1/receipts/{job_id}",
+            }
+
+        # A row of this requester's with no receipt is an attempt that died before it
+        # could answer. Resuming it creates no new job, so it is not charged for one:
+        # charging it here would refuse, at a low limit, the single request that exists
+        # to recover an answer the requester already paid for.
+        resuming = owner == did and existing is None
+        if not resuming:
+            # Otherwise, rate limit before the nonce is spent: a refused request should
+            # not cost the caller a counter they then have to reason about.
+            try:
+                node.runner.check_rate_limit(did)
+            except RejectedJob as exc:
+                return _problem(exc.code, exc.detail, status.HTTP_429_TOO_MANY_REQUESTS)
 
         # Validate before the nonce is claimed. `parse_and_validate` is pure — it reads
         # nothing and writes nothing — so running it here and again inside `handle()` is
