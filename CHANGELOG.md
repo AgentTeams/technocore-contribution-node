@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.1.2 — 2026-08-28
+
+A safety fix. `v0.1.1` reported honestly that the node was not usable and then went on
+accepting work anyway.
+
+### The gap
+
+`availability()` described the node's state; nothing acted on it. `run_mailbox`,
+`poll_mailbox_once` and `process_message` were ungated, so a stranger who created the
+mailbox and posted a job would have had a receipt published into a result room that
+**nobody owns** — where anyone can post a forged receipt beside a genuine one, and a
+reader cannot tell which is which.
+
+The room is unowned because of a second, related mistake. Upstream a `d-` room is ownable
+from birth or not at all; `publish-profile` wrote a profile attestation into the room
+before claiming it, which created it and made it permanently unclaimable. The write meant
+to make the room trustworthy is what prevented it from being so.
+
+### Fixed
+
+- **`can_accept_third_party_jobs()`** — one gate, checked before any third-party work:
+  result-room ownership confirmed by a successful read, owner equal to this node's DID, no
+  read error, and a public URL configured.
+- **The mailbox loop is gated.** The room is still read; nothing is executed and the
+  cursor does not advance. Deferred work stays available — dropping it silently would look
+  identical to having none.
+- **`publish_audit_copy()` has its own ownership guard**, independent of the gate.
+- **The profile attestation confirms ownership by a read before writing.** The accident
+  above is reproduced as a regression test.
+- **`recover-result-room`** performs the recovery in the only safe order — inspect, claim,
+  read back, then attest — stopping on ambiguity and never retrying a signed claim.
+  **`inspect-result-room`** reports the state and the safe next step, writing nothing.
+- `/v1/info` now carries `accepting_third_party_jobs` and `stop_reasons` beside the
+  description, so a disagreement between what the node says and what it will do is visible
+  rather than something to infer.
+
+### Still true
+
+Third-party usage **0**. The FLOP testnet adapter is a disabled stub. No airdrop, points,
+endorsement or official status is claimed.
+
 ## v0.1.1 — 2026-08-28
 
 Documentation, evidence, CI — and one behavioural addition that the review of this very
