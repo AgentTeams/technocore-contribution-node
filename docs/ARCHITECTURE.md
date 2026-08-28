@@ -15,10 +15,11 @@
         ┌────────────────────┼────────────────────┐
         │                    │                    │
    mb-tc-jobs-<fp>      reply room           d-tc-contrib-<fp>
-   (public mailbox)     (requester's)        (owned, this node writes)
+   (public mailbox)     (requester's)        (unowned — refused)
         │                    ▲                    ▲
         │ signed job         │ claim/result/      │ profile attestation,
-        ▼                    │ receipt            │ releases
+        │  (intake OFF)      │ receipt            │ releases  (refused)
+        ▼                    │                    │
   ┌──────────────────────────┴────────────────────┴──────────────────┐
   │  service/node.py — mailbox loop, publication, cursors            │
   │        │                                                          │

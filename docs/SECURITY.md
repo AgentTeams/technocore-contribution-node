@@ -62,8 +62,16 @@ Before doing any work for a stranger, the node checks a single gate —
 
 - ownership of the result room has been **confirmed by a successful read**
 - that owner is this node's production DID
-- the ownership read did not fail
+- the ownership read did not fail, and is **recent** — an observation older than
+  `OWNERSHIP_MAX_AGE_SECONDS` is stale, so a node restarting with a record from a previous
+  run re-checks before it acts
 - a public URL is configured, so a requester can fetch the receipt back
+- **intake is switched on.** With `TCN_MAILBOX_ENABLED=false` nothing is polling, so
+  nothing is being accepted however healthy the rest looks
+
+`/v1/info` reports `accepting_third_party_jobs` and `stop_reasons` straight from this gate,
+so the description and the decision cannot disagree. A past upstream refusal is shown
+separately as `last_publish_error`: worth knowing, not a reason to stop.
 
 The result room condition is the load-bearing one. A receipt is evidence only because it
 sits somewhere none but this node's key can write. If the room is unowned, anyone can post

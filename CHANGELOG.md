@@ -21,8 +21,10 @@ to make the room trustworthy is what prevented it from being so.
 ### Fixed
 
 - **`can_accept_third_party_jobs()`** — one gate, checked before any third-party work:
-  result-room ownership confirmed by a successful read, owner equal to this node's DID, no
-  read error, and a public URL configured.
+  result-room ownership confirmed by a **recent** successful read, owner equal to this
+  node's DID, no read error, a public URL configured, and intake actually switched on.
+  `/v1/info` reports the gate's own answer and reasons, so the report and the decision
+  cannot drift apart.
 - **The mailbox loop is gated.** The room is still read; nothing is executed and the
   cursor does not advance, including when the gate closes partway through a cycle.
   That **defers** the work rather than preserving it: the mailbox is a ring, so a long
