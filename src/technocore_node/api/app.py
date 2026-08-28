@@ -24,6 +24,7 @@ from ..jobs import schema as job_schema
 from ..logging import get_logger
 from ..metrics import build_metrics
 from ..service.node import Node
+from . import jobs as http_jobs
 from .dashboard import render_dashboard
 
 log = get_logger(__name__)
@@ -144,6 +145,18 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                     "input_schema": job_schema.TASK_INPUT_SCHEMAS["protocol_manifest_snapshot"],
                 },
             ],
+            "intake": {
+                "technocore_mailbox": {
+                    "room": node.mailbox,
+                    "enabled": node.settings.mailbox_enabled,
+                },
+                "http": {
+                    "endpoint": "POST /v1/jobs",
+                    "enabled": node.settings.http_job_intake_enabled,
+                    "signing": "GET /v1/jobs/signing-payload?did=<your did:key>",
+                },
+                "accepting_now": node.can_accept_third_party_jobs(),
+            },
             "limits": {
                 "max_input_chars": job_schema.MAX_INPUT_CHARS,
                 "job_timeout_seconds": node.settings.job_timeout_seconds,
@@ -236,6 +249,15 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                 for r in rows
             ],
         }
+
+    # The HTTP submission lane. Registered unconditionally so the route exists and is
+    # documented; it answers 404 while `TCN_HTTP_JOB_INTAKE_ENABLED` is off, and 503 with
+    # its reasons while the safety gate is closed.
+    from fastapi import APIRouter
+
+    job_router = APIRouter()
+    http_jobs.register(job_router, node)
+    app.include_router(job_router)
 
     @app.exception_handler(Exception)
     async def unhandled(_request: Request, exc: Exception) -> JSONResponse:

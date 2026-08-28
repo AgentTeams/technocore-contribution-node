@@ -13,6 +13,37 @@ from technocore_node.ledger.db import Ledger
 TEST_PASSPHRASE = b"test-secret-do-not-use"
 
 
+@pytest.fixture(autouse=True)
+def no_outbound_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make it impossible for a unit or integration test to reach the network.
+
+    This exists because it already happened. A test that built a real `Node` and let it
+    publish a receipt sent live requests to the public Technocore instance — a shared
+    service, from a test run, silently. Nothing in the test said "network"; it was three
+    calls down, and the only visible symptom was the suite taking four minutes.
+
+    A guard that lives in the test that remembers to ask for it is not a guard. This is
+    autouse, and it fails loudly with the URL that was attempted, so the next such path
+    is found by the person who wrote it rather than by an upstream operator.
+
+    `tests/e2e` is exempt: it talks to a local instance on purpose, and refuses to run at
+    all unless `TCN_E2E_ORIGIN` names one.
+    """
+    if "tests/e2e" in str(request.node.fspath).replace("\\", "/"):
+        return
+
+    async def refuse(self: object, request: Any) -> None:
+        raise AssertionError(
+            f"a test tried to open a real connection: {request.method} {request.url}. "
+            "Stub the transport instead — the suite must never touch a live service."
+        )
+
+    # Patched on the real transport, not on the client. `httpx2.MockTransport` is a
+    # different class, so a test that supplies its own responses still works; only a
+    # request that would leave the machine is stopped.
+    monkeypatch.setattr("httpx2.AsyncHTTPTransport.handle_async_request", refuse)
+
+
 @pytest.fixture
 def key() -> Ed25519PrivateKey:
     return Ed25519PrivateKey.generate()

@@ -223,6 +223,37 @@ class Ledger:
         ).fetchone()
         return int(row["n"] or 0)
 
+    # ------------------------------------------------------------ http nonces
+
+    def claim_http_nonce(self, requester_did: str, nonce: int) -> bool:
+        """Record `nonce` for `requester_did` if it advances their counter.
+
+        Returns False when it does not — which is a replay, or a submission that raced
+        ahead of one already accepted. The check and the write are one transaction on
+        purpose: split them and two concurrent requests can both read the old value, both
+        decide they advance, and both be accepted.
+        """
+        with self.tx() as conn:
+            row = conn.execute(
+                "SELECT last_nonce FROM http_nonces WHERE requester_did = ?",
+                (requester_did,),
+            ).fetchone()
+            if row is not None and nonce <= int(row["last_nonce"]):
+                return False
+            conn.execute(
+                "INSERT INTO http_nonces (requester_did, last_nonce, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT (requester_did) DO UPDATE SET "
+                "last_nonce = excluded.last_nonce, updated_at = excluded.updated_at",
+                (requester_did, nonce, utcnow()),
+            )
+        return True
+
+    def http_nonce_floor(self, requester_did: str) -> int:
+        row = self.conn.execute(
+            "SELECT last_nonce FROM http_nonces WHERE requester_did = ?", (requester_did,)
+        ).fetchone()
+        return int(row["last_nonce"]) if row else 0
+
     # ------------------------------------------------------- deployment state
 
     def set_state(self, key: str, value: str | None) -> None:

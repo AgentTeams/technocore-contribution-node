@@ -119,6 +119,7 @@ class Settings:
     job_timeout_seconds: int
     requester_jobs_per_hour: int
     flop_testnet_enabled: bool
+    http_job_intake_enabled: bool
 
     def passphrase(self) -> bytes | None:
         """The key passphrase, read from disk at the moment it is needed.
@@ -172,4 +173,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         job_timeout_seconds=_int("TCN_JOB_TIMEOUT_SECONDS", 15, minimum=1, maximum=120),
         requester_jobs_per_hour=_int("TCN_REQUESTER_JOBS_PER_HOUR", 60, minimum=1, maximum=10000),
         flop_testnet_enabled=_flag("FLOP_TESTNET_ENABLED", False),
+        # Off by default and left off deliberately. Turning it on is a decision about
+        # accepting strangers' work over a second transport, and it is gated at runtime
+        # on the same conditions the mailbox lane is — see `Node.safety_state`.
+        http_job_intake_enabled=_flag("TCN_HTTP_JOB_INTAKE_ENABLED", False),
     )
