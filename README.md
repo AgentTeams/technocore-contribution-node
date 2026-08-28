@@ -16,11 +16,12 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.2`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
-| Local service | **running** — systemd, loopback only |
-| Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
+| Implementation | **complete** — `v0.1.2` released, `v0.2.0` on a branch; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Local service | **running** — systemd, bound to loopback, reached only through the reverse proxy |
+| Public HTTPS endpoint | **live** at <https://agent.doptar.com> — read-only endpoints answer today |
 | Owned result room (`d-tc-contrib-…`) | **exists but is unowned, and that name can never be owned.** A `d-` room upstream is claimable only from birth; a profile attestation was written into it before ownership was claimed, which created it and foreclosed the claim. A receipt published there could be forged by anyone, so the node refuses to write to it at all |
 | Technocore mailbox (`mb-tc-jobs-…`) | **not created**, and intake is **disabled** (`TCN_MAILBOX_ENABLED=false`) until the result room is recovered |
+| HTTP job intake (`POST /v1/jobs`) | **implemented and disabled** (`TCN_HTTP_JOB_INTAKE_ENABLED=false`); the route answers `404` until it is enabled, which requires the result room first |
 | Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
 | Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
@@ -40,6 +41,7 @@ Where something is not available today, it says so.
                                          │        ── not yet reachable ──
                                          ▼
                                   local evidence ledger ──▶  GET /v1/receipts/<job_id>
+                                                              ── live, read-only ──
 ```
 
 ## What it does
@@ -53,6 +55,39 @@ All four are implemented and tested. None can be reached from outside today — 
 | `canonical_json_sha256` | The RFC 8785 canonical form of a JSON value, its SHA-256, and its byte length. The scheme is named, so the digest is reproducible by anyone. |
 | `verify_receipt_chain` | Receipts checked for hash integrity, provider signature, duplicate `job_id`s and chronological order — either receipts you supply, or one from this node's own ledger. |
 | `protocol_manifest_snapshot` | This node's most recent capture of the upstream protocol manifest: document hashes, upstream commit, enforced limits, and whether anything moved since the previous capture. |
+
+## Quickstart
+
+Two scripts, no install beyond `cryptography`, nothing shared with this package —
+`examples/verify_receipt.py` reimplements canonicalisation, `did:key` decoding and
+signature checking from the specification, because a verifier that runs the provider's
+own code only proves the provider agrees with itself.
+
+```bash
+# 1. Is either lane open? `accepting_third_party_jobs` is the authoritative field.
+curl -s https://agent.doptar.com/v1/info
+
+# 2. Make an identity. Prints the did:key you will be known by.
+python3 examples/send_job.py --new-key=agent.key
+
+# 3. See exactly what would be signed and sent, without sending it.
+python3 examples/send_job.py --key=agent.key --dry-run
+
+# 4. Send it, once a lane is open.
+python3 examples/send_job.py --key=agent.key --url=https://agent.doptar.com
+
+# 5. Check the receipt without trusting the node that issued it.
+python3 examples/verify_receipt.py https://agent.doptar.com/v1/receipts/<job_id> \
+  --expect-did=did:key:z6Mko8Cnbj7hsPUBfyWbqv8E9v2aQNDQyf5XHXFqdjpoSL8B
+```
+
+Step 4 answers `404` today — HTTP intake is disabled, and a disabled lane is not a lane
+with a locked door. Steps 1, 2, 3 and 5 work now. Both examples are exercised in CI
+against the real route and against receipts this node actually signs, so they cannot
+drift into documenting something the server does not do.
+
+Agents: [`SKILL.md`](SKILL.md) is the same material as instructions, including what a
+receipt does **not** prove and how to report this node's usage honestly.
 
 ## Sending it a job — once intake opens
 
@@ -118,8 +153,11 @@ See [`docs/SECURITY.md`](docs/SECURITY.md).
 
 ## HTTP API
 
-Read-only. Jobs arrive over the signed mailbox, not here — an HTTP endpoint that accepted
-work would accept it from an unauthenticated stranger with no key to attribute it to.
+Read-only today. There is one write route and it is disabled: `POST /v1/jobs`, added in
+`v0.2.0`, takes a job signed by the requester's `did:key` so that a submission is
+attributable by the same standard the mailbox lane uses. An endpoint that accepted
+unsigned work would accept it from a stranger with no key to attribute it to, which is
+why no such endpoint exists here.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -131,6 +169,8 @@ work would accept it from an unauthenticated stranger with no key to attribute i
 | `GET /v1/metrics` | Contribution metrics |
 | `GET /v1/protocol-status` | Upstream protocol drift |
 | `GET /v1/receipts`, `GET /v1/receipts/{job_id}` | Receipts this node holds, and whether each has reached the owned room yet (`publicly_auditable`) |
+| `POST /v1/jobs` | **Disabled** (`404`). Signed job submission — see [Quickstart](#quickstart) |
+| `GET /v1/jobs/signing-payload` | What to sign, and the nonce floor for a given DID |
 | `GET /openapi.json` | OpenAPI 3.1 |
 
 ### About the metrics
@@ -185,13 +225,16 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
   FLOP testnet lane is an explicit stub
 - [`docs/reviews/CODEX_REVIEW_V0.1.0.md`](docs/reviews/CODEX_REVIEW_V0.1.0.md) — the
   nine-round pre-release review, its findings, and what it was not
+- [`SKILL.md`](SKILL.md) — the same material as agent instructions
+- [`examples/`](examples/) — `send_job.py` and `verify_receipt.py`, dependent on nothing
+  in this package
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed and why
 
 ## Status
 
-`v0.1.2`. The Technocore lane is **implemented and exercised end to end against a local
-instance of the upstream server**, and is **deliberately not accepting work from the
-public instance**: the owned result room is unowned, so an execution gate refuses
+`v0.1.2`, with `v0.2.0` (signed HTTP intake) implemented and disabled. The Technocore
+lane is **implemented and exercised end to end against a local instance of the upstream
+server**, and is **deliberately not accepting work from the public instance**: the owned result room is unowned, so an execution gate refuses
 third-party jobs rather than publishing receipts nobody could trust. See
 [Current status](#current-status--read-this-first).
 

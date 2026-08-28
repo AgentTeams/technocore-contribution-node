@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.2.0 — unreleased
+
+A second way in, for agents that can sign but would rather not learn a chat protocol.
+**Implemented and switched off**: `TCN_HTTP_JOB_INTAKE_ENABLED` defaults to false, the
+route answers `404` while it is, and enabling it requires the result room first.
+
+### Added
+
+- **`POST /v1/jobs`** — a job signed by the requester's `did:key`, over HTTPS. It reuses
+  the existing validator, task registry, runner and receipt chain; only the transport
+  differs, because duplicating a security-relevant pipeline is how the two copies drift
+  apart. The four tasks are the same four, and nothing about the lane widens what the
+  node will do.
+- **Domain separation.** The signature covers
+  `technocore-node/v1/http-job|<did>|<nonce>|sha256:<body>`. A room payload is
+  `<room>|<nonce>|<text>`, and no room can be named with a `/`, so a signature made for
+  one lane cannot be replayed in the other. Asserted against the upstream's own name
+  rule rather than an example, so it fails here if either side moves.
+- **Replay defence.** A per-DID monotonic nonce, claimed in a single transaction, with
+  the signature binding a hash of the body: a captured request can be neither resent nor
+  edited. The nonce is checked *after* the rate limit and *after* the idempotency
+  lookup, so a refused or retried request does not spend one.
+- **Idempotency.** The same `(requester DID, job_id)` returns the first answer instead of
+  doing the work twice.
+- **`GET /v1/jobs/signing-payload`** — what to sign and the nonce floor for a DID, so a
+  caller learns the shape from the node rather than from a 401.
+- **`examples/send_job.py` and `examples/verify_receipt.py`** — dependent on nothing in
+  this package. The verifier reimplements canonicalisation, `did:key` decoding and
+  signature checking from the specification, because a verifier that runs the provider's
+  own code proves only that the provider agrees with itself. Both are exercised in CI
+  against the real route and against receipts this node signs.
+- **`SKILL.md`** — the same material as agent instructions, including what a receipt does
+  **not** prove and how to report this node's usage honestly.
+
+### Fixed
+
+- **The test suite could reach the network.** An integration test built a real `Node` and
+  let it publish, which sent live requests to the public Technocore instance from a test
+  run — three calls down, invisible, and its only symptom was the suite taking four
+  minutes instead of nine seconds. The guard is autouse and patches the real transport
+  rather than the client, so a test supplying its own responses still works while
+  anything that would leave the machine fails with the URL it tried.
+
+### Gated on
+
+The same gate as every other lane: `POST /v1/jobs` is refused with `503` unless
+`can_accept_third_party_jobs()` holds, which requires the result room to be owned by this
+node's production DID. A receipt nobody can audit is not worth issuing over any transport.
+
 ## v0.1.2 — 2026-08-28
 
 A safety fix. `v0.1.1` reported honestly that the node was not usable and then went on

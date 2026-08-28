@@ -43,7 +43,9 @@ def requester() -> tuple[Ed25519PrivateKey, str]:
 
 @pytest.fixture
 def node(
-    env: dict[str, str], monkeypatch: pytest.MonkeyPatch, published: list[tuple[str, dict[str, Any]]]
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    published: list[tuple[str, dict[str, Any]]],
 ) -> Node:
     monkeypatch.setenv("TCN_HTTP_JOB_INTAKE_ENABLED", "true")
     monkeypatch.setenv("TCN_PUBLIC_URL", "https://example.invalid")
@@ -417,3 +419,41 @@ def test_the_audit_copy_goes_to_the_room_the_gate_checked(
     assert rooms == [node.result_room]
     assert published[0][1]["job_id"] == "audited-00001"
     assert published[0][1]["type"] == "receipt"
+
+
+def test_the_published_example_produces_an_envelope_this_server_accepts(
+    client: TestClient, node: Node
+) -> None:
+    """`examples/send_job.py` is checked against the endpoint, not against its own docs.
+
+    The example reimplements the signing scheme from the specification so that a caller
+    need not install this package to use the node. That is the point of it, and also how
+    it comes to disagree with the server it is documenting — silently, and only for the
+    people who followed the instructions. So the envelope it builds is fed to the real
+    route here, and the receipt that comes back is checked by the other example.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[2] / "examples"
+    envelopes = importlib.util.spec_from_file_location("send_job", root / "send_job.py")
+    assert envelopes is not None and envelopes.loader is not None
+    sender = importlib.util.module_from_spec(envelopes)
+    envelopes.loader.exec_module(sender)
+
+    key = Ed25519PrivateKey.generate()
+    did = sender.encode_did(key)
+    job = dict(sender.EXAMPLE_JOB)
+    job["job_id"] = "example-round-trip"
+
+    response = client.post("/v1/jobs", json=sender.sign_job(key, did, job, 1))
+
+    assert response.status_code == 200, response.json()
+    receipt = response.json()["receipt"]
+    assert receipt["requester_did"] == did
+    assert receipt["provider_did"] == node.did
+
+    verifier = importlib.util.spec_from_file_location("verify_receipt", root / "verify_receipt.py")
+    assert verifier is not None and verifier.loader is not None
+    checker = importlib.util.module_from_spec(verifier)
+    verifier.loader.exec_module(checker)
+    assert checker.verify(receipt, node.did) == []
