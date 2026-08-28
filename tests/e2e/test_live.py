@@ -526,7 +526,9 @@ async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
         db_path=Path(ledger.path),
         bind_host="127.0.0.1",
         bind_port=3020,
-        public_url="",
+        # The safety gate requires one: a requester who cannot fetch the receipt back
+        # has no way to verify it, so the node declines to produce one.
+        public_url="https://example.invalid",
         origin=ORIGIN,
         mailbox_enabled=False,
         watcher_enabled=False,
@@ -542,6 +544,11 @@ async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
     )
     try:
         assert await node.client.claim_room(node.result_room) is True
+        # The gate does not take a claim's word for it: ownership has to be confirmed by
+        # a read before the node will do work for anyone. This is the real sequence an
+        # operator follows, so the test follows it too.
+        await node.observe_reachability()
+        assert node.owns_result_room()
 
         requester_key = Ed25519PrivateKey.generate()
         requester_did = didkey.encode_did(requester_key.public_key())
@@ -590,7 +597,9 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
         db_path=Path(ledger.path),
         bind_host="127.0.0.1",
         bind_port=3020,
-        public_url="",
+        # The safety gate requires one: a requester who cannot fetch the receipt back
+        # has no way to verify it, so the node declines to produce one.
+        public_url="https://example.invalid",
         origin=ORIGIN,
         mailbox_enabled=False,
         watcher_enabled=False,
@@ -606,6 +615,7 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
     )
     try:
         await node.client.claim_room(node.result_room)
+        await node.observe_reachability()
         requester_key = Ed25519PrivateKey.generate()
         await node.process_message(
             {
@@ -643,7 +653,9 @@ async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
         db_path=Path(ledger.path),
         bind_host="127.0.0.1",
         bind_port=3020,
-        public_url="",
+        # The safety gate requires one: a requester who cannot fetch the receipt back
+        # has no way to verify it, so the node declines to produce one.
+        public_url="https://example.invalid",
         origin=ORIGIN,
         mailbox_enabled=False,
         watcher_enabled=False,
@@ -659,6 +671,11 @@ async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
     )
     try:
         assert await node.client.claim_room(node.result_room) is True
+        # The gate does not take a claim's word for it: ownership has to be confirmed by
+        # a read before the node will do work for anyone. This is the real sequence an
+        # operator follows, so the test follows it too.
+        await node.observe_reachability()
+        assert node.owns_result_room()
 
         real_publish = node.publish
         failed_once = {"done": False}
@@ -725,7 +742,9 @@ async def test_27_a_copy_that_landed_before_a_crash_is_not_published_twice(
         db_path=Path(ledger.path),
         bind_host="127.0.0.1",
         bind_port=3020,
-        public_url="",
+        # The safety gate requires one: a requester who cannot fetch the receipt back
+        # has no way to verify it, so the node declines to produce one.
+        public_url="https://example.invalid",
         origin=ORIGIN,
         mailbox_enabled=False,
         watcher_enabled=False,
@@ -741,6 +760,11 @@ async def test_27_a_copy_that_landed_before_a_crash_is_not_published_twice(
     )
     try:
         assert await node.client.claim_room(node.result_room) is True
+        # The gate does not take a claim's word for it: ownership has to be confirmed by
+        # a read before the node will do work for anyone. This is the real sequence an
+        # operator follows, so the test follows it too.
+        await node.observe_reachability()
+        assert node.owns_result_room()
 
         requester_key = Ed25519PrivateKey.generate()
         job_id = f"crashed-{secrets.token_hex(4)}"
