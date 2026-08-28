@@ -321,15 +321,6 @@ class JobRunner:
             provider_signature=result["sig"],
             result_seq=None,
         )
-        self.ledger.update_job(
-            job_id,
-            status="completed" if status == "ok" else "failed",
-            completed_at=utcnow() if status == "ok" else None,
-            failed_at=None if status == "ok" else utcnow(),
-            latency_ms=latency_ms,
-            failure_code=failure_code,
-        )
-
         receipt = build_receipt(
             self._key,
             receipt_id=f"rcpt-{secrets.token_hex(12)}",
@@ -343,6 +334,24 @@ class JobRunner:
             provider_signature=result["sig"],
             request_seq=request_seq,
             internal_test=internal_test,
+        )
+
+        # One transaction, because marking the job finished and holding its receipt are
+        # one fact. Split across two writes, a crash in between leaves a job whose
+        # duplicate check refuses every retry and whose receipt does not exist: the work
+        # done and unprovable, with the `job_id` spent. Done here rather than in each
+        # caller so both intake lanes get it, and a third cannot forget to.
+        self.ledger.record_receipt(
+            receipt,
+            json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+            internal_test,
+            complete_job={
+                "status": "completed" if status == "ok" else "failed",
+                "completed_at": utcnow() if status == "ok" else None,
+                "failed_at": None if status == "ok" else utcnow(),
+                "latency_ms": latency_ms,
+                "failure_code": failure_code,
+            },
         )
 
         return Outcome(

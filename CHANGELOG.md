@@ -37,6 +37,18 @@ route answers `404` while it is, and enabling it requires the result room first.
 
 ### Fixed
 
+- **`TCN_MAILBOX_ENABLED` closed a lane it has nothing to do with.** Safety is shared
+  between lanes and enablement is not, but the two were one condition, so an HTTP-only
+  configuration was impossible: a node with the mailbox switched off refused signed HTTP
+  submissions with "mailbox intake is disabled". Each lane now has its own switch over
+  the same shared safety conditions, and `/v1/info` reports per lane — `stop_reasons`
+  stays empty exactly when something is accepted, so it can never read non-empty beside
+  `accepting_third_party_jobs: true`.
+- **A completed job and its receipt were two writes.** A crash between them left a job
+  marked complete — so the duplicate check refused every retry — whose receipt did not
+  exist: the work done, the `job_id` spent, and nothing to show for it. They are one
+  transaction now, performed inside the runner so both lanes get it and a third cannot
+  forget to.
 - **The live suite could be pointed at the public instance.** `tests/e2e` makes real
   writes and is exempt from the network guard because talking to a server is its purpose.
   Its docstring asked for a local instance; nothing enforced it, so a typo in

@@ -63,8 +63,8 @@ def register(router: APIRouter, node: Node) -> None:
             # advertising its existence invites people to keep knocking.
             return _problem("not_found", "no such endpoint", status.HTTP_404_NOT_FOUND)
 
-        if not node.can_accept_third_party_jobs():
-            _, reasons = node.safety_state()
+        if not node.can_accept_third_party_jobs("http"):
+            _, reasons = node.lane_is_open("http")
             # The same gate the mailbox lane passes. A receipt issued now could not be
             # audited, so declining is the only honest answer — and it says why, because
             # the caller can do nothing about a refusal they cannot see the shape of.
@@ -191,10 +191,7 @@ def register(router: APIRouter, node: Node) -> None:
 
         receipt = outcome.receipt
         if receipt is not None:
-            receipt_json = json.dumps(
-                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-            )
-            node.ledger.record_receipt(receipt, receipt_json, outcome.internal_test)
+            # Already persisted, atomically with the job's completion, inside `handle()`.
             # The auditable copy goes to the owned room, guarded there as everywhere else.
             await node.publish_audit_copy(outcome.job_id, receipt)
 

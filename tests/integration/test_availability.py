@@ -325,9 +325,33 @@ def test_the_report_and_the_gate_share_one_vocabulary(node: Node) -> None:
     node.ledger.set_state("owned_room_observed", "1")
 
     availability = node.availability()
-    safe, reasons = node.safety_state()
 
-    assert availability["accepting_third_party_jobs"] is safe
-    assert availability["stop_reasons"] == reasons
-    assert reasons and all(r in availability["blockers"] for r in reasons)
-    assert availability["third_party_intake"] == "unavailable"
+    assert availability["accepting_third_party_jobs"] is node.can_accept_third_party_jobs()
+    # The invariant, in the form that survives having more than one lane: reasons are
+    # listed exactly when nothing is accepted. A non-empty list beside `true` is the
+    # drift this asserts against, whichever lane produced the entry.
+    assert bool(availability["stop_reasons"]) is not availability["accepting_third_party_jobs"]
+    for lane, reported in availability["lanes"].items():
+        open_now, reasons = node.lane_is_open(lane)
+        assert reported["open"] is open_now
+        assert reported["stop_reasons"] == reasons
+
+
+def test_an_open_lane_is_not_reported_as_stopped_by_a_closed_one(node: Node) -> None:
+    """One lane switched off is a fact about that lane, not a stop for the node."""
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+    node.ledger.set_state("owned_room_error", None)
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    object.__setattr__(node.settings, "http_job_intake_enabled", False)
+    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+
+    availability = node.availability()
+
+    assert availability["accepting_third_party_jobs"] is True
+    assert availability["stop_reasons"] == []
+    assert availability["lanes"]["mailbox"]["open"] is True
+    assert availability["lanes"]["http"]["open"] is False
+    assert any(
+        "HTTP job intake is disabled" in r for r in availability["lanes"]["http"]["stop_reasons"]
+    )

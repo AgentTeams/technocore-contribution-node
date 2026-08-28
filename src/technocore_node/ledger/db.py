@@ -24,6 +24,21 @@ def utcnow() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+#: The columns :meth:`Ledger.update_job` may set. Shared with the combined
+#: complete-and-record write so the two cannot allow different things.
+_JOB_UPDATE_FIELDS = frozenset(
+    {
+        "status",
+        "claimed_at",
+        "completed_at",
+        "failed_at",
+        "latency_ms",
+        "failure_code",
+        "request_seq",
+    }
+)
+
+
 class Ledger:
     """The node's own record of what it did, and of what it can still prove."""
 
@@ -341,16 +356,7 @@ class Ledger:
         return True
 
     def update_job(self, job_id: str, **fields: Any) -> None:
-        allowed = {
-            "status",
-            "claimed_at",
-            "completed_at",
-            "failed_at",
-            "latency_ms",
-            "failure_code",
-            "request_seq",
-        }
-        updates = {k: v for k, v in fields.items() if k in allowed}
+        updates = {k: v for k, v in fields.items() if k in _JOB_UPDATE_FIELDS}
         if not updates:
             return
         assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -448,6 +454,8 @@ class Ledger:
         receipt: dict[str, Any],
         receipt_json: str,
         internal_test: bool,
+        *,
+        complete_job: dict[str, Any] | None = None,
     ) -> None:
         """Persist a receipt before it is announced anywhere.
 
@@ -456,8 +464,23 @@ class Ledger:
         publishing, a crash in between would leave a completed job whose receipt does not
         exist and whose duplicate check suppresses every retry. Written first, the worst
         a crash costs is a copy that has not been announced yet — which the row says.
+
+        `complete_job` closes the last of that window. Marking the job finished and
+        writing its receipt are one fact, so they are one transaction: a crash between two
+        separate statements would leave a job whose duplicate check refuses every retry
+        and whose receipt does not exist — the work done, paid for, and unprovable. The
+        keys are the ones :meth:`update_job` accepts.
         """
         with self.tx() as conn:
+            if complete_job:
+                updates = {k: v for k, v in complete_job.items() if k in _JOB_UPDATE_FIELDS}
+                if updates:
+                    assignments = ", ".join(f"{k} = ?" for k in updates)
+                    conn.execute(
+                        # Safe: `assignments` names only allowlisted keys; values are bound.
+                        f"UPDATE jobs SET {assignments} WHERE job_id = ?",  # noqa: S608
+                        (*updates.values(), receipt["job_id"]),
+                    )
             conn.execute(
                 "INSERT OR REPLACE INTO receipts (receipt_id, job_id, requester_did, "
                 "provider_did, request_hash, result_hash, provider_signature, receipt_hash, "

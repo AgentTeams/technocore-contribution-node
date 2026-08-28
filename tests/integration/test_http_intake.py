@@ -10,6 +10,7 @@ could check.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -530,3 +531,48 @@ def test_a_replay_still_cannot_execute_twice_after_that_reordering(
 
     fresh_job_same_nonce = _envelope(key, did, _job("different-job-01"), 11)
     assert client.post("/v1/jobs", json=fresh_job_same_nonce).status_code == 409
+
+
+def test_a_completed_job_and_its_receipt_are_one_write(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Work done and receipt held, or neither. Never the first without the second.
+
+    The two were separate statements once, with a return through the caller in between.
+    A crash in that window left a job marked complete — so the duplicate check refused
+    every retry — whose receipt did not exist. The work was done, the `job_id` was spent,
+    and there was nothing to show for it, which for a node whose entire product is a
+    receipt is the worst available outcome.
+
+    Asserted by making the write fail: if it is one transaction, the completion is rolled
+    back with it and the caller can try again.
+    """
+    key, did = requester
+    job = _job("atomic-0000000001")
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", explode)
+        # The client turns an unhandled exception into a 500 rather than re-raising, so
+        # the failure is observed where a caller would observe it.
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    assert node.ledger.get_receipt("atomic-0000000001") is None
+    row = node.ledger.get_job("atomic-0000000001")
+    assert row is not None
+    assert row["status"] not in ("completed", "failed")
+
+
+def test_the_receipt_is_durable_before_the_response_is_written(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A caller that never sees the response can still fetch what it paid for."""
+    key, did = requester
+
+    body = client.post("/v1/jobs", json=_envelope(key, did, _job("durable-00000001"), 1)).json()
+
+    stored = node.ledger.get_receipt("durable-00000001")
+    assert stored is not None
+    assert json.loads(stored["receipt_json"])["receipt_hash"] == body["receipt"]["receipt_hash"]

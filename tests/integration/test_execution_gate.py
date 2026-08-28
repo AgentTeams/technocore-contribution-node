@@ -743,19 +743,54 @@ def test_small_forward_jitter_is_tolerated(node: Node) -> None:
 
 
 def test_a_disabled_mailbox_is_itself_a_stop_reason(node: Node) -> None:
-    """Nothing is polling, so nothing is being accepted, however healthy the rest looks.
+    """Nothing is polling, so that lane accepts nothing, however healthy the rest looks.
 
     This is the production configuration at the time of writing: intake was switched off
     the moment the unowned room was discovered. A status that ignores whether anyone is
     listening is the same mismatch this release exists to remove.
     """
     _own_the_room(node)
-    assert node.can_accept_third_party_jobs() is True
+    assert node.can_accept_third_party_jobs("mailbox") is True
 
     object.__setattr__(node.settings, "mailbox_enabled", False)
+    assert node.can_accept_third_party_jobs("mailbox") is False
+    assert any("mailbox intake is disabled" in r for r in node.lane_is_open("mailbox")[1])
+    # No other lane is on either, so nothing is accepted by any route.
     assert node.can_accept_third_party_jobs() is False
-    assert any("mailbox intake is disabled" in r for r in node.safety_state()[1])
     assert node.availability()["third_party_intake"] == "unavailable"
+
+
+def test_one_lanes_switch_does_not_close_the_other(node: Node) -> None:
+    """Safety is shared; enablement is not.
+
+    `TCN_MAILBOX_ENABLED` says whether this node polls a chat room. It has nothing to say
+    about whether a signed HTTP submission is accepted, and a node that offers only the
+    HTTP lane is a configuration somebody will want. Folding the two together made the
+    mailbox switch silently close a lane it does not own.
+    """
+    _own_the_room(node)
+    object.__setattr__(node.settings, "mailbox_enabled", False)
+    object.__setattr__(node.settings, "http_job_intake_enabled", True)
+
+    assert node.can_accept_third_party_jobs("http") is True
+    assert node.can_accept_third_party_jobs("mailbox") is False
+    assert node.can_accept_third_party_jobs() is True
+    assert node.open_lanes() == ["http"]
+
+
+def test_a_shared_safety_failure_closes_every_lane(node: Node) -> None:
+    """Whatever the switches say. A receipt nobody can audit is worthless on any route."""
+    _own_the_room(node)
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    object.__setattr__(node.settings, "http_job_intake_enabled", True)
+    assert node.open_lanes() == ["mailbox", "http"]
+
+    node.ledger.set_state("owned_room_owner", None)
+
+    assert node.open_lanes() == []
+    assert node.can_accept_third_party_jobs() is False
+    for lane in ("mailbox", "http"):
+        assert any("has no owner" in r for r in node.lane_is_open(lane)[1])
 
 
 def test_a_past_publish_error_is_shown_without_closing_the_gate(node: Node) -> None:
