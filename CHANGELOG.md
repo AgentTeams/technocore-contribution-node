@@ -50,6 +50,16 @@ route answers `404` while it is, and enabling it requires the result room first.
   not "already answered": a row without a receipt now resumes, serialised per `job_id` so
   two concurrent submissions of one id cannot both run it, and an answered one still
   returns its first answer rather than running again.
+- **A resume was charged the rate limit twice.** The counter reads job rows, and the row
+  it was reading is the job being recovered — so at a low limit the one retry that exists
+  to recover an answer the requester already paid for was the request the limit refused,
+  until the window rolled over.
+- **Abandoning a request could start the work twice.** A task runs in a worker thread
+  that no cancellation can stop, so a client that disconnected mid-job released the job's
+  slot while its thread carried on, and a retry started a second one — breaking single
+  execution and the concurrency ceiling in the one situation where the requester is least
+  able to see it. A second submission now joins the running attempt through a shield: the
+  disconnect abandons the waiting, never the work.
 - **A nonce SQLite could not hold became a 500.** Nineteen digits satisfied the pattern
   and `2**63` does not fit a signed 64-bit column, so a well-signed request reached the
   bind and crashed — recording neither a rejection nor a nonce, and so escaping the

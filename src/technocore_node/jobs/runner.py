@@ -92,16 +92,17 @@ class JobRunner:
         self.requester_jobs_per_hour = requester_jobs_per_hour
         self.source_commit = source_commit[:40]
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        #: One lock per in-flight `job_id`, with a waiter count so it is dropped only
-        #: when nobody is queued on it — removing a lock somebody is waiting on would let
-        #: the next arrival make a second one and run concurrently, which is the thing
-        #: the lock is here to stop.
+        #: The running attempt for each `job_id`, so a second submission of one id joins
+        #: the first rather than starting beside it.
         #:
-        #: A job whose row exists but whose receipt does not is resumable (see `handle`),
-        #: so two concurrent submissions of one id would otherwise both find it
-        #: unanswered and both run it. They serialise here; the second then finds the
-        #: receipt and returns the first answer.
-        self._in_flight: dict[str, tuple[asyncio.Lock, list[int]]] = {}
+        #: A lock was not enough. A job whose row exists but whose receipt does not is
+        #: resumable (see `handle`), and the work runs in a worker thread that no
+        #: cancellation can stop: a client that disconnected mid-job released the lock
+        #: while its thread carried on, and the retry then started a second one. Holding
+        #: the *task* and awaiting it through a shield means the disconnect abandons the
+        #: waiting, never the work — and the entry is dropped by the task's own callback,
+        #: when it has actually finished.
+        self._in_flight: dict[str, asyncio.Task[Outcome | None]] = {}
 
     # ------------------------------------------------------------- validation
 
@@ -206,11 +207,10 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         task = str(job["task"])
 
-        lock, waiters = self._in_flight.setdefault(job_id, (asyncio.Lock(), [0]))
-        waiters[0] += 1
-        try:
-            async with lock:
-                return await self._run(
+        running = self._in_flight.get(job_id)
+        if running is None:
+            running = asyncio.create_task(
+                self._run(
                     job=job,
                     job_id=job_id,
                     reply_room=reply_room,
@@ -221,10 +221,24 @@ class JobRunner:
                     internal_test=internal_test,
                     started=started,
                 )
-        finally:
-            waiters[0] -= 1
-            if waiters[0] == 0:
-                self._in_flight.pop(job_id, None)
+            )
+            self._in_flight[job_id] = running
+            running.add_done_callback(lambda done: self._retire(job_id, done))
+        # Shielded: cancelling the caller must not cancel work that is already underway,
+        # because the thread running it would not stop anyway and the receipt is owed
+        # either way. The task carries its own timeout.
+        return await asyncio.shield(running)
+
+    def _retire(self, job_id: str, done: asyncio.Task[Outcome | None]) -> None:
+        """Drop a finished attempt, and consume its exception so the loop does not shout.
+
+        Every caller that was awaiting it has already seen the exception through the
+        shield; a task nobody is left waiting on — the disconnected client — would
+        otherwise be reported as never retrieved.
+        """
+        self._in_flight.pop(job_id, None)
+        if not done.cancelled():
+            done.exception()
 
     async def _run(
         self,
@@ -239,6 +253,7 @@ class JobRunner:
         internal_test: bool,
         started: datetime,
     ) -> Outcome | None:
+        resuming = False
         owner = self.ledger.job_requester(job_id)
         if owner is not None:
             if owner != requester_did:
@@ -268,8 +283,14 @@ class JobRunner:
                 "resuming a job whose previous attempt left no receipt",
                 extra={"fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}},
             )
+            resuming = True
 
-        self.check_rate_limit(requester_did)
+        if not resuming:
+            # The rate limit counts jobs, and this job is already counted — its row is
+            # what the counter is reading. Charging again would let the limit refuse the
+            # one retry that exists to recover an answer the requester already paid for,
+            # and at a low limit that refusal lasts until the window rolls over.
+            self.check_rate_limit(requester_did)
 
         request_hash = canonical_hash(job)
         inserted = self.ledger.insert_job(

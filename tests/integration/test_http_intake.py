@@ -9,8 +9,10 @@ could check.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,8 @@ from fastapi.testclient import TestClient
 from technocore_node.api import create_app
 from technocore_node.config import load_settings
 from technocore_node.crypto import didkey, keystore
+from technocore_node.jobs.runner import RejectedJob
+from technocore_node.jobs.tasks import REGISTRY
 from technocore_node.protocol.envelope import message_payload
 from technocore_node.protocol.http_envelope import (
     HTTP_JOB_DOMAIN,
@@ -78,6 +82,10 @@ def published() -> list[tuple[str, dict[str, Any]]]:
 @pytest.fixture
 def client(node: Node) -> TestClient:
     return TestClient(create_app(node), raise_server_exceptions=False)
+
+
+def _explode(*args: Any, **kwargs: Any) -> None:
+    raise sqlite3.OperationalError("disk I/O error")
 
 
 def _job(job_id: str = "http-job-000001", **over: Any) -> dict[str, Any]:
@@ -652,3 +660,91 @@ def test_the_published_api_description_admits_the_write_route(client: TestClient
     )
     assert "POST /v1/jobs" in spec["info"]["description"]
     assert "/v1/jobs" in spec["paths"]
+
+
+async def test_a_resume_is_not_charged_the_rate_limit_twice(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The row the limit counts is the job being recovered.
+
+    Charging it again lets the limit refuse the one retry that exists to recover an
+    answer the requester already paid for — and at a low limit, for as long as the window
+    lasts. The counter reads job rows; a resume creates none.
+    """
+    _, did = requester
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+    text = json.dumps(_job("ratelimited-0001"))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", _explode)
+        with pytest.raises(sqlite3.OperationalError):
+            await node.runner.handle(
+                text=text, requester_did=did, request_room="http", request_seq=None
+            )
+
+    assert node.ledger.get_receipt("ratelimited-0001") is None
+
+    outcome = await node.runner.handle(
+        text=text, requester_did=did, request_room="http", request_seq=None
+    )
+
+    assert outcome is not None
+    assert node.ledger.get_receipt("ratelimited-0001") is not None
+    # The limit still holds for work that is genuinely new.
+    with pytest.raises(RejectedJob) as refused:
+        await node.runner.handle(
+            text=json.dumps(_job("brand-new-000001")),
+            requester_did=did,
+            request_room="http",
+            request_seq=None,
+        )
+    assert refused.value.code == "rate_limited"
+
+
+async def test_abandoning_a_request_does_not_start_the_work_twice(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A disconnect abandons the waiting, never the work.
+
+    The task runs in a worker thread that no cancellation can stop. Releasing the job's
+    slot when the caller went away let a retry start a second thread for the same job —
+    breaking both single execution and the concurrency ceiling, in the one situation
+    where the requester is least able to see it.
+    """
+    _, did = requester
+    text = json.dumps(_job("abandoned-000001"))
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    runs = 0
+
+    def slow(payload: dict[str, Any], context: Any) -> dict[str, Any]:
+        nonlocal runs
+        runs += 1
+        loop.call_soon_threadsafe(started.set)
+        release.wait(5)
+        return {"canonical": "{}", "sha256": "sha256:" + "0" * 64, "bytes": 2}
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(REGISTRY, "canonical_json_sha256", slow)
+
+        first = asyncio.create_task(
+            node.runner.handle(text=text, requester_did=did, request_room="http", request_seq=None)
+        )
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # The abandoned work is still running, so a retry joins it rather than starting
+        # a second thread.
+        second = asyncio.create_task(
+            node.runner.handle(text=text, requester_did=did, request_room="http", request_seq=None)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        outcome = await second
+
+    assert runs == 1
+    assert outcome is not None
+    assert node.ledger.get_receipt("abandoned-000001") is not None
