@@ -530,7 +530,10 @@ async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
         # has no way to verify it, so the node declines to produce one.
         public_url="https://example.invalid",
         origin=ORIGIN,
-        mailbox_enabled=False,
+        # Intake is a gate condition, and these tests exercise a node that accepts work.
+        # The loop is never started here — `start_background()` is not called — so this
+        # switches the gate on without polling anything.
+        mailbox_enabled=True,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -601,7 +604,10 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
         # has no way to verify it, so the node declines to produce one.
         public_url="https://example.invalid",
         origin=ORIGIN,
-        mailbox_enabled=False,
+        # Intake is a gate condition, and these tests exercise a node that accepts work.
+        # The loop is never started here — `start_background()` is not called — so this
+        # switches the gate on without polling anything.
+        mailbox_enabled=True,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -657,7 +663,10 @@ async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
         # has no way to verify it, so the node declines to produce one.
         public_url="https://example.invalid",
         origin=ORIGIN,
-        mailbox_enabled=False,
+        # Intake is a gate condition, and these tests exercise a node that accepts work.
+        # The loop is never started here — `start_background()` is not called — so this
+        # switches the gate on without polling anything.
+        mailbox_enabled=True,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -746,7 +755,10 @@ async def test_27_a_copy_that_landed_before_a_crash_is_not_published_twice(
         # has no way to verify it, so the node declines to produce one.
         public_url="https://example.invalid",
         origin=ORIGIN,
-        mailbox_enabled=False,
+        # Intake is a gate condition, and these tests exercise a node that accepts work.
+        # The loop is never started here — `start_background()` is not called — so this
+        # switches the gate on without polling anything.
+        mailbox_enabled=True,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,

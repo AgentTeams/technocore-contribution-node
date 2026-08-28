@@ -45,6 +45,10 @@ def node(env: dict[str, str]) -> Node:
     keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
     node = Node(load_settings())
     object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    # The shared fixture disables the loop so tests never poll; these tests exercise the
+    # node's own logic, so they run as a deployment with intake switched on. The disabled
+    # case has its own test.
+    object.__setattr__(node.settings, "mailbox_enabled", True)
     return node
 
 
@@ -736,3 +740,36 @@ def test_small_forward_jitter_is_tolerated(node: Node) -> None:
     _own_the_room(node)
     _age_the_observation(node, -5)
     assert node.owns_result_room() is True
+
+
+def test_a_disabled_mailbox_is_itself_a_stop_reason(node: Node) -> None:
+    """Nothing is polling, so nothing is being accepted, however healthy the rest looks.
+
+    This is the production configuration at the time of writing: intake was switched off
+    the moment the unowned room was discovered. A status that ignores whether anyone is
+    listening is the same mismatch this release exists to remove.
+    """
+    _own_the_room(node)
+    assert node.can_accept_third_party_jobs() is True
+
+    object.__setattr__(node.settings, "mailbox_enabled", False)
+    assert node.can_accept_third_party_jobs() is False
+    assert any("mailbox intake is disabled" in r for r in node.safety_state()[1])
+    assert node.availability()["third_party_intake"] == "unavailable"
+
+
+def test_a_past_publish_error_is_shown_without_closing_the_gate(node: Node) -> None:
+    """Worth showing, but it is not a gate condition.
+
+    Folding it into `blockers` made `stop_reasons` non-empty while
+    `accepting_third_party_jobs` stayed true — the exact disagreement those two fields
+    exist to make impossible. It has its own field now.
+    """
+    _own_the_room(node)
+    node.ledger.set_state(f"last_publish_error:{node.result_room}", "HTTP 429: slow down")
+    availability = node.availability()
+
+    assert availability["last_publish_error"] == "HTTP 429: slow down"
+    assert availability["accepting_third_party_jobs"] is True
+    assert availability["stop_reasons"] == []
+    assert availability["blockers"] == []

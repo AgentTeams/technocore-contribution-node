@@ -720,6 +720,15 @@ class Node:
         if not self.settings.public_url:
             reasons.append("no public URL is configured, so a requester cannot verify a receipt")
 
+        if not self.settings.mailbox_enabled:
+            # The only intake this version has. With the loop switched off nothing is
+            # polling, so "accepting third-party jobs" would be false however healthy
+            # everything else looked — and a status that ignores whether anyone is
+            # listening is the same mismatch this release exists to remove.
+            reasons.append(
+                "mailbox intake is disabled (TCN_MAILBOX_ENABLED=false), so no job is being read"
+            )
+
         return (not reasons, reasons)
 
     def can_accept_third_party_jobs(self) -> bool:
@@ -758,13 +767,15 @@ class Node:
         # and they drifted: the report could read `available` from a stale ownership
         # record the gate had already rejected, which is exactly the status/action
         # mismatch this release exists to remove.
+        # `blockers` is exactly what the gate refuses on — no more. A past publish
+        # failure is worth showing and is shown, but as its own field: folding it in here
+        # made `stop_reasons` non-empty while `accepting_third_party_jobs` stayed true,
+        # which is the very disagreement these two fields exist to make impossible.
         safe, blockers = self.safety_state()
-        if result_err:
-            blockers = [*blockers, f"last publish to the owned room was refused: {result_err}"]
 
         # Blockers are about now; a completed job is about the past. A node that once
         # served somebody and is unreachable today is unreachable today.
-        if blockers or not safe:
+        if not safe:
             intake = "unavailable"
         elif completed > 0:
             intake = "available"
@@ -777,6 +788,7 @@ class Node:
             # disagree the reader should be able to see it, not have to infer it.
             "accepting_third_party_jobs": safe,
             "stop_reasons": blockers,
+            "last_publish_error": result_err,
             "third_party_jobs_completed": completed,
             "blockers": blockers,
             "public_url": self.settings.public_url or None,

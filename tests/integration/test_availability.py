@@ -29,7 +29,9 @@ REQUESTER = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
 @pytest.fixture
 def node(env: dict[str, str]) -> Node:
     keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
-    return Node(load_settings())
+    node = Node(load_settings())
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    return node
 
 
 @pytest.fixture
@@ -81,8 +83,9 @@ async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) ->
     assert await node.publish(node.result_room, {"type": "receipt", "job_id": "x"}) is None
 
     availability = node.availability()
-    assert availability["third_party_intake"] == "unavailable"
-    assert any("room limit reached" in b for b in availability["blockers"]), availability
+    # The upstream's own sentence, kept and shown — in its own field, because a past
+    # failure is context rather than a gate condition.
+    assert "room limit reached" in (availability["last_publish_error"] or ""), availability
 
 
 async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
@@ -96,7 +99,7 @@ async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
 
     node.client.say_signed = refuse  # type: ignore[method-assign]
     await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
-    assert any("room limit" in b for b in node.availability()["blockers"])
+    assert "room limit" in (node.availability()["last_publish_error"] or "")
 
     async def accept(room: str, text: str, *, confirm: bool = True) -> Confirmation:
         return Confirmation(
@@ -105,7 +108,7 @@ async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
 
     node.client.say_signed = accept  # type: ignore[method-assign]
     await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
-    assert not any("room limit" in b for b in node.availability()["blockers"])
+    assert node.availability()["last_publish_error"] is None
 
 
 def test_a_missing_public_url_is_a_blocker_not_a_footnote(node: Node) -> None:
