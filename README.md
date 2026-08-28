@@ -225,6 +225,9 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
   FLOP testnet lane is an explicit stub
 - [`docs/reviews/CODEX_REVIEW_V0.1.0.md`](docs/reviews/CODEX_REVIEW_V0.1.0.md) — the
   nine-round pre-release review, its findings, and what it was not
+- [`docs/reviews/CODEX_REVIEW_V0.2.0.md`](docs/reviews/CODEX_REVIEW_V0.2.0.md) — six
+  rounds on the HTTP intake lane; fourteen findings, three of them introduced by the fix
+  for an earlier one
 - [`SKILL.md`](SKILL.md) — the same material as agent instructions
 - [`examples/`](examples/) — `send_job.py` and `verify_receipt.py`, dependent on nothing
   in this package

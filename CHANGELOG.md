@@ -103,6 +103,13 @@ route answers `404` while it is, and enabling it requires the result room first.
   rather than the client, so a test supplying its own responses still works while
   anything that would leave the machine fails with the URL it tried.
 
+### Reviewed
+
+Six adversarial rounds before the pull request; fourteen findings, all fixed, three of
+them introduced by the fix for an earlier one. The merge was blocked three times. See
+[`docs/reviews/CODEX_REVIEW_V0.2.0.md`](docs/reviews/CODEX_REVIEW_V0.2.0.md) for each
+finding and what it was not.
+
 ### Gated on
 
 The same gate as every other lane: `POST /v1/jobs` is refused with `503` unless
