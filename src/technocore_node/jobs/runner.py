@@ -92,6 +92,16 @@ class JobRunner:
         self.requester_jobs_per_hour = requester_jobs_per_hour
         self.source_commit = source_commit[:40]
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        #: One lock per in-flight `job_id`, with a waiter count so it is dropped only
+        #: when nobody is queued on it — removing a lock somebody is waiting on would let
+        #: the next arrival make a second one and run concurrently, which is the thing
+        #: the lock is here to stop.
+        #:
+        #: A job whose row exists but whose receipt does not is resumable (see `handle`),
+        #: so two concurrent submissions of one id would otherwise both find it
+        #: unanswered and both run it. They serialise here; the second then finds the
+        #: receipt and returns the first answer.
+        self._in_flight: dict[str, tuple[asyncio.Lock, list[int]]] = {}
 
     # ------------------------------------------------------------- validation
 
@@ -196,6 +206,39 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         task = str(job["task"])
 
+        lock, waiters = self._in_flight.setdefault(job_id, (asyncio.Lock(), [0]))
+        waiters[0] += 1
+        try:
+            async with lock:
+                return await self._run(
+                    job=job,
+                    job_id=job_id,
+                    reply_room=reply_room,
+                    task=task,
+                    requester_did=requester_did,
+                    request_room=request_room,
+                    request_seq=request_seq,
+                    internal_test=internal_test,
+                    started=started,
+                )
+        finally:
+            waiters[0] -= 1
+            if waiters[0] == 0:
+                self._in_flight.pop(job_id, None)
+
+    async def _run(
+        self,
+        *,
+        job: dict[str, Any],
+        job_id: str,
+        reply_room: str,
+        task: str,
+        requester_did: str,
+        request_room: str,
+        request_seq: int | None,
+        internal_test: bool,
+        started: datetime,
+    ) -> Outcome | None:
         owner = self.ledger.job_requester(job_id)
         if owner is not None:
             if owner != requester_did:
@@ -208,11 +251,23 @@ class JobRunner:
                     "another requester already used this job_id; choose one with a "
                     "random component",
                 )
-            log.info(
-                "duplicate job ignored",
+            if self.ledger.get_receipt(job_id) is not None:
+                log.info(
+                    "duplicate job ignored",
+                    extra={
+                        "fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}
+                    },
+                )
+                return None
+            # The row exists and the receipt does not: a previous attempt died between
+            # inserting the job and writing its answer. "Already seen" is not "already
+            # answered", and treating it as such spent the caller's `job_id` on work they
+            # can never be shown. The tasks are pure and the row is already theirs, so
+            # this resumes rather than refusing.
+            log.warning(
+                "resuming a job whose previous attempt left no receipt",
                 extra={"fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}},
             )
-            return None
 
         self.check_rate_limit(requester_did)
 
@@ -231,10 +286,11 @@ class JobRunner:
             internal_test=internal_test,
         )
         if not inserted:
-            # Lost the insert race. The row now exists, so ask whose it is: two different
-            # requesters can both pass the check above before either has written, and the
-            # loser must still be told rather than dropped — otherwise the whole squatting
-            # problem survives inside the race window.
+            # Either the row is ours from an attempt that died — the resume path above —
+            # or we lost the insert race. Two different requesters can both pass the
+            # check above before either has written, and the loser must still be told
+            # rather than dropped, otherwise the whole squatting problem survives inside
+            # the race window.
             winner = self.ledger.job_requester(job_id)
             if winner is not None and winner != requester_did:
                 raise RejectedJob(
@@ -242,7 +298,8 @@ class JobRunner:
                     "another requester already used this job_id; choose one with a "
                     "random component",
                 )
-            return None
+            if winner == requester_did and self.ledger.get_receipt(job_id) is not None:
+                return None
 
         claim = {
             "v": job_schema.PROTOCOL_VERSION,

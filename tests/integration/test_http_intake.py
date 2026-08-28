@@ -576,3 +576,79 @@ def test_the_receipt_is_durable_before_the_response_is_written(
     stored = node.ledger.get_receipt("durable-00000001")
     assert stored is not None
     assert json.loads(stored["receipt_json"])["receipt_hash"] == body["receipt"]["receipt_hash"]
+
+
+def test_a_job_left_unanswered_by_a_crash_can_be_retried(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """ "Already seen" is not "already answered", and only the second may refuse a retry.
+
+    The completion and the receipt are one transaction, but the job row is inserted before
+    it. So a failure in that write rolls the completion back and leaves the row — and a
+    duplicate check keyed on the row's existence would then refuse every retry of a job
+    that was never answered. The caller's `job_id` is spent, the work is unprovable, and
+    nothing says so.
+    """
+    key, did = requester
+    job = _job("crashed-00000001")
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", explode)
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    assert node.ledger.job_requester("crashed-00000001") == did
+    assert node.ledger.get_receipt("crashed-00000001") is None
+
+    retried = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "ok"
+    assert node.ledger.get_receipt("crashed-00000001") is not None
+
+
+def test_an_answered_job_is_still_answered_from_the_ledger(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Resuming the unanswered must not make the answered run twice."""
+    key, did = requester
+    job = _job("answered-00000001")
+
+    first = client.post("/v1/jobs", json=_envelope(key, did, job, 1)).json()
+    again = client.post("/v1/jobs", json=_envelope(key, did, job, 2)).json()
+
+    assert again["status"] == "already_completed"
+    assert again["receipt"]["receipt_hash"] == first["receipt"]["receipt_hash"]
+
+
+def test_a_nonce_sqlite_cannot_hold_is_refused_rather_than_crashing(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Nineteen digits fits the pattern; not all of them fit a signed 64-bit column.
+
+    A well-signed request with `2**63` reached the bind and became a 500 that recorded
+    neither a rejection nor a nonce — a malformed input escaping the accounting every
+    other malformed input is subject to.
+    """
+    key, did = requester
+    too_big = str(2**63)
+    assert len(too_big) == 19
+
+    response = client.post("/v1/jobs", json=_envelope(key, did, _job("bignonce-0000001"), 2**63))
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "bad_signature"
+    assert client.post("/v1/jobs", json=_envelope(key, did, _job("okn-000000000001"), 2**63 - 1))
+
+
+def test_the_published_api_description_admits_the_write_route(client: TestClient) -> None:
+    """An auditor reading the OpenAPI document must not be told this API is read-only."""
+    spec = client.get("/openapi.json").json()
+
+    assert "read-only" not in spec["info"]["description"].lower().replace(
+        "every endpoint here is read-only except", ""
+    )
+    assert "POST /v1/jobs" in spec["info"]["description"]
+    assert "/v1/jobs" in spec["paths"]

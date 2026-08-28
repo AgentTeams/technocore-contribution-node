@@ -438,7 +438,14 @@ async def test_losing_the_insert_race_still_refuses_a_foreign_job_id(
 async def test_losing_the_race_to_yourself_stays_silently_idempotent(
     runner: JobRunner, ledger: Ledger
 ) -> None:
-    """A redelivery of one's own job is not an error, however the race resolves."""
+    """A redelivery of one's own job is not an error, however the race resolves.
+
+    What it resolves *to* depends on whether the earlier attempt got as far as an answer.
+    A row with a receipt is answered, and the redelivery is dropped. A row without one is
+    only *seen*: an attempt died between inserting the job and writing its receipt, and
+    treating that as a duplicate would spend the caller's `job_id` on work they can never
+    be shown. So it resumes. Neither is an error, and that is the point.
+    """
     real_insert = ledger.insert_job
 
     def insert_then_lose(**fields: object) -> bool:
@@ -447,7 +454,7 @@ async def test_losing_the_race_to_yourself_stays_silently_idempotent(
 
     ledger.insert_job = insert_then_lose  # type: ignore[method-assign]
     try:
-        outcome = await runner.handle(
+        resumed = await runner.handle(
             text=job_line(job_id="selfrace-00001"),
             requester_did=REQUESTER,
             request_room="mb-test",
@@ -455,7 +462,20 @@ async def test_losing_the_race_to_yourself_stays_silently_idempotent(
         )
     finally:
         ledger.insert_job = real_insert  # type: ignore[method-assign]
-    assert outcome is None
+
+    assert resumed is not None
+    assert ledger.get_receipt("selfrace-00001") is not None
+
+    # Now it is answered, so the next redelivery is dropped.
+    assert (
+        await runner.handle(
+            text=job_line(job_id="selfrace-00001"),
+            requester_did=REQUESTER,
+            request_room="mb-test",
+            request_seq=1,
+        )
+        is None
+    )
 
 
 def test_the_published_job_id_contract_says_globally_unique() -> None:

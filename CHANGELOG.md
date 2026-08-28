@@ -44,6 +44,20 @@ route answers `404` while it is, and enabling it requires the result room first.
   the same shared safety conditions, and `/v1/info` reports per lane — `stop_reasons`
   stays empty exactly when something is accepted, so it can never read non-empty beside
   `accepting_third_party_jobs: true`.
+- **A job left unanswered by a crash could never be retried.** The job row is inserted
+  before the work runs, so a failure writing the answer left a row with no receipt — and
+  a duplicate check keyed on the row's existence refused every retry. "Already seen" is
+  not "already answered": a row without a receipt now resumes, serialised per `job_id` so
+  two concurrent submissions of one id cannot both run it, and an answered one still
+  returns its first answer rather than running again.
+- **A nonce SQLite could not hold became a 500.** Nineteen digits satisfied the pattern
+  and `2**63` does not fit a signed 64-bit column, so a well-signed request reached the
+  bind and crashed — recording neither a rejection nor a nonce, and so escaping the
+  accounting every other malformed input is subject to. Bounded where the value is
+  already checked.
+- **The published API description said read-only.** It is, except for the one write route
+  this release adds. An auditor reading the OpenAPI document was told the write surface
+  did not exist.
 - **A completed job and its receipt were two writes.** A crash between them left a job
   marked complete — so the duplicate check refused every retry — whose receipt did not
   exist: the work done, the `job_id` spent, and nothing to show for it. They are one

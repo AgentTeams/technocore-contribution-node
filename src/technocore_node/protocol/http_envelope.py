@@ -43,6 +43,13 @@ SEPARATOR = "|"
 
 NONCE_RE = re.compile(r"^[0-9]{1,19}$")
 
+#: A nonce is stored as a SQLite INTEGER, which is signed 64-bit. `NONCE_RE` admits
+#: nineteen digits, and the largest of those is above that ceiling — so the pattern alone
+#: let a well-signed request through to a bind that overflows, turning a malformed input
+#: into a 500 that recorded neither a rejection nor a nonce. Bounded here, where the
+#: value is already being checked.
+MAX_NONCE = 2**63 - 1
+
 
 class HttpEnvelopeError(ValueError):
     """The submission is not a well-formed signed HTTP job."""
@@ -66,7 +73,7 @@ def verify_http_job(did: str, signature: str, nonce: str, body: object) -> None:
     """Raise :class:`HttpEnvelopeError` unless this is a valid submission from `did`."""
     if not didkey.is_did(did):
         raise HttpEnvelopeError("did is not a valid Ed25519 did:key")
-    if not NONCE_RE.fullmatch(nonce):
+    if not NONCE_RE.fullmatch(nonce) or int(nonce) > MAX_NONCE:
         raise HttpEnvelopeError("nonce must be 1-19 digits")
     if not didkey.SIG_RE.fullmatch(signature or ""):
         raise HttpEnvelopeError("sig must be 86 unpadded base64url characters")

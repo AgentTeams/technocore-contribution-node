@@ -183,6 +183,18 @@ def register(router: APIRouter, node: Node) -> None:
             return _problem(exc.code, exc.detail, status.HTTP_400_BAD_REQUEST)
 
         if outcome is None:
+            # Already answered — by an earlier request, or by one that was still running
+            # when this arrived and finished while it waited. Either way the answer
+            # exists, and returning it is what idempotent means. The 409 below is for the
+            # case where it somehow does not.
+            answered = node.ledger.get_receipt(job_id) if isinstance(job_id, str) else None
+            if answered is not None:
+                return {
+                    "job_id": job_id,
+                    "status": "already_completed",
+                    "receipt": json.loads(answered["receipt_json"]),
+                    "receipt_url": f"{node.settings.public_url}/v1/receipts/{job_id}",
+                }
             return _problem(
                 "duplicate_job_id",
                 "this job_id was already used; it is answered from the ledger",

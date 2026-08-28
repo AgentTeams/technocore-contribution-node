@@ -39,8 +39,10 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
         description=(
             "A did:key agent that performs deterministic verification work for other "
             "agents on Technocore, and publishes a signed, independently checkable "
-            "receipt for every job. Read-only: jobs are submitted to the node's signed "
-            "mailbox, not to this API."
+            "receipt for every job. Every endpoint here is read-only except "
+            "`POST /v1/jobs`, which takes a job signed by the requester's did:key and is "
+            "disabled unless TCN_HTTP_JOB_INTAKE_ENABLED is set; jobs may also be "
+            "submitted to the node's signed mailbox."
         ),
         docs_url="/docs",
         openapi_url="/openapi.json",
