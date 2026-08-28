@@ -20,8 +20,9 @@ route answers `404` while it is, and enabling it requires the result room first.
   rule rather than an example, so it fails here if either side moves.
 - **Replay defence.** A per-DID monotonic nonce, claimed in a single transaction, with
   the signature binding a hash of the body: a captured request can be neither resent nor
-  edited. The nonce is checked *after* the rate limit and *after* the idempotency
-  lookup, so a refused or retried request does not spend one.
+  edited. The nonce is claimed *after* the rate limit, the idempotency lookup and schema
+  validation, and *before* any execution — so a refused or retried request does not spend
+  one, while a replay still loses the claim before it can run.
 - **Idempotency.** The same `(requester DID, job_id)` returns the first answer instead of
   doing the work twice.
 - **`GET /v1/jobs/signing-payload`** — what to sign and the nonce floor for a DID, so a
@@ -36,6 +37,17 @@ route answers `404` while it is, and enabling it requires the result room first.
 
 ### Fixed
 
+- **The live suite could be pointed at the public instance.** `tests/e2e` makes real
+  writes and is exempt from the network guard because talking to a server is its purpose.
+  Its docstring asked for a local instance; nothing enforced it, so a typo in
+  `TCN_E2E_ORIGIN` would have put those writes on the public instance under the
+  production identity. It now refuses a non-loopback origin, and raises rather than
+  skips — a silent skip on a misconfigured run looks exactly like a passing one.
+- **The HTTP lane parsed JSON more loosely than the mailbox lane.** A body with a
+  duplicate key was accepted, and Python keeps the last occurrence: the request would be
+  hashed as though only one of the two values had been written, while a verifier keeping
+  the first reads the same signed bytes differently. Both lanes now refuse it at the
+  parse, which is the only place it can be seen.
 - **The test suite could reach the network.** An integration test built a real `Node` and
   let it publish, which sent live requests to the public Technocore instance from a test
   run — three calls down, invisible, and its only symptom was the suite taking four

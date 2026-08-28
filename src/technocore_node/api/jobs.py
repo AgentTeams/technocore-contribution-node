@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 
 from ..jobs.runner import RejectedJob
 from ..logging import get_logger
-from ..protocol.canonical import CanonicalJSONError, canonical_bytes
+from ..protocol.canonical import CanonicalJSONError, canonical_bytes, parse_strict
 from ..protocol.http_envelope import HttpEnvelopeError, http_job_payload, verify_http_job
 from ..service.node import Node
 
@@ -83,9 +83,19 @@ def register(router: APIRouter, node: Node) -> None:
             )
 
         try:
-            envelope = json.loads(raw)
+            # `parse_strict`, not `json.loads`. Python keeps the last of a duplicate key,
+            # so `{"task":"a","task":"b"}` would be signed and hashed as if only `b` were
+            # written, while a verifier that keeps the first reads the same bytes
+            # differently. The signature would verify and the two parties would disagree
+            # about what was signed — the one property a receipt exists to rule out. The
+            # mailbox lane refuses this at the parse; so does this one.
+            envelope = parse_strict(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return _problem("not_json", "body is not UTF-8", status.HTTP_400_BAD_REQUEST)
         except json.JSONDecodeError:
             return _problem("not_json", "body is not JSON", status.HTTP_400_BAD_REQUEST)
+        except CanonicalJSONError as exc:
+            return _problem("not_canonical_json", str(exc), status.HTTP_400_BAD_REQUEST)
         if not isinstance(envelope, dict):
             return _problem("not_an_object", "body is not an object", status.HTTP_400_BAD_REQUEST)
 
@@ -128,6 +138,24 @@ def register(router: APIRouter, node: Node) -> None:
                     "receipt_url": f"{node.settings.public_url}/v1/receipts/{job_id}",
                 }
 
+        # Validate before the nonce is claimed. `parse_and_validate` is pure — it reads
+        # nothing and writes nothing — so running it here and again inside `handle()` is
+        # free, and it means a job refused by the schema leaves the caller's counter where
+        # it was. Execution still happens strictly after the claim, so a replay of a valid
+        # request re-validates cheaply and then loses the claim, exactly as before.
+        text = canonical_bytes(job).decode("utf-8")
+        try:
+            node.runner.parse_and_validate(text)
+        except RejectedJob as exc:
+            node.ledger.record_rejection(
+                job_id=job_id if isinstance(job_id, str) else None,
+                requester_did=did,
+                code=exc.code,
+                detail=exc.detail,
+                request_room="http",
+            )
+            return _problem(exc.code, exc.detail, status.HTTP_400_BAD_REQUEST)
+
         if not node.ledger.claim_http_nonce(did, int(nonce)):
             return _problem(
                 "nonce_not_advancing",
@@ -138,7 +166,7 @@ def register(router: APIRouter, node: Node) -> None:
 
         try:
             outcome = await node.runner.handle(
-                text=canonical_bytes(job).decode("utf-8"),
+                text=text,
                 requester_did=did,
                 request_room="http",
                 request_seq=None,

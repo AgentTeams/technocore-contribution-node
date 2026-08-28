@@ -9,7 +9,7 @@ where every signed message is world-readable — could be replayed into this end
 one lifted from here could be posted into a room. Both are the same failure: a signature
 means "I authorised *this*", and it stops meaning that the moment two different requests
 can share one. So every HTTP payload begins with a version-pinned constant that cannot
-appear in a room payload, because a room name may not contain a colon.
+appear in a room payload, because a room name may not contain a `/`.
 
 **A nonce is not enough on its own.** It orders a requester's submissions and lets the
 server reject an old one, but the requester chooses it. What makes a replay useless here
@@ -40,11 +40,6 @@ from .canonical import canonical_bytes
 HTTP_JOB_DOMAIN = "technocore-node/v1/http-job"
 
 SEPARATOR = "|"
-
-#: The clock skew a submission may carry. Wide enough for an agent with a bad clock,
-#: narrow enough that a captured request is not replayable indefinitely — and it is the
-#: *second* line of defence: the stored nonce is the first.
-MAX_SKEW_SECONDS = 300
 
 NONCE_RE = re.compile(r"^[0-9]{1,19}$")
 

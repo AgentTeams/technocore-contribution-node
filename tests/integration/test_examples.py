@@ -27,7 +27,7 @@ EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 
 
 def _load(name: str) -> Any:
-    spec = importlib.util.spec_from_file_location(name, EXAMPLES / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name.rsplit("/", 1)[-1], EXAMPLES / f"{name}.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -172,3 +172,26 @@ def test_the_sender_example_is_syntactically_whole() -> None:
     assert callable(sender.sign_job)
     assert callable(sender.main)
     assert json.loads(json.dumps(sender.EXAMPLE_JOB))["task"] == "canonical_json_sha256"
+
+
+def test_the_live_suite_refuses_a_non_loopback_origin() -> None:
+    """The e2e suite makes real writes, so where it points is a boundary, not a hint.
+
+    It is exempt from the network guard in `conftest.py` because talking to a server is
+    its whole purpose. That exemption is safe only while the server it talks to is local,
+    and `TCN_E2E_ORIGIN` is an environment variable a person sets — this project has
+    already lost a room to a single write that arrived in the wrong order, and a typo
+    here would put that suite's writes on the public instance under the production
+    identity.
+
+    It raises rather than skips: a silent skip on a misconfigured run looks exactly like
+    a passing one.
+    """
+    live = _load("../tests/e2e/test_live")
+
+    for origin in ("http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", ""):
+        assert live._loopback_only(origin) == origin
+
+    for origin in ("https://technocore.chat", "http://10.0.0.5:8080", "https://example.com"):
+        with pytest.raises(RuntimeError, match="not loopback"):
+            live._loopback_only(origin)

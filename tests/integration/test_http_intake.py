@@ -457,3 +457,76 @@ def test_the_published_example_produces_an_envelope_this_server_accepts(
     checker = importlib.util.module_from_spec(verifier)
     verifier.loader.exec_module(checker)
     assert checker.verify(receipt, node.did) == []
+
+
+def test_a_duplicate_key_is_refused_the_way_the_mailbox_lane_refuses_it(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Two lanes, one parser. A body with no single meaning is not a request.
+
+    Python keeps the last of a duplicate key, so `{"task":"a","task":"b"}` would be
+    hashed as though only `b` were ever written — and a verifier that keeps the first
+    reads the same signed bytes differently. The signature verifies, both parties are
+    satisfied, and they disagree about what was signed. A receipt exists to rule that out,
+    so it is refused at the parse rather than canonicalised into one of its two meanings.
+    """
+    key, did = requester
+    job = _job("dupe-00000000001")
+    envelope = _envelope(key, did, job, 1)
+
+    # Signed over the value Python would keep, so only the parser can catch this.
+    body = json.dumps(envelope).replace(
+        '"task": "canonical_json_sha256"',
+        '"task": "verify_receipt_chain", "task": "canonical_json_sha256"',
+    )
+    response = client.post(
+        "/v1/jobs", content=body.encode(), headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "not_canonical_json"
+
+
+def test_a_job_the_schema_refuses_does_not_spend_a_nonce(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A refusal must not cost the caller a counter they then have to reason about.
+
+    `reply_room: "lobby"` is refused because a public room would make this node a
+    reflector. That is a fault in the request, and the fix is to send a corrected one —
+    which the caller cannot do if the first attempt already advanced their floor.
+    """
+    key, did = requester
+    bad = _job("rejected-0000001", reply_room="lobby")
+
+    refused = client.post("/v1/jobs", json=_envelope(key, did, bad, 7))
+    assert refused.status_code == 400
+
+    assert (
+        client.get("/v1/jobs/signing-payload", params={"did": did}).json()["next_nonce_must_exceed"]
+        == 0
+    )
+    corrected = client.post("/v1/jobs", json=_envelope(key, did, _job("corrected-000001"), 7))
+    assert corrected.status_code == 200
+
+
+def test_a_replay_still_cannot_execute_twice_after_that_reordering(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Validating before the claim must not open a window for the thing the claim stops.
+
+    Validation is pure, so running it twice costs nothing and decides nothing; the claim
+    is still the only gate execution passes, and it is still atomic.
+    """
+    key, did = requester
+    envelope = _envelope(key, did, _job("replay-after-reorder"), 11)
+
+    assert client.post("/v1/jobs", json=envelope).status_code == 200
+    second = client.post("/v1/jobs", json=envelope)
+
+    # Answered from the ledger rather than re-run: same job_id, same requester.
+    assert second.status_code == 200
+    assert second.json()["status"] == "already_completed"
+
+    fresh_job_same_nonce = _envelope(key, did, _job("different-job-01"), 11)
+    assert client.post("/v1/jobs", json=fresh_job_same_nonce).status_code == 409
