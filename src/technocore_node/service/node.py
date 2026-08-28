@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx2 as httpx
@@ -40,6 +41,10 @@ from .rooms import mailbox_room, result_room
 from .watcher import ProtocolWatcher
 
 log = get_logger(__name__)
+
+#: Slack for ordinary clock jitter between writing an observation and reading it back.
+#: Beyond this into the future, a timestamp is treated as unusable rather than recent.
+_CLOCK_TOLERANCE_SECONDS = 60
 
 _RECEIPT_VALIDATOR = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
 
@@ -140,6 +145,25 @@ class Node:
         under the server's single-line sweep, so the bytes signed and the bytes stored are
         the same bytes with no round-trip surprise.
         """
+        if room == self.result_room and not self.owns_result_room():
+            # The guard lives at the sink, not only at the callers.
+            #
+            # It was at the callers first, and a review pointed out what that is worth:
+            # `publish()` is public, and anything written later that reaches for the
+            # result room bypasses every check made above it. A rule enforced at each
+            # call site is a rule somebody will one day forget to apply — and here
+            # forgetting it means writing into a room where anyone can forge a receipt
+            # beside ours, or creating the room and foreclosing ever owning it.
+            self.ledger.set_state(
+                f"last_publish_error:{room}",
+                "refused locally: this node has not confirmed it owns the result room",
+            )
+            log.warning(
+                "refusing to write to the result room: ownership is not confirmed",
+                extra={"fields": {"room": room, "type": obj.get("type")}},
+            )
+            return None
+
         text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         if len(text) > MAX_TEXT_CHARS:
             log.error(
@@ -194,11 +218,27 @@ class Node:
 
     async def process_message(
         self, message: dict[str, Any], *, internal_test: bool = False
-    ) -> None:
-        """Handle one inbound mailbox line, start to finish."""
+    ) -> bool:
+        """Handle one inbound mailbox line, start to finish.
+
+        Returns True when the message was dealt with — executed, refused, or recognised
+        as a duplicate — and False when it was left untouched because the node is not in
+        a safe state. The caller uses that to decide whether the cursor may move past it.
+        """
         sender = str(message.get("from", ""))
         text = str(message.get("text", ""))
         seq = int(message.get("seq", 0))
+
+        if not internal_test and not self.can_accept_third_party_jobs():
+            # Checked here as well as in the poll loop. `process_message` is public and
+            # is called directly by the self-test and by anything written later; a gate
+            # that only exists at one call site protects only that call site.
+            _, reasons = self.safety_state()
+            log.warning(
+                "refusing to process a third-party job: unsafe state",
+                extra={"fields": {"seq": seq, "reasons": reasons}},
+            )
+            return False
 
         if not didkey.is_did(sender):
             # The server refuses unsigned writes to an `mb-` room, so this is belt and
@@ -211,7 +251,7 @@ class Node:
                 detail="mailbox line was not signed",
                 request_room=self.mailbox,
             )
-            return
+            return True  # seen and refused on its own merits
 
         self.ledger.record_message(
             local_event_id=f"in-{self.mailbox}-{seq}",
@@ -252,10 +292,10 @@ class Node:
                     }
                 },
             )
-            return
+            return True  # refused, recorded, and readable at /v1/receipts/<job_id>
 
         if outcome is None:
-            return
+            return True  # a duplicate job_id: already answered, nothing left to do
 
         receipt = outcome.receipt
         receipt_json = ""
@@ -306,12 +346,30 @@ class Node:
                 }
             },
         )
+        return True
 
     #: Attempts before a receipt is taken out of the retry queue.
     MAX_AUDIT_ATTEMPTS = 5
 
     async def publish_audit_copy(self, job_id: str, receipt: dict[str, Any]) -> int | None:
-        """Publish one receipt to the owned room and record the outcome."""
+        """Publish one receipt to the owned room and record the outcome.
+
+        Guarded on ownership independently of every other check. Writing an audit record
+        into a room this node does not own does not merely fail to prove anything — it
+        creates a room where a forgery sits beside a genuine receipt, indistinguishable
+        to anyone reading it. Refusing is strictly better than publishing there.
+        """
+        if not self.owns_result_room():
+            self.ledger.set_state(
+                f"last_publish_error:{self.result_room}",
+                "refused locally: this node has not confirmed it owns the result room",
+            )
+            log.warning(
+                "refusing to publish an audit copy into a room this node does not own",
+                extra={"fields": {"job_id": job_id, "room": self.result_room}},
+            )
+            return None
+
         seq = await self.publish(self.result_room, receipt)
         if seq is not None:
             self.ledger.set_audit_seq(job_id, seq)
@@ -324,6 +382,43 @@ class Node:
             extra={"fields": {"job_id": job_id, "quarantined": quarantined}},
         )
         return None
+
+    async def inspect_result_room(self) -> dict[str, Any]:
+        """Read the result room's state without writing anything. Read-only, always.
+
+        Returns the two facts a recovery decision turns on — who owns it, and whether it
+        holds any message — plus a verdict naming the one safe next step.
+        """
+        owner = await self.client.room_owner(self.result_room)
+        data = await self.client.read_room(self.result_room, limit=1)
+        count = int(data.get("count", 0))
+        last_seq = int(data.get("last_seq", 0))
+        exists = count > 0 or last_seq > 0
+
+        if owner == self.did:
+            verdict, action = "owned", "nothing to recover"
+        elif owner is not None:
+            verdict, action = "owned_by_other", "STOP: another key owns this name; pick another"
+        elif exists:
+            verdict, action = (
+                "unclaimable",
+                "WAIT: the room holds messages, and upstream allows a claim only from "
+                "birth. Write nothing to it. A room still on its single message is "
+                "reclaimed after 24 hours idle; then claim it before anything else.",
+            )
+        else:
+            verdict, action = "claimable", "claim it now, before writing anything to it"
+
+        return {
+            "room": self.result_room,
+            "owner": owner,
+            "owned_by_this_node": owner == self.did,
+            "message_count": count,
+            "last_seq": last_seq,
+            "exists": exists,
+            "verdict": verdict,
+            "next_action": action,
+        }
 
     async def observe_reachability(self) -> None:
         """Record, read-only, what this node can currently observe about its own reach.
@@ -352,7 +447,17 @@ class Node:
         written to it again. This is what makes retrying safe after a crash between the
         publish and the record, and what stops a database migrated from an older build
         from re-announcing receipts it published long ago.
+
+        Gated on confirmed ownership, because reading is harmless but *believing* what is
+        read is not. `mark_published()` turns a message in this room into the claim
+        "publicly auditable", and that claim holds only if none but this node's key can
+        write here. In an unowned room anyone can post a copy of a receipt lifted from the
+        requester's reply room, and treating that as evidence would let a stranger decide
+        what this node asserts about its own work.
         """
+        if not self.owns_result_room():
+            return 0
+
         since = self.ledger.cursor(self.result_room)
         try:
             data = await self.client.read_room(self.result_room, since=since)
@@ -430,20 +535,82 @@ class Node:
         return landed
 
     async def poll_mailbox_once(self, *, wait: int = 10) -> int:
-        """One long-poll cycle. Returns how many messages were processed."""
+        """One long-poll cycle. Returns how many messages were processed.
+
+        When the safety gate is closed the room is still read — knowing what is waiting is
+        useful and costs a stranger nothing — but nothing is executed and **the cursor
+        does not move**. Advancing it would be the quiet failure: the node would look
+        healthy, the queue would look empty, and every job that arrived while it was
+        unsafe would have been thrown away without the requester ever being told.
+        Leaving the cursor still means the work is deferred rather than discarded — but
+        deferred is not preserved. The mailbox is a ring, so a long enough closure ages
+        unread messages out upstream, where no cursor can reach them. That gap is detected
+        from `first_seq`, logged at `error` and recorded; it cannot be undone.
+        """
+        safe, reasons = self.safety_state()
         since = self.ledger.cursor(self.mailbox)
         data = await self.client.read_room(self.mailbox, since=since, wait=wait)
         messages = data.get("messages", [])
+
+        first_seq = data.get("first_seq")
+        if since and first_seq is not None and int(first_seq) > since + 1:
+            # The mailbox is a ring. Holding the cursor defers work; it does not preserve
+            # it, and pretending otherwise would be the same class of overclaim this
+            # release exists to remove. If the room turned over faster than the node read
+            # it, those messages are gone from upstream and no cursor can bring them back.
+            log.error(
+                "mailbox dropped messages before they were read",
+                extra={
+                    "fields": {
+                        "room": self.mailbox,
+                        "cursor": since,
+                        "oldest_available": int(first_seq),
+                        "lost": int(first_seq) - since - 1,
+                    }
+                },
+            )
+            self.ledger.set_state(
+                "mailbox_gap",
+                f"{int(first_seq) - since - 1} message(s) aged out unread before seq {first_seq}",
+            )
+
+        if not safe:
+            if messages:
+                log.warning(
+                    "holding inbound jobs unprocessed: this node is not in a safe state",
+                    extra={
+                        "fields": {
+                            "waiting": len(messages),
+                            "cursor_held_at": since,
+                            "reasons": reasons,
+                        }
+                    },
+                )
+            return 0
+
         for message in messages:
+            handled = False
             try:
-                await self.process_message(message)
+                handled = await self.process_message(message)
             except Exception:
-                # One malformed or hostile message must never end the loop.
+                # One malformed or hostile message must never end the loop. It counts as
+                # handled: it was seen, it failed on its own merits, and re-reading it
+                # forever would wedge the queue behind one bad line.
+                handled = True
                 log.exception(
                     "message handling failed", extra={"fields": {"seq": message.get("seq")}}
                 )
-            finally:
-                self.ledger.set_cursor(self.mailbox, int(message.get("seq", since)))
+            if not handled:
+                # The gate closed between the start of this cycle and this message —
+                # ownership lapsed, the public URL went away, a ledger read failed.
+                # Advancing now would drop a job nobody was ever told about, which is
+                # the precise failure the cursor hold exists to prevent.
+                log.warning(
+                    "stopping this cycle with the cursor held: state became unsafe mid-poll",
+                    extra={"fields": {"seq": message.get("seq"), "cursor_held_at": since}},
+                )
+                return 0
+            self.ledger.set_cursor(self.mailbox, int(message.get("seq", since)))
         if not messages and data.get("last_seq") is not None:
             self.ledger.set_cursor(self.mailbox, int(data["last_seq"]))
         return len(messages)
@@ -452,9 +619,15 @@ class Node:
         backoff = 1.0
         while True:
             try:
+                # Observe first. The gate reads persisted state, and persisted state is
+                # only as good as when it was written: a node restarting with an
+                # ownership record from a previous run would otherwise process a cycle's
+                # worth of jobs, and publish for them, before ever checking whether it
+                # still owns the room. Reordering closes the window; the freshness bound
+                # in `_ownership_observation` is what closes it for good.
+                await self.observe_reachability()
                 await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
-                await self.observe_reachability()
                 backoff = 1.0
             except RateLimited as exc:
                 log.warning(
@@ -468,6 +641,111 @@ class Node:
                 log.exception("mailbox poll failed")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
+
+    #: How old an ownership observation may be and still be acted on. The mailbox loop
+    #: refreshes it every cycle, so this is many cycles of slack — it exists to catch a
+    #: node that restarted, or whose loop stopped, not to second-guess a healthy one.
+    OWNERSHIP_MAX_AGE_SECONDS = 900
+
+    def _ownership_observation(self) -> tuple[str | None, str | None, str | None, float | None]:
+        """`(owner, observed_flag, error, age_seconds)` for the result room.
+
+        `age_seconds` is None when nothing has ever been observed. It is the reason this
+        is a helper rather than three `get_state` calls: "confirmed by a read" has to mean
+        confirmed *recently*, or a record written before the room changed hands would keep
+        authorising writes indefinitely.
+        """
+        owner, owner_at = self.ledger.get_state("owned_room_owner")
+        observed, _ = self.ledger.get_state("owned_room_observed")
+        error, _ = self.ledger.get_state("owned_room_error")
+
+        age: float | None = None
+        if owner_at:
+            try:
+                seen = datetime.fromisoformat(owner_at.replace("Z", "+00:00"))
+            except ValueError:
+                age = None  # unparseable: treated as never observed, which fails closed
+            else:
+                delta = (datetime.now(UTC) - seen).total_seconds()
+                # A record from the future is not fresh, it is wrong. Clamping it to zero
+                # would make an old observation look current after a clock jumped forward
+                # and was corrected — trusting the timestamp most in the one case where it
+                # is least trustworthy.
+                age = None if delta < -_CLOCK_TOLERANCE_SECONDS else max(0.0, delta)
+        return owner, observed, error, age
+
+    def _ownership_is_fresh(self, age: float | None) -> bool:
+        return age is not None and age <= self.OWNERSHIP_MAX_AGE_SECONDS
+
+    def safety_state(self) -> tuple[bool, list[str]]:
+        """Whether it is safe to do work for a stranger, and why not when it is not.
+
+        This is the gate, and it is separate from :meth:`availability` on purpose.
+        `availability` describes; this decides. They were the same thing once — a status
+        block that read `unavailable` while the mailbox loop went on accepting jobs
+        underneath it — which is a description of a system that reports its own safety
+        and does not act on it.
+
+        The condition that matters most is the owned result room. A receipt is only
+        evidence because it sits somewhere none but this node's key can write; if the
+        room is unowned, anyone can post a forged receipt beside ours, and publishing
+        there would be manufacturing exactly the ambiguity the receipt exists to remove.
+        So an unverified or foreign owner is not a warning to display. It is a stop.
+        """
+        reasons: list[str] = []
+
+        owner, observed, owner_err, age = self._ownership_observation()
+
+        if observed and not owner_err and not self._ownership_is_fresh(age):
+            reasons.append(
+                "the result room ownership check is stale "
+                f"({int(age) if age is not None else 'unknown'}s old, limit "
+                f"{self.OWNERSHIP_MAX_AGE_SECONDS}s); it will re-check before accepting work"
+            )
+        elif owner_err:
+            reasons.append(f"result room ownership could not be verified: {owner_err}")
+        elif not observed:
+            reasons.append("result room ownership has never been successfully checked")
+        elif owner is None:
+            reasons.append(
+                f"result room {self.result_room} has no owner, so anything published "
+                "there could be forged by anyone"
+            )
+        elif owner != self.did:
+            reasons.append(
+                f"result room {self.result_room} is owned by another key, so this node "
+                "cannot publish an auditable record there"
+            )
+
+        if not self.settings.public_url:
+            reasons.append("no public URL is configured, so a requester cannot verify a receipt")
+
+        if not self.settings.mailbox_enabled:
+            # The only intake this version has. With the loop switched off nothing is
+            # polling, so "accepting third-party jobs" would be false however healthy
+            # everything else looked — and a status that ignores whether anyone is
+            # listening is the same mismatch this release exists to remove.
+            reasons.append(
+                "mailbox intake is disabled (TCN_MAILBOX_ENABLED=false), so no job is being read"
+            )
+
+        return (not reasons, reasons)
+
+    def can_accept_third_party_jobs(self) -> bool:
+        """The single gate every third-party execution path must pass."""
+        return self.safety_state()[0]
+
+    def owns_result_room(self) -> bool:
+        """Confirmed, from a successful read, that the result room is this node's.
+
+        Deliberately independent of :meth:`can_accept_third_party_jobs`: a write to the
+        audit room must be refused on the ownership fact alone, whatever else is or is
+        not true, and whichever caller thought it had already checked.
+        """
+        owner, observed, owner_err, age = self._ownership_observation()
+        return (
+            bool(observed) and not owner_err and owner == self.did and self._ownership_is_fresh(age)
+        )
 
     def availability(self) -> dict[str, Any]:
         """What this node can honestly say about being reachable, and on what evidence.
@@ -484,34 +762,20 @@ class Node:
         audit = self.ledger.audit_backlog()
 
         completed = int(metrics["completed_jobs"])
-        blockers: list[str] = []
-        if owner_err:
-            # Not knowing is its own state, and it is still a reason not to claim to be
-            # reachable — but it is reported as not knowing.
-            blockers.append(f"this node could not verify who owns its result room: {owner_err}")
-        elif observed and owner is None:
-            blockers.append(
-                "this node's owned result room has no owner note, so receipts cannot be "
-                "published where a third party could audit them"
-            )
-        elif observed and owner != self.did:
-            # Stronger than being unowned, not weaker. An unclaimed room can still be
-            # claimed; one held by another key never will be, and the whole value of that
-            # room is that only this node can write to it. A receipt published there by
-            # somebody else's key is not an audit record of anything.
-            blockers.append(
-                "this node's owned result room is held by a different key, so nothing it "
-                "publishes there could serve as an audit record"
-            )
-        if result_err:
-            blockers.append(f"last publish to the owned room was refused: {result_err}")
-        if not self.settings.public_url:
-            blockers.append("no public HTTPS endpoint is configured (no DNS record)")
+
+        # One source of truth. These were two lists once — the gate's and the report's —
+        # and they drifted: the report could read `available` from a stale ownership
+        # record the gate had already rejected, which is exactly the status/action
+        # mismatch this release exists to remove.
+        # `blockers` is exactly what the gate refuses on — no more. A past publish
+        # failure is worth showing and is shown, but as its own field: folding it in here
+        # made `stop_reasons` non-empty while `accepting_third_party_jobs` stayed true,
+        # which is the very disagreement these two fields exist to make impossible.
+        safe, blockers = self.safety_state()
 
         # Blockers are about now; a completed job is about the past. A node that once
-        # served somebody and is unreachable today is unreachable today, so the current
-        # facts decide and history only distinguishes "working" from "never tried".
-        if blockers:
+        # served somebody and is unreachable today is unreachable today.
+        if not safe:
             intake = "unavailable"
         elif completed > 0:
             intake = "available"
@@ -520,6 +784,11 @@ class Node:
 
         return {
             "third_party_intake": intake,
+            # What the node will actually *do*, next to what it reports. When these two
+            # disagree the reader should be able to see it, not have to infer it.
+            "accepting_third_party_jobs": safe,
+            "stop_reasons": blockers,
+            "last_publish_error": result_err,
             "third_party_jobs_completed": completed,
             "blockers": blockers,
             "public_url": self.settings.public_url or None,

@@ -21,7 +21,7 @@ from ..config import load_settings
 from ..crypto import didkey, keystore
 from ..ledger.db import Ledger
 from ..logging import configure, get_logger
-from ..protocol.client import TechnocoreClient
+from ..protocol.client import TechnocoreClient, TechnocoreError
 from ..service.node import Node
 from ..service.rooms import mailbox_room, result_room
 
@@ -168,6 +168,10 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
     trust it on its own. Posting the same profile's hash as a signed message into a room
     this node owns is what makes the note checkable: the signature covers the hash, and
     only the owner's key can write there.
+
+    The attestation is skipped, loudly, unless ownership is confirmed by a read first.
+    Upstream a `d-` room is ownable from birth or not at all, so writing into an
+    unclaimed one creates it and forecloses ever owning it.
     """
 
     async def run() -> dict[str, Any]:
@@ -179,20 +183,46 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
             profile_hash = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
             namespace, key = didkey.note_path(node.did)
 
+            seq: int | None = None
+            attestation_refused: str | None = None
+
             if not args.dry_run:
                 await node.client.set_note(namespace, key, value)
-                seq = await node.publish(
-                    node.result_room,
-                    {
-                        "v": "1",
-                        "type": "profile_attestation",
-                        "did": node.did,
-                        "note": f"/kv/{namespace}/{key}",
-                        "profile_sha256": profile_hash,
-                    },
-                )
-            else:
-                seq = None
+
+                # The note is written either way; the attestation is not.
+                #
+                # This ordering caused a real, unrecoverable loss. Upstream, a `d-` room
+                # is "ownable from birth or not at all": posting into a room that does
+                # not exist creates it, and a room that already holds a message can never
+                # be claimed. Publishing the attestation first therefore *destroyed* the
+                # ability to own the room it was meant to make trustworthy — permanently,
+                # for that name.
+                #
+                # So ownership is confirmed by a read before anything is written there.
+                # Not "we claimed it earlier and assume it stuck": read it now.
+                await node.observe_reachability()
+                if node.owns_result_room():
+                    seq = await node.publish(
+                        node.result_room,
+                        {
+                            "v": "1",
+                            "type": "profile_attestation",
+                            "did": node.did,
+                            "note": f"/kv/{namespace}/{key}",
+                            "profile_sha256": profile_hash,
+                        },
+                    )
+                else:
+                    owner, _ = node.ledger.get_state("owned_room_owner")
+                    attestation_refused = (
+                        f"{node.result_room} is not confirmed as owned by this node "
+                        f"(owner={owner!r}); publishing there would create or extend a "
+                        "room that can never be claimed. Run `recover-result-room`."
+                    )
+                    log.warning(
+                        "profile note published; attestation refused",
+                        extra={"fields": {"room": node.result_room, "owner": owner}},
+                    )
 
             return {
                 "dry_run": args.dry_run,
@@ -200,6 +230,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 "profile_sha256": profile_hash,
                 "value_chars": len(value),
                 "attestation_seq": seq,
+                "attestation_refused": attestation_refused,
                 "profile": profile,
             }
         finally:
@@ -234,6 +265,130 @@ def build_profile(node: Node, public_url: str) -> dict[str, Any]:
             "evaluation, no caller-supplied URL fetching."
         ),
     }
+
+
+def cmd_recover_result_room(args: argparse.Namespace) -> int:
+    """Bring the owned result room back into a state where it proves something.
+
+    Every step reads before it writes and reads back after, and the command stops rather
+    than guessing. The rule it exists to respect: upstream, a `d-` room is ownable from
+    birth or not at all, so the *order* is the whole safety property. Claim, confirm, and
+    only then write. Getting that backwards once already cost a room name permanently.
+
+    On an ambiguous outcome — a timeout, a 5xx, anything that leaves it unclear whether a
+    write landed — it re-reads the state instead of resending. A signed claim is never
+    retried: replaying one is how a caller turns "I am not sure" into two attempts.
+    """
+
+    async def run() -> dict[str, Any]:
+        node = Node(load_settings())
+        steps: list[dict[str, Any]] = []
+
+        def step(name: str, **fields: Any) -> None:
+            steps.append({"step": name, **fields})
+
+        try:
+            state = await node.inspect_result_room()
+            step("inspect", **state)
+
+            if state["verdict"] == "owned":
+                step("done", ok=True, detail="already owned by this node; nothing to do")
+                return {"ok": True, "action_taken": "none", "steps": steps}
+
+            if state["verdict"] in ("owned_by_other", "unclaimable"):
+                step("stop", ok=False, reason=state["next_action"])
+                return {"ok": False, "action_taken": "none (stopped)", "steps": steps}
+
+            if not args.claim:
+                step(
+                    "dry_run",
+                    ok=True,
+                    detail="the room is claimable; re-run with --claim to take ownership",
+                )
+                return {"ok": True, "action_taken": "none (dry run)", "steps": steps}
+
+            # One attempt. Never retried: a claim carries a signed nonce, and resending it
+            # after an ambiguous reply is how one intent becomes two writes.
+            try:
+                claimed = await node.client.claim_room(node.result_room)
+                step("claim", ok=True, accepted=claimed)
+            except TechnocoreError as exc:
+                step(
+                    "claim",
+                    ok=False,
+                    error=str(exc)[:200],
+                    detail="not retried; re-reading state instead",
+                )
+
+            after = await node.inspect_result_room()
+            step("read_back", **after)
+
+            if not after["owned_by_this_node"]:
+                step(
+                    "stop",
+                    ok=False,
+                    reason="ownership is not confirmed after the claim; writing nothing",
+                )
+                return {
+                    "ok": False,
+                    "action_taken": "claim attempted, not confirmed",
+                    "steps": steps,
+                }
+
+            await node.observe_reachability()
+            if not node.owns_result_room():
+                step("stop", ok=False, reason="local ownership record disagrees with the read")
+                return {
+                    "ok": False,
+                    "action_taken": "claim confirmed upstream only",
+                    "steps": steps,
+                }
+
+            if not args.attest:
+                step(
+                    "dry_run_attest",
+                    ok=True,
+                    detail="ownership confirmed; re-run with --attest to publish the profile",
+                )
+                return {"ok": True, "action_taken": "claimed", "steps": steps}
+
+            profile = build_profile(node, node.settings.public_url)
+            value = json.dumps(profile, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            profile_hash = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+            namespace, key = didkey.note_path(node.did)
+            await node.client.set_note(namespace, key, value)
+            seq = await node.publish(
+                node.result_room,
+                {
+                    "v": "1",
+                    "type": "profile_attestation",
+                    "did": node.did,
+                    "note": f"/kv/{namespace}/{key}",
+                    "profile_sha256": profile_hash,
+                },
+            )
+            step("attest", ok=seq is not None, seq=seq, profile_sha256=profile_hash)
+            return {"ok": seq is not None, "action_taken": "claimed and attested", "steps": steps}
+        finally:
+            await node.aclose()
+
+    result = asyncio.run(run())
+    _emit(result)
+    return 0 if result["ok"] else 1
+
+
+def cmd_inspect_result_room(_args: argparse.Namespace) -> int:
+    """Read the result room's state and say what the safe next step is. Writes nothing."""
+
+    async def run() -> dict[str, Any]:
+        node = Node(load_settings())
+        try:
+            return await node.inspect_result_room()
+        finally:
+            await node.aclose()
+
+    _emit(asyncio.run(run()))
+    return 0
 
 
 def cmd_serve(_args: argparse.Namespace) -> int:
@@ -366,6 +521,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("publish-profile", cmd_publish_profile, "publish the DID profile note")
     p.add_argument("--dry-run", action="store_true")
+
+    add(
+        "inspect-result-room",
+        cmd_inspect_result_room,
+        "read the result room's state and the safe next step (writes nothing)",
+    )
+
+    p = add(
+        "recover-result-room",
+        cmd_recover_result_room,
+        "bring the result room back to a state where it proves something",
+    )
+    p.add_argument(
+        "--claim",
+        action="store_true",
+        help="actually take ownership when the room is claimable (default: report only)",
+    )
+    p.add_argument(
+        "--attest",
+        action="store_true",
+        help="publish the profile attestation after ownership is confirmed",
+    )
 
     add("selftest", cmd_selftest, "run a live end-to-end test with a throwaway identity")
     add("testnet-status", cmd_testnet_status, "report the FLOP testnet adapter's state")

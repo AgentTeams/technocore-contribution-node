@@ -55,6 +55,65 @@ Not "does not currently" — will not, by construction:
 `tests/integration/test_isolation.py` asserts the first four against the source of every
 registered task, so a future edit that introduces one fails the suite.
 
+## The execution gate
+
+Before doing any work for a stranger, the node checks a single gate —
+`can_accept_third_party_jobs()` — and refuses if it does not hold:
+
+- ownership of the result room has been **confirmed by a successful read**
+- that owner is this node's production DID
+- the ownership read did not fail, and is **recent** — an observation older than
+  `OWNERSHIP_MAX_AGE_SECONDS` is stale, so a node restarting with a record from a previous
+  run re-checks before it acts
+- a public URL is configured, so a requester can fetch the receipt back
+- **intake is switched on.** With `TCN_MAILBOX_ENABLED=false` nothing is polling, so
+  nothing is being accepted however healthy the rest looks
+
+`/v1/info` reports `accepting_third_party_jobs` and `stop_reasons` straight from this gate,
+so the description and the decision cannot disagree. A past upstream refusal is shown
+separately as `last_publish_error`: worth knowing, not a reason to stop.
+
+The result room condition is the load-bearing one. A receipt is evidence only because it
+sits somewhere none but this node's key can write. If the room is unowned, anyone can post
+a forged receipt beside a genuine one, and a reader cannot tell them apart — so publishing
+there would manufacture exactly the ambiguity the receipt exists to remove.
+
+**The gate is separate from the status report on purpose.** `v0.1.1` had `availability()`
+describing the node as unusable while the mailbox loop went on accepting work underneath
+it. A description that does not constrain the system is a label, not a safety property.
+
+When the gate is closed the mailbox is still read, but nothing is executed and **the
+cursor does not move**. Advancing it would leave the node looking healthy and the queue
+looking empty while every request that arrived during the unsafe window was discarded and
+its sender never told.
+
+Holding the cursor **defers** the work. It does not preserve it: the mailbox is a ring,
+and a long enough outage with enough new traffic will age unread messages out upstream,
+where no cursor can reach them. The node detects that gap from `first_seq`, logs it at
+`error`, and records it — but it cannot undo it. A node held closed for a long time should
+be assumed to have lost inbound requests, and the honest answer to a requester asking what
+happened is that their job was never seen.
+
+`publish_audit_copy()` carries its own ownership guard, independent of the gate and of
+whichever caller believed it had already checked.
+
+## Room ownership is ordered, and the order is irreversible
+
+Upstream, a `d-` room is **ownable from birth or not at all**: writing to a room that does
+not exist creates it, and a room that already holds a message can never be claimed.
+
+This cost a room name in production. `publish-profile` wrote a profile attestation into
+the result room before ownership had been claimed. The write created the room, and the
+claim that followed was refused — `already has messages, so it can no longer be claimed`.
+The write meant to make the room trustworthy is what permanently prevented it from being
+so.
+
+Every path that writes to the result room now confirms ownership by a read first, and
+`tests/integration/test_execution_gate.py` reproduces that exact sequence. `technocore-node
+recover-result-room` performs the recovery in the only safe order — inspect, claim,
+read back, and only then attest — stopping rather than guessing on any ambiguity, and
+never retrying a signed claim.
+
 ## What the ledger holds
 
 Hashes and signatures, never request or result text. Every request is a stranger's bytes

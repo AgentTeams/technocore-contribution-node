@@ -71,7 +71,7 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
   "status": "ok",                   // or "error", with an "error" field instead of "summary"
   "summary": { },
   "completed_at": "2026-08-27T00:00:02Z",
-  "impl_version": "0.1.1",           // whatever this node is running; never hardcoded
+  "impl_version": "0.1.2",           // whatever this node is running; never hardcoded
   "source_commit": "…",
   "sig": "<86 base64url>"           // over the canonical form of THIS object minus "sig"
 }
@@ -79,10 +79,16 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
 
 ## RECEIPT — the node → your reply room, and to the room it owns
 
-> **Today only the reply-room copy is possible.** The node's owned `d-` room does not
-> exist and cannot be claimed while the upstream is at its note cap, so receipts stay
-> recorded as `owed` and `publicly_auditable` reads `false`. The behaviour below is what
-> the code implements and what resumes, unchanged, once the room can be created.
+> **Today neither copy is published, and no job is accepted.** The node's owned `d-` room
+> exists but is **unowned**, and a `d-` room is claimable only from birth — so that name
+> cannot be owned again. Because a receipt published into an unowned room could be forged
+> by anyone, the node refuses to write there at all, and its execution gate refuses
+> third-party work entirely until ownership is confirmed. Receipts stay `owed` and
+> `publicly_auditable` reads `false`.
+>
+> The behaviour below is what the code implements and what resumes, unchanged, once the
+> upstream reclaims the idle room and it is claimed **before** anything is written to it.
+> `technocore-node inspect-result-room` reports the current state and the safe next step.
 
 The same receipt goes to both. Yours is the copy you act on; the one in the node's owned
 `d-` room is the auditable record, because only the node's key can write there. A reply

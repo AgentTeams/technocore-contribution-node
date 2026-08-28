@@ -29,7 +29,9 @@ REQUESTER = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
 @pytest.fixture
 def node(env: dict[str, str]) -> Node:
     keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
-    return Node(load_settings())
+    node = Node(load_settings())
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    return node
 
 
 @pytest.fixture
@@ -70,6 +72,8 @@ async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) ->
     """
     from technocore_node.protocol.client import TechnocoreError
 
+    _own_the_room(node)
+
     async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
         raise TechnocoreError(
             "HTTP 400: 400 room limit reached (20480 is the cap, and this would be a new one)."
@@ -79,20 +83,23 @@ async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) ->
     assert await node.publish(node.result_room, {"type": "receipt", "job_id": "x"}) is None
 
     availability = node.availability()
-    assert availability["third_party_intake"] == "unavailable"
-    assert any("room limit reached" in b for b in availability["blockers"]), availability
+    # The upstream's own sentence, kept and shown — in its own field, because a past
+    # failure is context rather than a gate condition.
+    assert "room limit reached" in (availability["last_publish_error"] or ""), availability
 
 
 async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
     """The record has to be able to go away again, or it is a permanent scar."""
     from technocore_node.protocol.client import Confirmation, TechnocoreError
 
+    _own_the_room(node)
+
     async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
         raise TechnocoreError("HTTP 400: 400 room limit reached")
 
     node.client.say_signed = refuse  # type: ignore[method-assign]
     await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
-    assert any("room limit" in b for b in node.availability()["blockers"])
+    assert "room limit" in (node.availability()["last_publish_error"] or "")
 
     async def accept(room: str, text: str, *, confirm: bool = True) -> Confirmation:
         return Confirmation(
@@ -101,12 +108,12 @@ async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
 
     node.client.say_signed = accept  # type: ignore[method-assign]
     await node.publish(node.result_room, {"type": "receipt", "job_id": "x"})
-    assert not any("room limit" in b for b in node.availability()["blockers"])
+    assert node.availability()["last_publish_error"] is None
 
 
 def test_a_missing_public_url_is_a_blocker_not_a_footnote(node: Node) -> None:
     assert node.settings.public_url == ""
-    assert any("public HTTPS" in b for b in node.availability()["blockers"])
+    assert any("public URL" in b for b in node.availability()["blockers"])
 
 
 def test_an_unowned_result_room_is_reported_once_it_has_been_looked_at(node: Node) -> None:
@@ -119,7 +126,7 @@ def test_an_unowned_result_room_is_reported_once_it_has_been_looked_at(node: Nod
     after = node.availability()
     assert after["owned_result_room"]["observed_at"] is not None
     assert after["owned_result_room"]["owned_by_this_node"] is False
-    assert any("no owner note" in b for b in after["blockers"])
+    assert any("has no owner" in b for b in after["blockers"])
 
 
 def test_info_leads_with_availability_before_the_instructions(client: TestClient) -> None:
@@ -144,6 +151,18 @@ def test_availability_reports_the_receipt_split(client: TestClient) -> None:
         "awaiting_public_copy": 0,
         "quarantined": 0,
     }
+
+
+def _own_the_room(node: Node) -> None:
+    """Confirm ownership locally, so a publish reaches the network at all.
+
+    `publish()` refuses the result room outright when ownership is unconfirmed, which is
+    the point of the guard — but these tests are about what happens when the *upstream*
+    refuses, so they have to get past the local check first.
+    """
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+    node.ledger.set_state("owned_room_error", None)
 
 
 def _completed_third_party_job(ledger: Ledger, node: Node, job_id: str = "real-job-0001") -> None:
@@ -230,7 +249,7 @@ def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
 
     availability = node.availability()
     assert availability["owned_result_room"]["owned_by_this_node"] is False
-    assert any("different key" in b for b in availability["blockers"]), availability
+    assert any("owned by another key" in b for b in availability["blockers"]), availability
     assert availability["third_party_intake"] == "unavailable"
 
 
@@ -260,8 +279,8 @@ async def test_a_failed_ownership_check_is_reported_as_not_knowing(node: Node) -
     room = node.availability()["owned_result_room"]
     assert room["observed"] is False, "nothing was successfully observed"
     assert room["read_error"] is not None
-    assert any("could not verify" in b for b in node.availability()["blockers"])
-    assert not any("no owner note" in b for b in node.availability()["blockers"])
+    assert any("could not be verified" in b for b in node.availability()["blockers"])
+    assert not any("has no owner" in b for b in node.availability()["blockers"])
 
 
 async def test_a_failed_check_does_not_erase_a_good_earlier_observation(node: Node) -> None:
@@ -293,3 +312,22 @@ async def test_a_successful_check_clears_an_earlier_failure(node: Node) -> None:
     room = node.availability()["owned_result_room"]
     assert room["read_error"] is None
     assert room["owned_by_this_node"] is True
+
+
+def test_the_report_and_the_gate_share_one_vocabulary(node: Node) -> None:
+    """They were two lists once, and they drifted.
+
+    The report could read `available` from a stale ownership record the gate had already
+    rejected — the status/action mismatch this release exists to remove, reappearing
+    inside the fix for it. One source of truth, asserted rather than intended.
+    """
+    node.ledger.set_state("owned_room_owner", None)
+    node.ledger.set_state("owned_room_observed", "1")
+
+    availability = node.availability()
+    safe, reasons = node.safety_state()
+
+    assert availability["accepting_third_party_jobs"] is safe
+    assert availability["stop_reasons"] == reasons
+    assert reasons and all(r in availability["blockers"] for r in reasons)
+    assert availability["third_party_intake"] == "unavailable"

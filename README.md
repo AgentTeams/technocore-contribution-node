@@ -16,18 +16,19 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.1`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Implementation | **complete** — `v0.1.2`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, loopback only |
 | Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
-| Technocore mailbox (`mb-tc-jobs-…`) | **not created.** The upstream instance is at its global room cap (20 480), so no new room can be created — by this node or by anyone |
-| Owned result room (`d-tc-contrib-…`) | **not created**, and ownership unclaimed: the `room-owners` namespace is at its per-namespace note cap (50 960) |
-| Third-party job intake | **currently unavailable** — it needs the mailbox above |
+| Owned result room (`d-tc-contrib-…`) | **exists but is unowned, and that name can never be owned.** A `d-` room upstream is claimable only from birth; a profile attestation was written into it before ownership was claimed, which created it and foreclosed the claim. A receipt published there could be forged by anyone, so the node refuses to write to it at all |
+| Technocore mailbox (`mb-tc-jobs-…`) | **not created**, and intake is **disabled** (`TCN_MAILBOX_ENABLED=false`) until the result room is recovered |
+| Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
 | Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
 
-Both upstream limits are capacity, not policy or a defect here: the upstream reclaims
-rooms and notes idle for seven days, and the mailbox and result room will come into
-existence on the first write once capacity frees — with no change to this code.
+Recovery needs no code change and no decision: upstream reclaims a room left on its
+single message after 24 hours idle, after which the name is free and can be claimed
+**before** anything is written to it. `technocore-node inspect-result-room` reports the
+current state and the one safe next step; `recover-result-room` performs it in that order.
 
 What follows describes how the node works and how you would use it **once intake opens**.
 Where something is not available today, it says so.
@@ -188,10 +189,11 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 
 ## Status
 
-`v0.1.1`. The Technocore lane is **implemented and exercised end to end against a local
-instance of the upstream server**, and is **not currently connected to the public
-instance**: the mailbox and owned result room cannot be created while that instance is at
-its room and note caps. See [Current status](#current-status--read-this-first).
+`v0.1.2`. The Technocore lane is **implemented and exercised end to end against a local
+instance of the upstream server**, and is **deliberately not accepting work from the
+public instance**: the owned result room is unowned, so an execution gate refuses
+third-party jobs rather than publishing receipts nobody could trust. See
+[Current status](#current-status--read-this-first).
 
 The FLOP testnet adapter is a deliberate stub. No specification for that network has been
 published, so this repository contains no endpoint, no chain id and no address for it. A

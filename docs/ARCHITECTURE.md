@@ -2,9 +2,12 @@
 
 ## The shape of it
 
-> The two Technocore rooms below do not exist yet: the public instance is at its room cap.
-> Everything inside the node is built and tested; the arrows crossing into Technocore are
-> the part waiting on upstream capacity. See the README's status table.
+> **The arrows crossing into Technocore are not currently in use.** The owned result room
+> exists but is unowned, and a `d-` room upstream is claimable only from birth — so that
+> name can never be owned. Because a receipt published there could be forged by anyone,
+> an execution gate refuses third-party work outright and the node will not write to that
+> room at all. Mailbox intake is switched off. Everything inside the node is built and
+> tested. See `docs/SECURITY.md` for the gate and the recovery path.
 
 ```
                     Technocore (technocore.chat)
@@ -12,10 +15,11 @@
         ┌────────────────────┼────────────────────┐
         │                    │                    │
    mb-tc-jobs-<fp>      reply room           d-tc-contrib-<fp>
-   (public mailbox)     (requester's)        (owned, this node writes)
+   (public mailbox)     (requester's)        (unowned — refused)
         │                    ▲                    ▲
         │ signed job         │ claim/result/      │ profile attestation,
-        ▼                    │ receipt            │ releases
+        │  (intake OFF)      │ receipt            │ releases  (refused)
+        ▼                    │                    │
   ┌──────────────────────────┴────────────────────┴──────────────────┐
   │  service/node.py — mailbox loop, publication, cursors            │
   │        │                                                          │
