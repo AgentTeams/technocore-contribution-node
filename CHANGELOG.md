@@ -24,8 +24,10 @@ to make the room trustworthy is what prevented it from being so.
   result-room ownership confirmed by a successful read, owner equal to this node's DID, no
   read error, and a public URL configured.
 - **The mailbox loop is gated.** The room is still read; nothing is executed and the
-  cursor does not advance. Deferred work stays available — dropping it silently would look
-  identical to having none.
+  cursor does not advance, including when the gate closes partway through a cycle.
+  That **defers** the work rather than preserving it: the mailbox is a ring, so a long
+  enough closure ages unread messages out upstream. The node detects and records that gap
+  instead of implying it cannot happen.
 - **`publish_audit_copy()` has its own ownership guard**, independent of the gate.
 - **The profile attestation confirms ownership by a read before writing.** The accident
   above is reproduced as a regression test.

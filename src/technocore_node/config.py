@@ -61,6 +61,28 @@ class ConfigError(ValueError):
     """Configuration that cannot be honoured safely."""
 
 
+def _public_url(raw: str) -> str:
+    """The advertised public URL, or empty when there genuinely is not one.
+
+    Stripped before it is judged, because a safety gate asks `if not public_url` and a
+    value of `"   "` is true. Configuration that is *almost* blank must read as blank, or
+    a whitespace typo silently opens a gate that was written to stay shut.
+
+    A non-empty value must be an https:// origin: a requester who cannot fetch the
+    receipt back over a channel they can trust has no way to verify it, so http:// or a
+    bare hostname is refused rather than advertised.
+    """
+    url = raw.strip().rstrip("/")
+    if not url:
+        return ""
+    if not url.startswith("https://") or len(url) <= len("https://"):
+        raise ConfigError(
+            f"TCN_PUBLIC_URL={raw!r} is not an https:// URL. Leave it empty if there is "
+            "no public endpoint yet; the node reports that honestly and declines work."
+        )
+    return url
+
+
 def _flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -142,7 +164,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         db_path=Path(source.get("TCN_DB_PATH", str(state_dir / "state.db"))),
         bind_host=bind_host,
         bind_port=_int("TCN_BIND_PORT", 3020, minimum=1, maximum=65535),
-        public_url=source.get("TCN_PUBLIC_URL", "").rstrip("/"),
+        public_url=_public_url(source.get("TCN_PUBLIC_URL", "")),
         origin=origin,
         mailbox_enabled=_flag("TCN_MAILBOX_ENABLED", True),
         watcher_enabled=_flag("TCN_WATCHER_ENABLED", True),

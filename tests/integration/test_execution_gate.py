@@ -407,3 +407,183 @@ def test_the_api_reports_the_gate_next_to_the_description(env: dict[str, str]) -
     assert availability["accepting_third_party_jobs"] is False
     assert availability["stop_reasons"], "the reasons it will not act are stated"
     assert any("no owner" in r for r in availability["stop_reasons"])
+
+
+# ------------------------- the guard belongs at the sink, not only at callers
+
+
+async def test_publish_itself_refuses_the_result_room_when_ownership_is_unconfirmed(
+    node: Node,
+) -> None:
+    """The lowest sink, checked directly.
+
+    The guard was at the callers first. `publish()` is public, so anything written later
+    that reaches for the result room would have bypassed every check above it — and here
+    bypassing it means writing where a forgery can sit beside a genuine receipt, or
+    creating the room and foreclosing ever owning it.
+    """
+    _room_state(node, owner=None, observed=True)
+    recorder = _Recorder(node)
+    node.client.say_signed = recorder.say_signed  # type: ignore[method-assign]
+
+    assert await node.publish(node.result_room, {"type": "receipt", "job_id": "j"}) is None
+    assert recorder.writes == []
+
+
+async def test_publish_still_allows_other_rooms_while_the_result_room_is_blocked(
+    node: Node,
+) -> None:
+    """The guard is about one room, not a general freeze: a requester's reply room is
+    theirs, and a receipt they can hold is still worth sending."""
+    _room_state(node, owner=None, observed=True)
+    recorder = _Recorder(node)
+    node.client.say_signed = recorder.say_signed  # type: ignore[method-assign]
+
+    assert await node.publish("mb-p-theirs", {"type": "receipt", "job_id": "j"}) == 1
+    assert recorder.rooms() == {"mb-p-theirs"}
+
+
+async def test_publish_writes_to_the_result_room_once_ownership_is_confirmed(
+    node: Node,
+) -> None:
+    _own_the_room(node)
+    recorder = _Recorder(node)
+    node.client.say_signed = recorder.say_signed  # type: ignore[method-assign]
+    assert await node.publish(node.result_room, {"type": "receipt", "job_id": "j"}) == 1
+    assert recorder.rooms() == {node.result_room}
+
+
+# ------------------ the cursor must not advance past work that was not done
+
+
+async def test_the_cursor_holds_when_the_gate_closes_partway_through_a_cycle(
+    node: Node,
+) -> None:
+    """Safe at the start of the poll, unsafe by the second message.
+
+    The `finally` that advanced the cursor did so whatever `process_message` decided, so
+    a lapse mid-cycle dropped a job nobody was ever told about — the precise failure the
+    hold exists to prevent, reintroduced one level down.
+    """
+    _own_the_room(node)
+    recorder = _Recorder(node)
+    node.client.say_signed = recorder.say_signed  # type: ignore[method-assign]
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "room": room,
+            "count": 2,
+            "first_seq": 1,
+            "last_seq": 2,
+            "messages": [
+                {
+                    "seq": 1,
+                    "ts": "now",
+                    "from": REQUESTER,
+                    "nonce": 1,
+                    "text": job_line(job_id="first-00000001", reply_room="mb-p-r"),
+                },
+                {
+                    "seq": 2,
+                    "ts": "now",
+                    "from": REQUESTER,
+                    "nonce": 2,
+                    "text": job_line(job_id="second-0000001", reply_room="mb-p-r"),
+                },
+            ],
+        }
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+
+    real_process = node.process_message
+
+    async def process_then_lapse(message: dict[str, Any], **kwargs: Any) -> bool:
+        handled = await real_process(message, **kwargs)
+        # Ownership lapses immediately after the first message is dealt with.
+        _room_state(node, owner=None, observed=True)
+        return handled
+
+    node.process_message = process_then_lapse  # type: ignore[method-assign]
+
+    await node.poll_mailbox_once(wait=0)
+
+    assert node.ledger.get_job("first-00000001") is not None, "the first was processed"
+    assert node.ledger.get_job("second-0000001") is None, "the second was not"
+    assert node.ledger.cursor(node.mailbox) == 1, "the cursor stopped at the last one done"
+
+
+async def test_a_message_that_raises_still_advances_the_cursor(node: Node) -> None:
+    """A bad line is handled, not held: re-reading it forever would wedge the queue."""
+    _own_the_room(node)
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "room": room,
+            "count": 1,
+            "first_seq": 3,
+            "last_seq": 3,
+            "messages": [{"seq": 3, "ts": "now", "from": REQUESTER, "nonce": 1, "text": "{"}],
+        }
+
+    async def boom(message: dict[str, Any], **kwargs: Any) -> bool:
+        raise RuntimeError("handler exploded")
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    node.process_message = boom  # type: ignore[method-assign]
+
+    await node.poll_mailbox_once(wait=0)
+    assert node.ledger.cursor(node.mailbox) == 3
+
+
+async def test_a_ring_gap_is_detected_and_recorded(node: Node) -> None:
+    """Holding the cursor defers work; it does not preserve it.
+
+    The mailbox is a ring. Saying "deferred, not lost" without noticing a gap would be
+    the same class of overclaim this release exists to remove.
+    """
+    _own_the_room(node)
+    node.ledger.set_cursor(node.mailbox, 10)
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        return {"room": room, "count": 0, "first_seq": 25, "last_seq": 30, "messages": []}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    await node.poll_mailbox_once(wait=0)
+
+    gap, _ = node.ledger.get_state("mailbox_gap")
+    assert gap is not None and "14 message(s)" in gap, gap
+
+
+# ----------------------------------- a whitespace public URL is not a public URL
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "\t\n"])
+def test_a_blank_public_url_reads_as_blank(raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate asks `if not public_url`, and `"   "` is true.
+
+    Configuration that is almost blank must read as blank, or a whitespace typo silently
+    opens a gate written to stay shut.
+    """
+    monkeypatch.setenv("TCN_PUBLIC_URL", raw)
+    assert load_settings().public_url == ""
+
+
+@pytest.mark.parametrize("raw", ["http://x.example", "agent.example.com", "https://", "ftp://x"])
+def test_a_public_url_that_is_not_https_is_refused(
+    raw: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requester who cannot fetch the receipt back over a trusted channel cannot
+    verify it, so an unverifiable endpoint is not advertised as one."""
+    from technocore_node.config import ConfigError
+
+    monkeypatch.setenv("TCN_PUBLIC_URL", raw)
+    with pytest.raises(ConfigError):
+        load_settings()
+
+
+def test_a_whitespace_public_url_does_not_open_the_gate(
+    node: Node, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _own_the_room(node)
+    object.__setattr__(node.settings, "public_url", "")
+    assert node.can_accept_third_party_jobs() is False

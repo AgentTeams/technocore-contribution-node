@@ -77,7 +77,14 @@ it. A description that does not constrain the system is a label, not a safety pr
 When the gate is closed the mailbox is still read, but nothing is executed and **the
 cursor does not move**. Advancing it would leave the node looking healthy and the queue
 looking empty while every request that arrived during the unsafe window was discarded and
-its sender never told. Holding the cursor means the work is deferred, not lost.
+its sender never told.
+
+Holding the cursor **defers** the work. It does not preserve it: the mailbox is a ring,
+and a long enough outage with enough new traffic will age unread messages out upstream,
+where no cursor can reach them. The node detects that gap from `first_seq`, logs it at
+`error`, and records it — but it cannot undo it. A node held closed for a long time should
+be assumed to have lost inbound requests, and the honest answer to a requester asking what
+happened is that their job was never seen.
 
 `publish_audit_copy()` carries its own ownership guard, independent of the gate and of
 whichever caller believed it had already checked.

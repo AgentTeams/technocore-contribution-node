@@ -140,6 +140,25 @@ class Node:
         under the server's single-line sweep, so the bytes signed and the bytes stored are
         the same bytes with no round-trip surprise.
         """
+        if room == self.result_room and not self.owns_result_room():
+            # The guard lives at the sink, not only at the callers.
+            #
+            # It was at the callers first, and a review pointed out what that is worth:
+            # `publish()` is public, and anything written later that reaches for the
+            # result room bypasses every check made above it. A rule enforced at each
+            # call site is a rule somebody will one day forget to apply — and here
+            # forgetting it means writing into a room where anyone can forge a receipt
+            # beside ours, or creating the room and foreclosing ever owning it.
+            self.ledger.set_state(
+                f"last_publish_error:{room}",
+                "refused locally: this node has not confirmed it owns the result room",
+            )
+            log.warning(
+                "refusing to write to the result room: ownership is not confirmed",
+                extra={"fields": {"room": room, "type": obj.get("type")}},
+            )
+            return None
+
         text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         if len(text) > MAX_TEXT_CHARS:
             log.error(
@@ -194,8 +213,13 @@ class Node:
 
     async def process_message(
         self, message: dict[str, Any], *, internal_test: bool = False
-    ) -> None:
-        """Handle one inbound mailbox line, start to finish."""
+    ) -> bool:
+        """Handle one inbound mailbox line, start to finish.
+
+        Returns True when the message was dealt with — executed, refused, or recognised
+        as a duplicate — and False when it was left untouched because the node is not in
+        a safe state. The caller uses that to decide whether the cursor may move past it.
+        """
         sender = str(message.get("from", ""))
         text = str(message.get("text", ""))
         seq = int(message.get("seq", 0))
@@ -209,7 +233,7 @@ class Node:
                 "refusing to process a third-party job: unsafe state",
                 extra={"fields": {"seq": seq, "reasons": reasons}},
             )
-            return
+            return False
 
         if not didkey.is_did(sender):
             # The server refuses unsigned writes to an `mb-` room, so this is belt and
@@ -222,7 +246,7 @@ class Node:
                 detail="mailbox line was not signed",
                 request_room=self.mailbox,
             )
-            return
+            return True  # seen and refused on its own merits
 
         self.ledger.record_message(
             local_event_id=f"in-{self.mailbox}-{seq}",
@@ -263,10 +287,10 @@ class Node:
                     }
                 },
             )
-            return
+            return True  # refused, recorded, and readable at /v1/receipts/<job_id>
 
         if outcome is None:
-            return
+            return True  # a duplicate job_id: already answered, nothing left to do
 
         receipt = outcome.receipt
         receipt_json = ""
@@ -317,6 +341,7 @@ class Node:
                 }
             },
         )
+        return True
 
     #: Attempts before a receipt is taken out of the retry queue.
     MAX_AUDIT_ATTEMPTS = 5
@@ -510,6 +535,28 @@ class Node:
         data = await self.client.read_room(self.mailbox, since=since, wait=wait)
         messages = data.get("messages", [])
 
+        first_seq = data.get("first_seq")
+        if since and first_seq is not None and int(first_seq) > since + 1:
+            # The mailbox is a ring. Holding the cursor defers work; it does not preserve
+            # it, and pretending otherwise would be the same class of overclaim this
+            # release exists to remove. If the room turned over faster than the node read
+            # it, those messages are gone from upstream and no cursor can bring them back.
+            log.error(
+                "mailbox dropped messages before they were read",
+                extra={
+                    "fields": {
+                        "room": self.mailbox,
+                        "cursor": since,
+                        "oldest_available": int(first_seq),
+                        "lost": int(first_seq) - since - 1,
+                    }
+                },
+            )
+            self.ledger.set_state(
+                "mailbox_gap",
+                f"{int(first_seq) - since - 1} message(s) aged out unread before seq {first_seq}",
+            )
+
         if not safe:
             if messages:
                 log.warning(
@@ -525,15 +572,28 @@ class Node:
             return 0
 
         for message in messages:
+            handled = False
             try:
-                await self.process_message(message)
+                handled = await self.process_message(message)
             except Exception:
-                # One malformed or hostile message must never end the loop.
+                # One malformed or hostile message must never end the loop. It counts as
+                # handled: it was seen, it failed on its own merits, and re-reading it
+                # forever would wedge the queue behind one bad line.
+                handled = True
                 log.exception(
                     "message handling failed", extra={"fields": {"seq": message.get("seq")}}
                 )
-            finally:
-                self.ledger.set_cursor(self.mailbox, int(message.get("seq", since)))
+            if not handled:
+                # The gate closed between the start of this cycle and this message —
+                # ownership lapsed, the public URL went away, a ledger read failed.
+                # Advancing now would drop a job nobody was ever told about, which is
+                # the precise failure the cursor hold exists to prevent.
+                log.warning(
+                    "stopping this cycle with the cursor held: state became unsafe mid-poll",
+                    extra={"fields": {"seq": message.get("seq"), "cursor_held_at": since}},
+                )
+                return 0
+            self.ledger.set_cursor(self.mailbox, int(message.get("seq", since)))
         if not messages and data.get("last_seq") is not None:
             self.ledger.set_cursor(self.mailbox, int(data["last_seq"]))
         return len(messages)

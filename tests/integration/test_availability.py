@@ -70,6 +70,8 @@ async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) ->
     """
     from technocore_node.protocol.client import TechnocoreError
 
+    _own_the_room(node)
+
     async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
         raise TechnocoreError(
             "HTTP 400: 400 room limit reached (20480 is the cap, and this would be a new one)."
@@ -86,6 +88,8 @@ async def test_a_real_publish_failure_is_what_records_the_blocker(node: Node) ->
 async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
     """The record has to be able to go away again, or it is a permanent scar."""
     from technocore_node.protocol.client import Confirmation, TechnocoreError
+
+    _own_the_room(node)
 
     async def refuse(room: str, text: str, *, confirm: bool = True) -> object:
         raise TechnocoreError("HTTP 400: 400 room limit reached")
@@ -144,6 +148,18 @@ def test_availability_reports_the_receipt_split(client: TestClient) -> None:
         "awaiting_public_copy": 0,
         "quarantined": 0,
     }
+
+
+def _own_the_room(node: Node) -> None:
+    """Confirm ownership locally, so a publish reaches the network at all.
+
+    `publish()` refuses the result room outright when ownership is unconfirmed, which is
+    the point of the guard — but these tests are about what happens when the *upstream*
+    refuses, so they have to get past the local check first.
+    """
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+    node.ledger.set_state("owned_room_error", None)
 
 
 def _completed_third_party_job(ledger: Ledger, node: Node, job_id: str = "real-job-0001") -> None:
