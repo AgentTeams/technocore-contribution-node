@@ -110,7 +110,7 @@ async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
 
 def test_a_missing_public_url_is_a_blocker_not_a_footnote(node: Node) -> None:
     assert node.settings.public_url == ""
-    assert any("public HTTPS" in b for b in node.availability()["blockers"])
+    assert any("public URL" in b for b in node.availability()["blockers"])
 
 
 def test_an_unowned_result_room_is_reported_once_it_has_been_looked_at(node: Node) -> None:
@@ -123,7 +123,7 @@ def test_an_unowned_result_room_is_reported_once_it_has_been_looked_at(node: Nod
     after = node.availability()
     assert after["owned_result_room"]["observed_at"] is not None
     assert after["owned_result_room"]["owned_by_this_node"] is False
-    assert any("no owner note" in b for b in after["blockers"])
+    assert any("has no owner" in b for b in after["blockers"])
 
 
 def test_info_leads_with_availability_before_the_instructions(client: TestClient) -> None:
@@ -246,7 +246,7 @@ def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
 
     availability = node.availability()
     assert availability["owned_result_room"]["owned_by_this_node"] is False
-    assert any("different key" in b for b in availability["blockers"]), availability
+    assert any("owned by another key" in b for b in availability["blockers"]), availability
     assert availability["third_party_intake"] == "unavailable"
 
 
@@ -276,8 +276,8 @@ async def test_a_failed_ownership_check_is_reported_as_not_knowing(node: Node) -
     room = node.availability()["owned_result_room"]
     assert room["observed"] is False, "nothing was successfully observed"
     assert room["read_error"] is not None
-    assert any("could not verify" in b for b in node.availability()["blockers"])
-    assert not any("no owner note" in b for b in node.availability()["blockers"])
+    assert any("could not be verified" in b for b in node.availability()["blockers"])
+    assert not any("has no owner" in b for b in node.availability()["blockers"])
 
 
 async def test_a_failed_check_does_not_erase_a_good_earlier_observation(node: Node) -> None:
@@ -309,3 +309,22 @@ async def test_a_successful_check_clears_an_earlier_failure(node: Node) -> None:
     room = node.availability()["owned_result_room"]
     assert room["read_error"] is None
     assert room["owned_by_this_node"] is True
+
+
+def test_the_report_and_the_gate_share_one_vocabulary(node: Node) -> None:
+    """They were two lists once, and they drifted.
+
+    The report could read `available` from a stale ownership record the gate had already
+    rejected — the status/action mismatch this release exists to remove, reappearing
+    inside the fix for it. One source of truth, asserted rather than intended.
+    """
+    node.ledger.set_state("owned_room_owner", None)
+    node.ledger.set_state("owned_room_observed", "1")
+
+    availability = node.availability()
+    safe, reasons = node.safety_state()
+
+    assert availability["accepting_third_party_jobs"] is safe
+    assert availability["stop_reasons"] == reasons
+    assert reasons and all(r in availability["blockers"] for r in reasons)
+    assert availability["third_party_intake"] == "unavailable"

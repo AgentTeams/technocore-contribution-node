@@ -42,6 +42,10 @@ from .watcher import ProtocolWatcher
 
 log = get_logger(__name__)
 
+#: Slack for ordinary clock jitter between writing an observation and reading it back.
+#: Beyond this into the future, a timestamp is treated as unusable rather than recent.
+_CLOCK_TOLERANCE_SECONDS = 60
+
 _RECEIPT_VALIDATOR = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
 
 
@@ -443,7 +447,17 @@ class Node:
         written to it again. This is what makes retrying safe after a crash between the
         publish and the record, and what stops a database migrated from an older build
         from re-announcing receipts it published long ago.
+
+        Gated on confirmed ownership, because reading is harmless but *believing* what is
+        read is not. `mark_published()` turns a message in this room into the claim
+        "publicly auditable", and that claim holds only if none but this node's key can
+        write here. In an unowned room anyone can post a copy of a receipt lifted from the
+        requester's reply room, and treating that as evidence would let a stranger decide
+        what this node asserts about its own work.
         """
+        if not self.owns_result_room():
+            return 0
+
         since = self.ledger.cursor(self.result_room)
         try:
             data = await self.client.read_room(self.result_room, since=since)
@@ -649,9 +663,15 @@ class Node:
         if owner_at:
             try:
                 seen = datetime.fromisoformat(owner_at.replace("Z", "+00:00"))
-                age = max(0.0, (datetime.now(UTC) - seen).total_seconds())
             except ValueError:
-                age = None
+                age = None  # unparseable: treated as never observed, which fails closed
+            else:
+                delta = (datetime.now(UTC) - seen).total_seconds()
+                # A record from the future is not fresh, it is wrong. Clamping it to zero
+                # would make an old observation look current after a clock jumped forward
+                # and was corrected — trusting the timestamp most in the one case where it
+                # is least trustworthy.
+                age = None if delta < -_CLOCK_TOLERANCE_SECONDS else max(0.0, delta)
         return owner, observed, error, age
 
     def _ownership_is_fresh(self, age: float | None) -> bool:
@@ -733,47 +753,30 @@ class Node:
         audit = self.ledger.audit_backlog()
 
         completed = int(metrics["completed_jobs"])
-        blockers: list[str] = []
-        if owner_err:
-            # Not knowing is its own state, and it is still a reason not to claim to be
-            # reachable — but it is reported as not knowing.
-            blockers.append(f"this node could not verify who owns its result room: {owner_err}")
-        elif observed and owner is None:
-            blockers.append(
-                "this node's owned result room has no owner note, so receipts cannot be "
-                "published where a third party could audit them"
-            )
-        elif observed and owner != self.did:
-            # Stronger than being unowned, not weaker. An unclaimed room can still be
-            # claimed; one held by another key never will be, and the whole value of that
-            # room is that only this node can write to it. A receipt published there by
-            # somebody else's key is not an audit record of anything.
-            blockers.append(
-                "this node's owned result room is held by a different key, so nothing it "
-                "publishes there could serve as an audit record"
-            )
+
+        # One source of truth. These were two lists once — the gate's and the report's —
+        # and they drifted: the report could read `available` from a stale ownership
+        # record the gate had already rejected, which is exactly the status/action
+        # mismatch this release exists to remove.
+        safe, blockers = self.safety_state()
         if result_err:
-            blockers.append(f"last publish to the owned room was refused: {result_err}")
-        if not self.settings.public_url:
-            blockers.append("no public HTTPS endpoint is configured (no DNS record)")
+            blockers = [*blockers, f"last publish to the owned room was refused: {result_err}"]
 
         # Blockers are about now; a completed job is about the past. A node that once
-        # served somebody and is unreachable today is unreachable today, so the current
-        # facts decide and history only distinguishes "working" from "never tried".
-        if blockers:
+        # served somebody and is unreachable today is unreachable today.
+        if blockers or not safe:
             intake = "unavailable"
         elif completed > 0:
             intake = "available"
         else:
             intake = "unverified"
 
-        safe, stop_reasons = self.safety_state()
         return {
             "third_party_intake": intake,
             # What the node will actually *do*, next to what it reports. When these two
             # disagree the reader should be able to see it, not have to infer it.
             "accepting_third_party_jobs": safe,
-            "stop_reasons": stop_reasons,
+            "stop_reasons": blockers,
             "third_party_jobs_completed": completed,
             "blockers": blockers,
             "public_url": self.settings.public_url or None,

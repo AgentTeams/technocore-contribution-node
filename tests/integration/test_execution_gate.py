@@ -671,3 +671,68 @@ async def test_the_loop_observes_before_it_processes_anything(node: Node) -> Non
         await node.run_mailbox()
 
     assert calls == ["observe", "poll"], calls
+
+
+# ------------- reading a room is harmless; believing what is read is not
+
+
+async def test_sync_does_not_treat_an_unowned_rooms_contents_as_evidence(node: Node) -> None:
+    """`mark_published()` turns a message in the result room into the claim "publicly
+    auditable", and that claim holds only if none but this node's key can write there.
+
+    In an unowned room anyone can post a copy of a receipt lifted from the requester's
+    reply room. Syncing against it would let a stranger decide what this node asserts
+    about its own work.
+    """
+    _room_state(node, owner=None, observed=True)
+    read = {"n": 0}
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        read["n"] += 1
+        return {"room": room, "count": 0, "last_seq": 0, "messages": []}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    assert await node.sync_owned_room() == 0
+    assert read["n"] == 0, "the room is not even read while ownership is unconfirmed"
+
+
+async def test_sync_runs_once_ownership_is_confirmed(node: Node) -> None:
+    _own_the_room(node)
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        return {"room": room, "count": 0, "last_seq": 0, "messages": []}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    assert await node.sync_owned_room() == 0
+    assert node.ledger.cursor(node.result_room) == 0
+
+
+async def test_a_stale_record_stops_the_sync_too(node: Node) -> None:
+    _own_the_room(node)
+    _age_the_observation(node, node.OWNERSHIP_MAX_AGE_SECONDS + 60)
+    read = {"n": 0}
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        read["n"] += 1
+        return {"room": room, "count": 0, "last_seq": 0, "messages": []}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    assert await node.sync_owned_room() == 0
+    assert read["n"] == 0
+
+
+def test_an_observation_from_the_future_is_invalid_not_fresh(node: Node) -> None:
+    """Clamping a future timestamp to zero age would make an old record look current
+    after a clock jumped forward and was corrected — trusting the timestamp most in the
+    one case where it is least trustworthy."""
+    _own_the_room(node)
+    _age_the_observation(node, -3600)  # an hour in the future
+    assert node.owns_result_room() is False
+    assert node.can_accept_third_party_jobs() is False
+
+
+def test_small_forward_jitter_is_tolerated(node: Node) -> None:
+    """The bound is for a wrong clock, not for ordinary skew between write and read."""
+    _own_the_room(node)
+    _age_the_observation(node, -5)
+    assert node.owns_result_room() is True
