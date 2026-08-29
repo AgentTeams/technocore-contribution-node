@@ -615,6 +615,107 @@ class Node:
             self.ledger.set_cursor(self.mailbox, int(data["last_seq"]))
         return len(messages)
 
+    #: How often the ownership lease is renewed. The upstream deletes a note with no
+    #: write for seven days, so this is set far below that: a renewal may fail on six
+    #: consecutive days — an upstream outage, a rate limit, a restart — and the lease
+    #: still holds. A cadence that only just fits leaves no room for the ordinary.
+    OWNERSHIP_RENEWAL_SECONDS = 6 * 3600
+
+    #: What the upstream publishes as `retention_seconds`. Recorded so the cadence above
+    #: can be checked against it rather than against a remembered number, and so the
+    #: reported lease age means something to a reader who does not know the rule.
+    UPSTREAM_NOTE_RETENTION_SECONDS = 7 * 24 * 3600
+
+    async def maintain_result_room_ownership(self) -> str:
+        """Renew, or recover, this node's claim on the result room. One cycle.
+
+        Returns what it did, for the log and for the tests: `renewed`, `claimed`,
+        `unclaimable`, `owned_by_other`, or `failed`.
+
+        A claim is a lease. The upstream deletes any note with no write for seven days, so
+        ownership that nothing renews expires — the room reverts to "an ordinary open
+        room", and the first stranger to write to it makes it permanently unclaimable.
+        Every guard elsewhere in this file checks whether the room *is* ours; none of them
+        kept it that way.
+        """
+        try:
+            owner = await self.client.room_owner(self.result_room)
+        except TechnocoreError as exc:
+            log.warning(
+                "could not read result room ownership",
+                extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
+            )
+            return "failed"
+
+        if owner == self.did:
+            try:
+                renewed = await self.client.refresh_room_ownership(self.result_room)
+            except TechnocoreError as exc:
+                log.warning(
+                    "ownership renewal failed",
+                    extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
+                )
+                return "failed"
+            if renewed:
+                self.ledger.set_state("owned_room_renewed", utcnow())
+                log.info("ownership lease renewed", extra={"fields": {"room": self.result_room}})
+                return "renewed"
+            return "failed"
+
+        if owner is not None:
+            # Somebody else's. Never touched, never contested — and loudly, because it
+            # means every receipt this node holds is unpublishable and the operator needs
+            # to know why rather than reading it off a gate that has quietly closed.
+            log.error(
+                "the result room is owned by another key",
+                extra={"fields": {"room": self.result_room}},
+            )
+            return "owned_by_other"
+
+        # Unowned. Claiming is the recovery, and it writes only to the ownership note —
+        # never to the room, which is what made the room unclaimable the first time.
+        # `claim_room` carries `if_absent`, so it refuses rather than overwrites if
+        # somebody claimed it a moment ago.
+        try:
+            claimed = await self.client.claim_room(self.result_room)
+        except TechnocoreError as exc:
+            log.warning(
+                "reclaim failed",
+                extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
+            )
+            return "failed"
+        if claimed:
+            log.warning(
+                "the ownership lease had lapsed and was reclaimed",
+                extra={"fields": {"room": self.result_room}},
+            )
+            return "claimed"
+        log.error(
+            "the result room is unowned and can no longer be claimed",
+            extra={"fields": {"room": self.result_room}},
+        )
+        return "unclaimable"
+
+    async def run_ownership_lease(self) -> None:
+        """Renew the lease forever, whatever else this node is or is not doing.
+
+        Separate from the mailbox loop on purpose. Intake is switched off for months at a
+        time — it is off in production as this is written — and the lease expires on the
+        calendar regardless. Tying the renewal to the loop that reads jobs would mean the
+        room is lost precisely while the node is being careful.
+        """
+        while True:
+            try:
+                await self.maintain_result_room_ownership()
+                await self.observe_reachability()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # This loop must outlive anything it touches. A renewal that raises is a
+                # renewal to retry, not a reason to stop renewing.
+                log.exception("ownership lease cycle failed", extra={"fields": {}})
+            await asyncio.sleep(self.OWNERSHIP_RENEWAL_SECONDS)
+
     async def run_mailbox(self) -> None:
         backoff = 1.0
         while True:
@@ -673,6 +774,19 @@ class Node:
                 # is least trustworthy.
                 age = None if delta < -_CLOCK_TOLERANCE_SECONDS else max(0.0, delta)
         return owner, observed, error, age
+
+    def _age_of(self, timestamp: str | None) -> int | None:
+        """Seconds since `timestamp`, or None if it is absent or unreadable."""
+        if not timestamp:
+            return None
+        try:
+            when = datetime.fromisoformat(timestamp)
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - when).total_seconds()
+        return int(age) if age >= -_CLOCK_TOLERANCE_SECONDS else None
 
     def _ownership_is_fresh(self, age: float | None) -> bool:
         return age is not None and age <= self.OWNERSHIP_MAX_AGE_SECONDS
@@ -782,8 +896,23 @@ class Node:
         else:
             intake = "unverified"
 
+        renewed_at, _ = self.ledger.get_state("owned_room_renewed")
         return {
             "third_party_intake": intake,
+            # The lease, not just the ownership. A room that is ours today and whose
+            # renewal stopped a week ago is a room we are about to lose, and reporting
+            # only `owner == us` says everything is fine right up until it is not.
+            "ownership_lease": {
+                "renewed_at": renewed_at,
+                "renewed_seconds_ago": self._age_of(renewed_at),
+                "upstream_expiry_seconds": self.UPSTREAM_NOTE_RETENTION_SECONDS,
+                "note": (
+                    "Ownership upstream is a note, and a note with no write for "
+                    f"{self.UPSTREAM_NOTE_RETENTION_SECONDS}s is deleted. This node "
+                    f"renews every {self.OWNERSHIP_RENEWAL_SECONDS}s. Null means it has "
+                    "not renewed since this ledger was created."
+                ),
+            },
             # What the node will actually *do*, next to what it reports. When these two
             # disagree the reader should be able to see it, not have to infer it.
             "accepting_third_party_jobs": safe,
@@ -815,6 +944,11 @@ class Node:
         }
 
     def start_background(self) -> None:
+        # Started unconditionally. The lease is a fact about the calendar, not about
+        # whether this node is accepting work: with intake off — which is how production
+        # runs today — nothing else would renew it, and the room would be lost while the
+        # node was doing exactly what it was told.
+        self._tasks.append(asyncio.create_task(self.run_ownership_lease(), name="ownership"))
         if self.settings.mailbox_enabled:
             self._tasks.append(asyncio.create_task(self.run_mailbox(), name="mailbox"))
         if self.settings.watcher_enabled:

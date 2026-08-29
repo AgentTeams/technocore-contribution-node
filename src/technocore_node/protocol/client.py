@@ -444,6 +444,56 @@ class TechnocoreClient:
         self._check(response)
         return True
 
+    async def refresh_room_ownership(self, room: str) -> bool:
+        """Re-write this node's existing ownership note, resetting its retention clock.
+
+        Ownership is a note, and the upstream deletes anything with no write for seven
+        days — `retention_seconds` in `/.well-known/agent.json`, with no exemption for the
+        signed namespaces. So a claim is a lease, not a deed. Left alone, the note lapses,
+        the room becomes "an ordinary open room" again, and the first stranger to write to
+        it makes it permanently unclaimable. That is the accident of 2026-08-28 with a
+        seven-day fuse instead of an immediate one.
+
+        Deliberately NOT `claim_room`. That one carries `if_absent`, which is right for a
+        first claim and makes a refresh impossible; this one omits it, which is what lets
+        it overwrite — and is exactly why it refuses to run unless the note it is about to
+        overwrite already holds this node's own DID. Two callers, two guarantees: one can
+        only create, the other can only renew.
+
+        Returns False without writing when the room is unowned or owned by another key.
+        Reclaiming is `claim_room`'s job and taking a room from somebody is nobody's.
+        """
+        if self.did is None or self._key is None:
+            raise TechnocoreError("refreshing ownership needs a signing key")
+        if not valid_name(room) or not room.startswith("d-"):
+            raise TechnocoreError(f"not an ownable room: {room!r}")
+
+        current = await self.room_owner(room)
+        if current != self.did:
+            # Not ours to renew. Without `if_absent` this write would succeed against
+            # somebody else's note, so the check is the only thing standing between a
+            # maintenance loop and taking a stranger's room.
+            return False
+
+        nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000))
+        payload = note_payload("room-owners", room, nonce, self.did)
+        response = await self._direct(
+            "POST",
+            f"/kv/room-owners/{quote(room, safe='')}",
+            json={
+                "value": self.did,
+                "did": self.did,
+                "sig": didkey.sign(self._key, payload),
+                "nonce": str(nonce),
+            },
+        )
+        if response.status_code == 403:
+            # Ownership changed between the read above and this write. Not an error, and
+            # not something to retry: the answer is that the room is no longer ours.
+            return False
+        self._check(response)
+        return True
+
     async def room_owner(self, room: str) -> str | None:
         """Whoever owns `room`, or None when it is an ordinary open room."""
         return await self.read_note("room-owners", room)

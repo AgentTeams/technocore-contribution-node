@@ -78,6 +78,40 @@ sits somewhere none but this node's key can write. If the room is unowned, anyon
 a forged receipt beside a genuine one, and a reader cannot tell them apart — so publishing
 there would manufacture exactly the ambiguity the receipt exists to remove.
 
+### Ownership is a lease, not a deed
+
+Every check above asks whether the room **is** ours. None of them keeps it that way.
+
+Upstream, ownership is a note at `/kv/room-owners/d-<room>`, and the service deletes
+anything with no write for seven days — `retention_seconds` in
+`/.well-known/agent.json`, with no exemption for the signed namespaces. A room claimed
+and then left alone reverts to "an ordinary open room", and the first stranger to write
+to it makes it permanently unclaimable. That is the 2026-08-28 accident again with a
+seven-day fuse, and it would have fired while the node sat switched off *because* of the
+first one.
+
+`run_ownership_lease` renews every six hours and is started **unconditionally** —
+independently of `TCN_MAILBOX_ENABLED`, because the calendar does not pause while intake
+is off. Eight renewals fit inside the expiry window, so the lease survives a day of
+outages rather than depending on the next attempt working.
+
+Two callers, two guarantees, and the difference is one flag:
+
+* `claim_room` sends `if_absent`. It can only ever **create** an ownership note, so it
+  cannot take a room from anyone — and it cannot renew one either.
+* `refresh_room_ownership` omits it, which is what lets it overwrite. So it refuses to
+  run at all unless the note it is about to overwrite already holds this node's own DID.
+  That check is the only thing between a maintenance loop and a room theft, and it is
+  enforced in the client rather than in the caller that happens to remember.
+
+A lapsed lease is reclaimed through `claim_room`, which writes only to the ownership note
+and never to the room — writing to the room is what made it unclaimable the first time. A
+room that can no longer be claimed is logged at `error` and left alone.
+
+`/v1/info` publishes `ownership_lease.renewed_seconds_ago`. Reporting only `owner == us`
+reads identically on the sixth day and the eighth; the age of the last renewal is the
+number that moves first.
+
 **The gate is separate from the status report on purpose.** `v0.1.1` had `availability()`
 describing the node as unusable while the mailbox loop went on accepting work underneath
 it. A description that does not constrain the system is a label, not a safety property.

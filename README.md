@@ -19,16 +19,16 @@ separate throughout.
 | Implementation | **complete** — `v0.1.2`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, loopback only |
 | Public HTTPS endpoint | **pending DNS.** No record exists yet, so there is no URL to give you |
-| Owned result room (`d-tc-contrib-…`) | **exists but is unowned, and that name can never be owned.** A `d-` room upstream is claimable only from birth; a profile attestation was written into it before ownership was claimed, which created it and foreclosed the claim. A receipt published there could be forged by anyone, so the node refuses to write to it at all |
-| Technocore mailbox (`mb-tc-jobs-…`) | **not created**, and intake is **disabled** (`TCN_MAILBOX_ENABLED=false`) until the result room is recovered |
+| Owned result room (`d-tc-contrib-…`) | **owned, and the claim is renewed as a lease.** Reclaimed 2026-08-30 after the upstream's 24-hour sweep freed the name lost in the 2026-08-28 accident, and claimed *before* anything was written to it. Ownership upstream is a note that expires after seven days without a write, so the node renews every six hours whether or not intake is on — see [`docs/SECURITY.md`](docs/SECURITY.md#ownership-is-a-lease-not-a-deed) |
+| Technocore mailbox (`mb-tc-jobs-…`) | intake is **disabled** (`TCN_MAILBOX_ENABLED=false`). The result room is recovered; enabling intake is a separate decision and has not been taken |
 | Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
 | Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
 
-Recovery needs no code change and no decision: upstream reclaims a room left on its
-single message after 24 hours idle, after which the name is free and can be claimed
-**before** anything is written to it. `technocore-node inspect-result-room` reports the
-current state and the one safe next step; `recover-result-room` performs it in that order.
+The room was recovered on 2026-08-30, and `v0.1.3` fixed what would have lost it again:
+ownership upstream is a note, the upstream deletes anything with no write for seven days,
+and nothing was renewing it. `technocore-node inspect-result-room` reports the current
+state; `/v1/info` publishes how long ago the lease last renewed.
 
 What follows describes how the node works and how you would use it **once intake opens**.
 Where something is not available today, it says so.
@@ -191,8 +191,8 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 
 `v0.1.2`. The Technocore lane is **implemented and exercised end to end against a local
 instance of the upstream server**, and is **deliberately not accepting work from the
-public instance**: the owned result room is unowned, so an execution gate refuses
-third-party jobs rather than publishing receipts nobody could trust. See
+public instance**: intake is switched off, so an execution gate refuses third-party jobs
+rather than publishing receipts nobody has asked for. See
 [Current status](#current-status--read-this-first).
 
 The FLOP testnet adapter is a deliberate stub. No specification for that network has been

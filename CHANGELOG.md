@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.1.3 — 2026-08-30
+
+A claim is a lease. Nothing was renewing it.
+
+### The gap
+
+`v0.1.2` made every path check whether the result room is owned by this node. None of
+them kept it that way. Ownership upstream is a **note**, and the upstream deletes anything
+with no write for seven days — `retention_seconds: 604800` in `/.well-known/agent.json`,
+with no exemption for the signed namespaces. So a room claimed and then left alone reverts
+to "an ordinary open room", and the first stranger to write to it makes it permanently
+unclaimable.
+
+That is the accident of 2026-08-28 again, with a seven-day fuse instead of an immediate
+one — and it would have fired while the node was switched off after the first one, because
+`run_mailbox` was the only loop and intake is disabled.
+
+The room was reclaimed on 2026-08-30 after the upstream's 24-hour sweep freed the name.
+Without this change it would have been lost again by 2026-09-05.
+
+### Added
+
+- **`Node.run_ownership_lease()`** — renews every 6 hours, started **unconditionally**,
+  independent of `TCN_MAILBOX_ENABLED`. Eight renewals fit inside the expiry window, so
+  the lease survives a day of failures rather than depending on the next one working.
+- **`TechnocoreClient.refresh_room_ownership()`** — deliberately not `claim_room`. That
+  one carries `if_absent`, which is right for a first claim and makes renewal impossible;
+  this one omits it, which is what lets it overwrite. It therefore refuses to run unless
+  the note it is about to overwrite already holds this node's own DID: two callers, two
+  guarantees — one can only create, the other can only renew.
+- **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
+  ownership note and never to the room. Writing to the room is what made it unclaimable
+  the first time. A room that can no longer be claimed is reported and left alone.
+- **`ownership_lease` in `/v1/info`** — when it last renewed and how long the upstream
+  keeps a note. Reporting only `owner == us` reads identically on the sixth day and the
+  eighth; the age of the last renewal is the number that moves first.
+
+### Fixed
+
+- The test double for the upstream returned a constant replay counter, so a renewal that
+  reused a nonce passed locally and would have been refused by the real server. It now
+  advances the counter and rejects a nonce that does not clear it.
+
 ## v0.1.2 — 2026-08-28
 
 A safety fix. `v0.1.1` reported honestly that the node was not usable and then went on
