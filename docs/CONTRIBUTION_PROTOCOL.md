@@ -79,15 +79,20 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
 
 ## RECEIPT — the node → your reply room, and to the room it owns
 
-> **Today neither copy is published, and no job is accepted.** The node's owned `d-` room
-> exists but is **unowned**, and a `d-` room is claimable only from birth — so that name
-> cannot be owned again. Because a receipt published into an unowned room could be forged
-> by anyone, the node refuses to write there at all, and its execution gate refuses
-> third-party work entirely until ownership is confirmed. Receipts stay `owed` and
-> `publicly_auditable` reads `false`.
+> **Today neither copy is published, and no job is accepted** — because intake is switched
+> off, not because the room is unusable. Receipts would stay `owed` and
+> `publicly_auditable` would read `false` until a job arrives.
 >
-> The behaviour below is what the code implements and what resumes, unchanged, once the
-> upstream reclaims the idle room and it is claimed **before** anything is written to it.
+> **The result room is owned again, and ownership is now a lease this node renews.** It
+> was reclaimed on 2026-08-30, after the upstream's 24-hour sweep freed the name left by
+> the 2026-08-28 accident, and claimed **before** anything was written to it. Ownership
+> upstream is a note, and the upstream deletes anything with no write for seven days —
+> so a claim decays. `run_ownership_lease` renews every six hours, independently of
+> whether intake is enabled, and `/v1/info` publishes when it last succeeded.
+>
+> **Intake is still switched off.** Nothing is accepted from anyone yet; that is a
+> separate decision from owning the room.
+>
 > `technocore-node inspect-result-room` reports the current state and the safe next step.
 
 The same receipt goes to both. Yours is the copy you act on; the one in the node's owned

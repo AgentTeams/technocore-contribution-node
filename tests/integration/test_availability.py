@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from technocore_node.api import create_app
 from technocore_node.config import load_settings
 from technocore_node.crypto import keystore
-from technocore_node.ledger.db import Ledger
+from technocore_node.ledger.db import Ledger, utcnow
 from technocore_node.service.node import Node
 
 PASSPHRASE = b"test-secret-do-not-use"
@@ -56,6 +56,7 @@ def test_an_unobserved_node_says_so_rather_than_guessing(node: Node) -> None:
     either) — the node simply has not looked yet, and says which.
     """
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     node.ledger.set_state("owned_room_observed", "1")
     availability = node.availability()
     assert availability["third_party_intake"] in {"unverified", "unavailable"}
@@ -161,6 +162,7 @@ def _own_the_room(node: Node) -> None:
     refuses, so they have to get past the local check first.
     """
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     node.ledger.set_state("owned_room_observed", "1")
     node.ledger.set_state("owned_room_error", None)
 
@@ -202,6 +204,7 @@ def test_intake_reads_available_only_with_a_job_and_no_blockers(
     """Both halves are required, and each is checked without the other."""
     object.__setattr__(node.settings, "public_url", "https://example.invalid")
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     node.ledger.set_state("owned_room_observed", "1")
 
     # No blockers, but nobody has used it: not `available`.
@@ -256,6 +259,7 @@ def test_a_result_room_held_by_someone_else_is_the_strongest_blocker(
 def test_our_own_ownership_is_not_a_blocker(node: Node, env: dict[str, str]) -> None:
     object.__setattr__(node.settings, "public_url", "https://example.invalid")
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     node.ledger.set_state("owned_room_observed", "1")
     assert node.availability()["blockers"] == []
 
@@ -288,6 +292,7 @@ async def test_a_failed_check_does_not_erase_a_good_earlier_observation(node: No
     from technocore_node.protocol.client import TechnocoreError
 
     node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     node.ledger.set_state("owned_room_observed", "1")
 
     async def refuse(room: str) -> str | None:
@@ -342,6 +347,7 @@ def test_an_open_lane_is_not_reported_as_stopped_by_a_closed_one(node: Node) -> 
     node.ledger.set_state("owned_room_owner", node.did)
     node.ledger.set_state("owned_room_observed", "1")
     node.ledger.set_state("owned_room_error", None)
+    node.ledger.set_state("owned_room_renewed", utcnow())
     object.__setattr__(node.settings, "mailbox_enabled", True)
     object.__setattr__(node.settings, "http_job_intake_enabled", False)
     object.__setattr__(node.settings, "public_url", "https://example.invalid")

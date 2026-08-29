@@ -13,6 +13,7 @@ import asyncio
 import json
 import sqlite3
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from technocore_node.config import load_settings
 from technocore_node.crypto import didkey, keystore
 from technocore_node.jobs.runner import RejectedJob
 from technocore_node.jobs.tasks import REGISTRY
+from technocore_node.ledger.db import utcnow
 from technocore_node.protocol.envelope import message_payload
 from technocore_node.protocol.http_envelope import (
     HTTP_JOB_DOMAIN,
@@ -61,6 +63,11 @@ def node(
     node.ledger.set_state("owned_room_owner", node.did)
     node.ledger.set_state("owned_room_observed", "1")
     node.ledger.set_state("owned_room_error", None)
+    # Owning the room and holding a live lease on it are two facts, and a node in
+    # production has both. `v0.1.3` made the gate and the sink require the second, so
+    # setting only the first leaves every test here running against a state the node is
+    # now right to refuse.
+    node.ledger.set_state("owned_room_renewed", utcnow())
 
     # The audit copy goes to a real room over a real socket. These tests are about the
     # intake lane, not about publishing, so the sink is recorded instead of sent — and
@@ -836,3 +843,54 @@ def test_a_crashed_job_resumes_over_http_even_at_the_limit(
 
     assert resumed.status_code == 200
     assert node.ledger.get_receipt("httpresume-00001") is not None
+
+
+def test_a_dead_lease_closes_the_http_lane_too(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Safety is shared between lanes, and the lease is a safety condition.
+
+    `v0.2.0` separated each lane's switch from the conditions they share; `v0.1.3` made
+    the ownership lease one of those conditions. This is where the two meet: a receipt
+    earned over HTTP is audited in the same room as one earned in a chat room, so a lease
+    that has stopped being renewed makes the HTTP receipt exactly as worthless — and the
+    lane has to refuse for that reason, not merely report it.
+    """
+    key, did = requester
+    assert (
+        client.post("/v1/jobs", json=_envelope(key, did, _job("before-lapse-01"), 1)).status_code
+        == 200
+    )
+
+    stale = (
+        datetime.now(UTC) - timedelta(seconds=Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS + 60)
+    ).isoformat()
+    node.ledger.set_state("owned_room_renewed", stale)
+
+    refused = client.post("/v1/jobs", json=_envelope(key, did, _job("after-lapse-001"), 2))
+
+    assert refused.status_code == 503
+    assert refused.json()["error"] == "not_accepting_jobs"
+    assert "lease" in refused.json()["detail"]
+    # And it is the shared condition, not the lane's own switch, that closed it.
+    assert node.can_accept_third_party_jobs("http") is False
+    assert node.can_accept_third_party_jobs("mailbox") is False
+    assert node.open_lanes() == []
+
+
+def test_a_lapsed_lease_does_not_orphan_a_receipt_already_earned(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Work already paid for stays retrievable. Refusing new work is not forgetting old.
+
+    The receipt is in the ledger and served from there; what a dead lease stops is the
+    audit copy, which the row records as still owed.
+    """
+    key, did = requester
+    body = client.post("/v1/jobs", json=_envelope(key, did, _job("earned-000000001"), 1)).json()
+
+    node.ledger.set_state("owned_room_renewed", None)
+
+    fetched = client.get("/v1/receipts/earned-000000001")
+    assert fetched.status_code == 200
+    assert fetched.json()["receipt"]["receipt_hash"] == body["receipt"]["receipt_hash"]

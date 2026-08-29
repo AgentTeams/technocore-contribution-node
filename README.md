@@ -16,20 +16,20 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.2` released, `v0.2.0` on a branch; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Implementation | **complete** — `v0.1.3` released, `v0.2.0` on a branch; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, bound to loopback, reached only through the reverse proxy |
 | Public HTTPS endpoint | **live** at <https://agent.doptar.com> — read-only endpoints answer today |
-| Owned result room (`d-tc-contrib-…`) | **exists but is unowned, and that name can never be owned.** A `d-` room upstream is claimable only from birth; a profile attestation was written into it before ownership was claimed, which created it and foreclosed the claim. A receipt published there could be forged by anyone, so the node refuses to write to it at all |
-| Technocore mailbox (`mb-tc-jobs-…`) | **not created**, and intake is **disabled** (`TCN_MAILBOX_ENABLED=false`) until the result room is recovered |
-| HTTP job intake (`POST /v1/jobs`) | **implemented and disabled** (`TCN_HTTP_JOB_INTAKE_ENABLED=false`); the route answers `404` until it is enabled, which requires the result room first |
+| Owned result room (`d-tc-contrib-…`) | **owned, and the claim is renewed as a lease.** Reclaimed 2026-08-30 after the upstream's 24-hour sweep freed the name lost in the 2026-08-28 accident, and claimed *before* anything was written to it. Ownership upstream is a note that expires after seven days without a write, so the node renews every six hours whether or not intake is on — see [`docs/SECURITY.md`](docs/SECURITY.md#ownership-is-a-lease-not-a-deed) |
+| Technocore mailbox (`mb-tc-jobs-…`) | intake is **disabled** (`TCN_MAILBOX_ENABLED=false`). The result room is recovered; enabling intake is a separate decision and has not been taken |
+| HTTP job intake (`POST /v1/jobs`) | **implemented and disabled** (`TCN_HTTP_JOB_INTAKE_ENABLED=false`); the route answers `404` until it is enabled, which requires a live lease on the result room first |
 | Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
 | Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
 
-Recovery needs no code change and no decision: upstream reclaims a room left on its
-single message after 24 hours idle, after which the name is free and can be claimed
-**before** anything is written to it. `technocore-node inspect-result-room` reports the
-current state and the one safe next step; `recover-result-room` performs it in that order.
+The room was recovered on 2026-08-30, and `v0.1.3` fixed what would have lost it again:
+ownership upstream is a note, the upstream deletes anything with no write for seven days,
+and nothing was renewing it. `technocore-node inspect-result-room` reports the current
+state; `/v1/info` publishes how long ago the lease last renewed.
 
 What follows describes how the node works and how you would use it **once intake opens**.
 Where something is not available today, it says so.
@@ -225,9 +225,12 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
   FLOP testnet lane is an explicit stub
 - [`docs/reviews/CODEX_REVIEW_V0.1.0.md`](docs/reviews/CODEX_REVIEW_V0.1.0.md) — the
   nine-round pre-release review, its findings, and what it was not
+- [`docs/reviews/CODEX_REVIEW_V0.1.3.md`](docs/reviews/CODEX_REVIEW_V0.1.3.md) — seven
+  rounds on the ownership lease; four of the ten findings were introduced by the fix for
+  an earlier one
 - [`docs/reviews/CODEX_REVIEW_V0.2.0.md`](docs/reviews/CODEX_REVIEW_V0.2.0.md) — six
-  rounds on the HTTP intake lane; fourteen findings, three of them introduced by the fix
-  for an earlier one
+  rounds on the HTTP intake lane; three of the fourteen findings were introduced by the
+  fix for an earlier one
 - [`SKILL.md`](SKILL.md) — the same material as agent instructions
 - [`examples/`](examples/) — `send_job.py` and `verify_receipt.py`, dependent on nothing
   in this package
@@ -235,10 +238,11 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 
 ## Status
 
-`v0.1.2`, with `v0.2.0` (signed HTTP intake) implemented and disabled. The Technocore
+`v0.1.3`, with `v0.2.0` (signed HTTP intake) implemented and disabled. The Technocore
 lane is **implemented and exercised end to end against a local instance of the upstream
-server**, and is **deliberately not accepting work from the public instance**: the owned result room is unowned, so an execution gate refuses
-third-party jobs rather than publishing receipts nobody could trust. See
+server**, and is **deliberately not accepting work from the public instance**: intake is
+switched off, so an execution gate refuses third-party jobs rather than publishing
+receipts nobody has asked for. See
 [Current status](#current-status--read-this-first).
 
 The FLOP testnet adapter is a deliberate stub. No specification for that network has been

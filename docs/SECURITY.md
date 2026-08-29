@@ -78,6 +78,67 @@ sits somewhere none but this node's key can write. If the room is unowned, anyon
 a forged receipt beside a genuine one, and a reader cannot tell them apart — so publishing
 there would manufacture exactly the ambiguity the receipt exists to remove.
 
+### Ownership is a lease, not a deed
+
+Every check above asks whether the room **is** ours. None of them keeps it that way.
+
+Upstream, ownership is a note at `/kv/room-owners/d-<room>`, and the service deletes
+anything with no write for seven days — `retention_seconds` in
+`/.well-known/agent.json`, with no exemption for the signed namespaces. A room claimed
+and then left alone reverts to "an ordinary open room", and the first stranger to write
+to it makes it permanently unclaimable. That is the 2026-08-28 accident again with a
+seven-day fuse, and it would have fired while the node sat switched off *because* of the
+first one.
+
+`run_ownership_lease` renews every six hours and is started **unconditionally** —
+independently of `TCN_MAILBOX_ENABLED`, because the calendar does not pause while intake
+is off. Eight renewals fit inside the expiry window, so the lease survives a day of
+outages rather than depending on the next attempt working.
+
+Two callers, two guarantees, and the difference is one flag:
+
+* `claim_room` sends `if_absent`. It can only ever **create** an ownership note, so it
+  cannot take a room from anyone — and it cannot renew one either.
+* `refresh_room_ownership` omits it, which is what lets it overwrite. So it refuses to
+  run at all unless the note it is about to overwrite already holds this node's own DID.
+  That check is the only thing between a maintenance loop and a room theft, and it is
+  enforced in the client rather than in the caller that happens to remember.
+
+A lapsed lease is reclaimed through `claim_room`, which writes only to the ownership note
+and never to the room — writing to the room is what made it unclaimable the first time. A
+room that can no longer be claimed is logged at `error` and left alone.
+
+**The lease age is a gate condition, not a displayed number.** Publishing it and stopping
+there would repeat the mistake `v0.1.1` made and `v0.1.2` exists to fix: a status block
+describing the node while nothing acted on it. Ownership can be verified fresh and still
+be days from expiry — the observation says who owns the room *now*, and only the lease
+says whether it will still be ours when a receipt published today is read tomorrow. With
+renewals failing, `observe_reachability` would go on confirming ownership and the gate
+would stay open right up to the sweep, after which a still-fresh local observation would
+let this node write into a room it no longer owned. That is the original accident reached
+by a different road.
+
+So the gate closes after 24 hours without a successful renewal: four missed attempts, and
+six days clear of the upstream's deletion. Early enough that somebody can still fix it,
+late enough that a bad afternoon does not stop the node. `/v1/info` reports it as a
+`stop_reason` like any other, and `ownership_lease` alongside.
+
+**Two signals, because each covers the other's blind spot.** The age catches a loop that
+stopped — cancelled, crashed, never started — where no failure is ever recorded. A count
+of consecutive failures catches what the age cannot see: an age is a subtraction from
+`now`, so a clock moved backwards, a ledger restored from a backup, or a row edited by
+hand all make a dead lease look freshly renewed. A count cannot be walked back by changing
+the time. Either signal closes the gate; a successful renewal clears both.
+
+**And the same condition guards the sink, not only the gate.** `owns_result_room()` is
+checked independently by `publish`, `publish_audit_copy` and `sync_owned_room`, and
+`reconcile_audit_copies` deliberately runs even while intake is shut so that receipts owed
+from before a closure still land. While that guard asked only *who owns the room*, a node
+whose renewals had been failing for a week would have gone on writing audit copies right
+up to the sweep — and the first of them turns a room that could have been reclaimed into
+one with messages in it, which can never be claimed again. The 2026-08-28 accident,
+produced by the machinery built to prevent it.
+
 **The gate is separate from the status report on purpose.** `v0.1.1` had `availability()`
 describing the node as unusable while the mailbox loop went on accepting work underneath
 it. A description that does not constrain the system is a label, not a safety property.
