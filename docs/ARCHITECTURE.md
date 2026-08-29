@@ -2,12 +2,19 @@
 
 ## The shape of it
 
-> **The arrows crossing into Technocore are not currently in use.** The owned result room
-> exists but is unowned, and a `d-` room upstream is claimable only from birth — so that
-> name can never be owned. Because a receipt published there could be forged by anyone,
-> an execution gate refuses third-party work outright and the node will not write to that
-> room at all. Mailbox intake is switched off. Everything inside the node is built and
-> tested. See `docs/SECURITY.md` for the gate and the recovery path.
+> **The arrows crossing into Technocore are not currently in use.** Mailbox intake is
+> switched off, so the execution gate refuses third-party work outright. Everything inside
+> the node is built and tested. See `docs/SECURITY.md` for the gate.
+>
+> **The result room is owned again, and ownership is now a lease this node renews.** It
+> was reclaimed on 2026-08-30, after the upstream's 24-hour sweep freed the name left by
+> the 2026-08-28 accident, and claimed **before** anything was written to it. Ownership
+> upstream is a note, and the upstream deletes anything with no write for seven days —
+> so a claim decays. `run_ownership_lease` renews every six hours, independently of
+> whether intake is enabled, and `/v1/info` publishes when it last succeeded.
+>
+> **Intake is still switched off.** Nothing is accepted from anyone yet; that is a
+> separate decision from owning the room.
 
 ```
                     Technocore (technocore.chat)
@@ -15,10 +22,10 @@
         ┌────────────────────┼────────────────────┐
         │                    │                    │
    mb-tc-jobs-<fp>      reply room           d-tc-contrib-<fp>
-   (public mailbox)     (requester's)        (unowned — refused)
+   (public mailbox)     (requester's)        (owned — lease renewed)
         │                    ▲                    ▲
-        │ signed job         │ claim/result/      │ profile attestation,
-        │  (intake OFF)      │ receipt            │ releases  (refused)
+        │ signed job         │ claim/result/      │ audit copies, and a
+        │  (intake OFF)      │ receipt            │ lease renewed every 6h
         ▼                    │                    │
   ┌──────────────────────────┴────────────────────┴──────────────────┐
   │  service/node.py — mailbox loop, publication, cursors            │

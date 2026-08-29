@@ -147,6 +147,10 @@ def cmd_claim_room(args: argparse.Namespace) -> int:
                     "note": "An owner already exists. This node does not overwrite one.",
                 }
             claimed = await node.client.claim_room(room)
+            if claimed:
+                # Named, not assumed: this command claims whichever room it is given, and
+                # a lease on one room says nothing about another.
+                node.record_lease_outcome(room, renewed=True)
             confirmed = await node.client.room_owner(room)
             return {
                 "room": room,
@@ -310,7 +314,10 @@ def cmd_recover_result_room(args: argparse.Namespace) -> int:
             # One attempt. Never retried: a claim carries a signed nonce, and resending it
             # after an ambiguous reply is how one intent becomes two writes.
             try:
-                claimed = await node.client.claim_room(node.result_room)
+                # Claims and starts the lease together. Separately, the attest step below
+                # is refused by this node's own sink guard, which requires a live lease
+                # and would have no record of the write that just succeeded.
+                claimed = await node.claim_result_room()
                 step("claim", ok=True, accepted=claimed)
             except TechnocoreError as exc:
                 step(

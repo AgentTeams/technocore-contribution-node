@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.1.3 — 2026-08-30
+
+A claim is a lease. Nothing was renewing it.
+
+### Reviewed
+
+Seven rounds before the pull request; ten findings, all fixed, four of them introduced by
+the fix for an earlier one. The merge was blocked four times. See
+[`docs/reviews/CODEX_REVIEW_V0.1.3.md`](docs/reviews/CODEX_REVIEW_V0.1.3.md).
+
+### The gap
+
+`v0.1.2` made every path check whether the result room is owned by this node. None of
+them kept it that way. Ownership upstream is a **note**, and the upstream deletes anything
+with no write for seven days — `retention_seconds: 604800` in `/.well-known/agent.json`,
+with no exemption for the signed namespaces. So a room claimed and then left alone reverts
+to "an ordinary open room", and the first stranger to write to it makes it permanently
+unclaimable.
+
+That is the accident of 2026-08-28 again, with a seven-day fuse instead of an immediate
+one — and it would have fired while the node was switched off after the first one, because
+`run_mailbox` was the only loop and intake is disabled.
+
+The room was reclaimed on 2026-08-30 after the upstream's 24-hour sweep freed the name.
+Without this change it would have been lost again by 2026-09-05.
+
+### Added
+
+- **`Node.run_ownership_lease()`** — renews every 6 hours, started **unconditionally**,
+  independent of `TCN_MAILBOX_ENABLED`. Eight renewals fit inside the expiry window, so
+  the lease survives a day of failures rather than depending on the next one working.
+- **`TechnocoreClient.refresh_room_ownership()`** — deliberately not `claim_room`. That
+  one carries `if_absent`, which is right for a first claim and makes renewal impossible;
+  this one omits it, which is what lets it overwrite. It therefore refuses to run unless
+  the note it is about to overwrite already holds this node's own DID: two callers, two
+  guarantees — one can only create, the other can only renew.
+- **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
+  ownership note and never to the room. Writing to the room is what made it unclaimable
+  the first time. A room that can no longer be claimed is reported and left alone.
+- **The live suite claimed the room without starting its lease**, so requiring a live
+  lease at the sink broke three of its tests — visible only in CI, which is where that
+  suite runs. `Node.claim_result_room()` now does both as one step, and the callers that
+  claim the result room use it instead of reaching for the client: the two belong
+  together, and having them separable had already cost a P0 and a broken recovery command.
+- **Claiming an unrelated room started the result room's lease.** `claim-room` takes
+  whichever `d-` room it is given, and the lease outcome was recorded without naming one —
+  so claiming any free room marked the result room's lease live, and the sink guard, newly
+  taught to require a live lease, would then permit writes to a room nothing had renewed.
+  The room is a required argument now, so it is not a mistake a caller has to remember not
+  to make.
+- **The recovery command was defeated by its own guard.** `recover-result-room --claim
+  --attest` is the documented procedure — inspect, claim, read back, attest — and a CLI
+  claim recorded no lease, so the node had just taken the room and had no record saying
+  so. The sink guard added in this same release then refused the attestation. A safe
+  failure, and a broken procedure.
+- **The lease guards the write, not only the gate.** `owns_result_room()` is checked
+  independently by `publish`, `publish_audit_copy` and `sync_owned_room`, and
+  `reconcile_audit_copies` runs even while intake is shut so receipts owed from before a
+  closure still land. Asking only who owns the room would have let a node whose renewals
+  had failed for a week keep writing audit copies until the sweep — and the first turns a
+  reclaimable room into one with messages in it, which can never be claimed again.
+- **A failure count as well as an age.** An age is a subtraction from `now`, so a clock
+  moved backwards, a restored ledger or an edited row makes a dead lease look fresh. The
+  count cannot be walked back by changing the time; the age catches a loop that stopped
+  and recorded nothing. Either closes the gate, a renewal clears both.
+- **The lease age is a gate condition.** The gate closes after 24 hours without a
+  successful renewal — four missed attempts, six days clear of the upstream's deletion.
+  Publishing the number and stopping there would have repeated the `v0.1.1` mistake this
+  project spent `v0.1.2` fixing: ownership can be verified fresh and still be days from
+  expiry, and with renewals failing the gate would have stayed open until the sweep, after
+  which a still-fresh local observation would let the node write into a room it no longer
+  owned. The original accident, reached by a different road.
+- **`ownership_lease` in `/v1/info`** — when it last renewed and how long the upstream
+  keeps a note, reported beside the `stop_reason` that acts on it.
+
+### Fixed
+
+- **A failed renewal waited out a full interval.** The loop slept six hours whatever the
+  outcome, so it waited longest exactly when waiting was worst: a node restarting on day
+  six, whose first attempt met a 503, would have slept past the expiry before trying
+  again. A renewal runs on a schedule; a failure now runs on a clock — 60s, doubling to
+  the interval, reset by a success. `owned_by_other` and `unclaimable` keep the full
+  interval, because neither is fixed by asking again in a minute.
+- **A nonce conflict was treated as a lost room.** `/kv/room-nonce/<room>` is shared with
+  the allow-list namespace and advances on every accepted signed write, so it can pass
+  the read before the write lands. A `409` there means the counter moved, not that the
+  room is gone; it is retried once with a freshly read, higher nonce — a different
+  request, not the same one resent.
+- **A reclaim did not reset the published lease age.** A claim writes the same note a
+  renewal writes, so it resets the same clock. Recording only renewals left the lease age
+  reading `null` on a node that had just recovered the room.
+- The test double for the upstream returned a constant replay counter, so a renewal that
+  reused a nonce passed locally and would have been refused by the real server. It now
+  advances the counter and rejects a nonce that does not clear it.
+
 ## v0.1.2 — 2026-08-28
 
 A safety fix. `v0.1.1` reported honestly that the node was not usable and then went on
