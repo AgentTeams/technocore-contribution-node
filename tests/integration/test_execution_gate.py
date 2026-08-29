@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from technocore_node.api import create_app
 from technocore_node.config import load_settings
 from technocore_node.crypto import keystore
+from technocore_node.ledger.db import utcnow
 from technocore_node.protocol.client import Confirmation, TechnocoreError
 from technocore_node.service.node import Node
 
@@ -56,12 +57,17 @@ def _own_the_room(node: Node) -> None:
     node.ledger.set_state("owned_room_owner", node.did)
     node.ledger.set_state("owned_room_observed", "1")
     node.ledger.set_state("owned_room_error", None)
+    # Owning the room and holding a live lease on it are two facts, and a node in
+    # production has both. Setting only the first would leave every test here running
+    # against a state the gate is now right to refuse.
+    node.ledger.set_state("owned_room_renewed", utcnow())
 
 
 def _room_state(node: Node, owner: str | None, observed: bool, error: str | None = None) -> None:
     node.ledger.set_state("owned_room_owner", owner)
     node.ledger.set_state("owned_room_observed", "1" if observed else None)
     node.ledger.set_state("owned_room_error", error)
+    node.ledger.set_state("owned_room_renewed", utcnow())
 
 
 class _Recorder:

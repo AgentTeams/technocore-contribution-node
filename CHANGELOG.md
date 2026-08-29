@@ -33,9 +33,15 @@ Without this change it would have been lost again by 2026-09-05.
 - **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
   ownership note and never to the room. Writing to the room is what made it unclaimable
   the first time. A room that can no longer be claimed is reported and left alone.
+- **The lease age is a gate condition.** The gate closes after 24 hours without a
+  successful renewal — four missed attempts, six days clear of the upstream's deletion.
+  Publishing the number and stopping there would have repeated the `v0.1.1` mistake this
+  project spent `v0.1.2` fixing: ownership can be verified fresh and still be days from
+  expiry, and with renewals failing the gate would have stayed open until the sweep, after
+  which a still-fresh local observation would let the node write into a room it no longer
+  owned. The original accident, reached by a different road.
 - **`ownership_lease` in `/v1/info`** — when it last renewed and how long the upstream
-  keeps a note. Reporting only `owner == us` reads identically on the sixth day and the
-  eighth; the age of the last renewal is the number that moves first.
+  keeps a note, reported beside the `stop_reason` that acts on it.
 
 ### Fixed
 

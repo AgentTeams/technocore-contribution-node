@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from technocore_node.config import load_settings
 from technocore_node.crypto import didkey, keystore
+from technocore_node.ledger.db import utcnow
 from technocore_node.protocol.client import TechnocoreError
 from technocore_node.service.node import Node
 
@@ -435,3 +437,79 @@ def test_the_backoff_can_never_exceed_the_renewal_interval() -> None:
     floor, interval = Node.OWNERSHIP_RETRY_FLOOR_SECONDS, Node.OWNERSHIP_RENEWAL_SECONDS
     for failures in range(1, 40):
         assert min(floor * 2 ** (failures - 1), interval) <= interval
+
+
+# ------------------------------------------------- the lease is a gate
+
+
+def _owned_and_renewed(node: Node, renewed: str | None) -> None:
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+    node.ledger.set_state("owned_room_error", None)
+    node.ledger.set_state("owned_room_renewed", renewed)
+    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+
+
+def test_a_stalled_lease_closes_the_gate(node: Node) -> None:
+    """Publishing the age was not enough. Nothing was acting on it.
+
+    Ownership can be verified fresh and still be days from expiry: the observation says
+    who owns the room now, and only the lease says whether it will be ours when a receipt
+    published today is read tomorrow. With renewals failing, `observe_reachability` kept
+    confirming ownership and the gate stayed open right up until the sweep — after which
+    a fresh local observation would have let this node write to a room it no longer owned.
+    That is the original accident, reached by a different road.
+    """
+    stale = (
+        datetime.now(UTC) - timedelta(seconds=Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS + 60)
+    ).isoformat()
+    _owned_and_renewed(node, stale)
+
+    open_now, reasons = node.safety_state()
+
+    assert open_now is False
+    assert any("lease was last renewed" in r for r in reasons)
+    assert node.availability()["accepting_third_party_jobs"] is False
+
+
+def test_a_lease_never_renewed_closes_the_gate(node: Node) -> None:
+    """An ownership record with no renewal behind it is a record, not a lease."""
+    _owned_and_renewed(node, None)
+
+    open_now, reasons = node.safety_state()
+
+    assert open_now is False
+    assert any("never been renewed" in r for r in reasons)
+
+
+def test_a_live_lease_opens_it(node: Node) -> None:
+    """The condition has to be satisfiable, or it is not a gate but a wall."""
+    _owned_and_renewed(node, utcnow())
+
+    assert node.safety_state() == (True, [])
+
+
+def test_the_lease_limit_leaves_days_of_warning(node: Node) -> None:
+    """Closing the gate on the last afternoon would be an alarm, not a safeguard.
+
+    The point of refusing early is that somebody can still fix it: the gate shuts four
+    missed renewals in, with six days left before the upstream deletes the note.
+    """
+    assert Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS >= 4 * Node.OWNERSHIP_RENEWAL_SECONDS
+    assert (
+        Node.UPSTREAM_NOTE_RETENTION_SECONDS - Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS >= 5 * 24 * 3600
+    )
+
+
+def test_a_room_owned_by_another_key_reports_that_first(node: Node) -> None:
+    """A room that is not ours has a more immediate problem than an unrenewed lease."""
+    _owned_and_renewed(node, None)
+    node.ledger.set_state(
+        "owned_room_owner", "did:key:z6MkfyqMqvC4QGbyMAzpL4haXspn1f1ZGUwhdPearjqPpnnc"
+    )
+
+    _, reasons = node.safety_state()
+
+    assert any("owned by another key" in r for r in reasons)
+    assert not any("lease" in r for r in reasons)

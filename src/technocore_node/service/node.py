@@ -627,6 +627,17 @@ class Node:
     #: trying again. The lease is renewed on a schedule; a failure is retried on a clock.
     OWNERSHIP_RETRY_FLOOR_SECONDS = 60
 
+    #: How stale the lease may be before the gate closes. Four missed renewals, and six
+    #: days clear of the upstream's expiry — long enough that a bad afternoon does not
+    #: stop the node, short enough that there is a week to notice.
+    #:
+    #: This is a gate condition rather than a displayed number because a displayed number
+    #: is what `v0.1.1` had: a status block describing the node as unusable while it went
+    #: on working underneath. Ownership can be verified fresh and still be minutes from
+    #: expiry — the observation says who owns it now, and only the lease says whether it
+    #: will still be ours when a receipt published today is read tomorrow.
+    OWNERSHIP_LEASE_MAX_AGE_SECONDS = 24 * 3600
+
     #: What the upstream publishes as `retention_seconds`. Recorded so the cadence above
     #: can be checked against it rather than against a remembered number, and so the
     #: reported lease age means something to a reader who does not know the rule.
@@ -860,6 +871,23 @@ class Node:
                 f"result room {self.result_room} is owned by another key, so this node "
                 "cannot publish an auditable record there"
             )
+
+        lease_age = self._age_of(self.ledger.get_state("owned_room_renewed")[0])
+        if not reasons:
+            # Only when ownership itself checked out: a room that is not ours has a more
+            # immediate problem than an unrenewed lease, and saying both would bury it.
+            if lease_age is None:
+                reasons.append(
+                    "the result room ownership lease has never been renewed by this node, "
+                    "so there is no evidence it will still hold"
+                )
+            elif lease_age > self.OWNERSHIP_LEASE_MAX_AGE_SECONDS:
+                reasons.append(
+                    f"the result room ownership lease was last renewed {lease_age}s ago "
+                    f"(limit {self.OWNERSHIP_LEASE_MAX_AGE_SECONDS}s); upstream deletes an "
+                    f"unwritten note after {self.UPSTREAM_NOTE_RETENTION_SECONDS}s, so the "
+                    "room is on its way to being lost"
+                )
 
         if not self.settings.public_url:
             reasons.append("no public URL is configured, so a requester cannot verify a receipt")

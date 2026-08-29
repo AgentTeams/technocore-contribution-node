@@ -108,9 +108,20 @@ A lapsed lease is reclaimed through `claim_room`, which writes only to the owner
 and never to the room — writing to the room is what made it unclaimable the first time. A
 room that can no longer be claimed is logged at `error` and left alone.
 
-`/v1/info` publishes `ownership_lease.renewed_seconds_ago`. Reporting only `owner == us`
-reads identically on the sixth day and the eighth; the age of the last renewal is the
-number that moves first.
+**The lease age is a gate condition, not a displayed number.** Publishing it and stopping
+there would repeat the mistake `v0.1.1` made and `v0.1.2` exists to fix: a status block
+describing the node while nothing acted on it. Ownership can be verified fresh and still
+be days from expiry — the observation says who owns the room *now*, and only the lease
+says whether it will still be ours when a receipt published today is read tomorrow. With
+renewals failing, `observe_reachability` would go on confirming ownership and the gate
+would stay open right up to the sweep, after which a still-fresh local observation would
+let this node write into a room it no longer owned. That is the original accident reached
+by a different road.
+
+So the gate closes after 24 hours without a successful renewal: four missed attempts, and
+six days clear of the upstream's deletion. Early enough that somebody can still fix it,
+late enough that a bad afternoon does not stop the node. `/v1/info` reports it as a
+`stop_reason` like any other, and `ownership_lease.renewed_seconds_ago` alongside.
 
 **The gate is separate from the status report on purpose.** `v0.1.1` had `availability()`
 describing the node as unusable while the mailbox loop went on accepting work underneath
