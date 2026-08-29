@@ -148,7 +148,9 @@ def cmd_claim_room(args: argparse.Namespace) -> int:
                 }
             claimed = await node.client.claim_room(room)
             if claimed:
-                node.record_lease_outcome(renewed=True)
+                # Named, not assumed: this command claims whichever room it is given, and
+                # a lease on one room says nothing about another.
+                node.record_lease_outcome(room, renewed=True)
             confirmed = await node.client.room_owner(room)
             return {
                 "room": room,
@@ -317,7 +319,7 @@ def cmd_recover_result_room(args: argparse.Namespace) -> int:
                     # The lease starts now. Without this the attest step below is refused
                     # by this node's own sink guard, which requires a live lease and would
                     # have no record of the write that just succeeded.
-                    node.record_lease_outcome(renewed=True)
+                    node.record_lease_outcome(node.result_room, renewed=True)
                 step("claim", ok=True, accepted=claimed)
             except TechnocoreError as exc:
                 step(

@@ -33,6 +33,12 @@ Without this change it would have been lost again by 2026-09-05.
 - **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
   ownership note and never to the room. Writing to the room is what made it unclaimable
   the first time. A room that can no longer be claimed is reported and left alone.
+- **Claiming an unrelated room started the result room's lease.** `claim-room` takes
+  whichever `d-` room it is given, and the lease outcome was recorded without naming one —
+  so claiming any free room marked the result room's lease live, and the sink guard, newly
+  taught to require a live lease, would then permit writes to a room nothing had renewed.
+  The room is a required argument now, so it is not a mistake a caller has to remember not
+  to make.
 - **The recovery command was defeated by its own guard.** `recover-result-room --claim
   --attest` is the documented procedure — inspect, claim, read back, attest — and a CLI
   claim recorded no lease, so the node had just taken the room and had no record saying

@@ -683,7 +683,7 @@ class Node:
     #: reported lease age means something to a reader who does not know the rule.
     UPSTREAM_NOTE_RETENTION_SECONDS = 7 * 24 * 3600
 
-    def record_lease_outcome(self, *, renewed: bool) -> None:
+    def record_lease_outcome(self, room: str, *, renewed: bool) -> None:
         """One place where both lease signals are written, so they cannot disagree.
 
         Public because the CLI claims the room too, and a claim it makes is as much a
@@ -692,7 +692,16 @@ class Node:
         guard added in the same release: the room was claimed, the lease was live upstream,
         and this node had no record saying so — a recovery procedure defeated by its own
         safety check.
+
+        `room` is required, and anything but the result room is ignored. There is exactly
+        one lease here, and `claim-room` will claim any `d-` room it is given: without
+        this, claiming an unrelated room marked the *result* room's lease live, and the
+        sink guard would then permit writes to a room nothing had renewed. The parameter
+        exists so that mistake cannot be made by a caller rather than being one a caller
+        must remember not to make.
         """
+        if room != self.result_room:
+            return
         if renewed:
             self.ledger.set_state("owned_room_renewed", utcnow())
             self.ledger.set_state("owned_room_renewal_failures", "0")
@@ -720,7 +729,7 @@ class Node:
                 "could not read result room ownership",
                 extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
             )
-            self.record_lease_outcome(renewed=False)
+            self.record_lease_outcome(self.result_room, renewed=False)
             return "failed"
 
         if owner == self.did:
@@ -731,13 +740,13 @@ class Node:
                     "ownership renewal failed",
                     extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
                 )
-                self.record_lease_outcome(renewed=False)
+                self.record_lease_outcome(self.result_room, renewed=False)
                 return "failed"
             if renewed:
-                self.record_lease_outcome(renewed=True)
+                self.record_lease_outcome(self.result_room, renewed=True)
                 log.info("ownership lease renewed", extra={"fields": {"room": self.result_room}})
                 return "renewed"
-            self.record_lease_outcome(renewed=False)
+            self.record_lease_outcome(self.result_room, renewed=False)
             return "failed"
 
         if owner is not None:
@@ -761,13 +770,13 @@ class Node:
                 "reclaim failed",
                 extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
             )
-            self.record_lease_outcome(renewed=False)
+            self.record_lease_outcome(self.result_room, renewed=False)
             return "failed"
         if claimed:
             # A claim is a successful write to the same note a renewal writes, so it
             # resets the same clock. Recording only renewals would leave the published
             # lease age reading `null` on a node that had just recovered the room.
-            self.record_lease_outcome(renewed=True)
+            self.record_lease_outcome(self.result_room, renewed=True)
             log.warning(
                 "the ownership lease had lapsed and was reclaimed",
                 extra={"fields": {"room": self.result_room}},

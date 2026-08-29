@@ -606,7 +606,7 @@ async def test_the_recovery_command_is_not_defeated_by_its_own_guard(
 
     claimed = await node.client.claim_room(node.result_room)
     assert claimed is True
-    node.record_lease_outcome(renewed=True)
+    node.record_lease_outcome(node.result_room, renewed=True)
     await node.observe_reachability()
 
     assert node.owns_result_room() is True
@@ -626,3 +626,29 @@ async def test_a_refused_claim_does_not_start_a_lease(node: Node, upstream: Upst
     assert await node.client.claim_room(node.result_room) is False
     assert node.availability()["ownership_lease"]["renewed_at"] is None
     assert node.owns_result_room() is False
+
+
+async def test_claiming_an_unrelated_room_does_not_start_the_result_rooms_lease(
+    node: Node, upstream: Upstream
+) -> None:
+    """`claim-room` takes whichever room it is given. There is one lease, and it is not that one.
+
+    Recording the outcome without naming the room meant claiming any free `d-` room marked
+    the *result* room's lease live — and the sink guard, which had just been taught to
+    require a live lease, would then permit writes to a room nothing had renewed. The room
+    is a required argument now, so the mistake is not one a caller has to remember not to
+    make.
+    """
+    assert node.availability()["ownership_lease"]["renewed_at"] is None
+
+    node.record_lease_outcome("d-some-other-room", renewed=True)
+
+    assert node.availability()["ownership_lease"]["renewed_at"] is None
+    assert node.owns_result_room() is False
+
+
+async def test_a_failure_elsewhere_does_not_count_against_this_lease(node: Node) -> None:
+    """The same argument in the other direction: one room's trouble is not another's."""
+    node.record_lease_outcome("d-some-other-room", renewed=False)
+
+    assert node.availability()["ownership_lease"]["consecutive_failures"] == 0
