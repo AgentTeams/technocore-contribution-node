@@ -588,3 +588,41 @@ async def test_every_failing_path_counts(node: Node, upstream: Upstream) -> None
     for expected in range(1, 4):
         assert await node.maintain_result_room_ownership() == "failed"
         assert node.ledger.get_state("owned_room_renewal_failures")[0] == str(expected)
+
+
+async def test_the_recovery_command_is_not_defeated_by_its_own_guard(
+    node: Node, upstream: Upstream
+) -> None:
+    """Claim, then attest. The second step must not be refused because of the first.
+
+    `recover-result-room --claim --attest` is the documented recovery: inspect, claim,
+    read back, then publish the attestation. The sink guard added in this release requires
+    a live lease — and a CLI claim recorded nothing, so the node had just taken the room
+    and had no record saying so. The attestation was refused by the safety check meant to
+    protect it, which is a safe failure and still a broken procedure.
+    """
+    upstream.owner = None
+    assert node.owns_result_room() is False
+
+    claimed = await node.client.claim_room(node.result_room)
+    assert claimed is True
+    node.record_lease_outcome(renewed=True)
+    await node.observe_reachability()
+
+    assert node.owns_result_room() is True
+    assert node.availability()["ownership_lease"]["live"] is True
+
+
+async def test_a_refused_claim_does_not_start_a_lease(node: Node, upstream: Upstream) -> None:
+    """Only a write that happened may reset the clock.
+
+    Recording on the attempt rather than the result would mark a lease live on a node that
+    had just been told it cannot have the room — and the sink guard would then let it
+    write there.
+    """
+    upstream.owner = None
+    upstream.claim_succeeds = False
+
+    assert await node.client.claim_room(node.result_room) is False
+    assert node.availability()["ownership_lease"]["renewed_at"] is None
+    assert node.owns_result_room() is False

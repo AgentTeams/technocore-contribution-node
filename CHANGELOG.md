@@ -33,6 +33,11 @@ Without this change it would have been lost again by 2026-09-05.
 - **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
   ownership note and never to the room. Writing to the room is what made it unclaimable
   the first time. A room that can no longer be claimed is reported and left alone.
+- **The recovery command was defeated by its own guard.** `recover-result-room --claim
+  --attest` is the documented procedure — inspect, claim, read back, attest — and a CLI
+  claim recorded no lease, so the node had just taken the room and had no record saying
+  so. The sink guard added in this same release then refused the attestation. A safe
+  failure, and a broken procedure.
 - **The lease guards the write, not only the gate.** `owns_result_room()` is checked
   independently by `publish`, `publish_audit_copy` and `sync_owned_room`, and
   `reconcile_audit_copies` runs even while intake is shut so receipts owed from before a
