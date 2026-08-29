@@ -185,6 +185,9 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
   FLOP testnet lane is an explicit stub
 - [`docs/reviews/CODEX_REVIEW_V0.1.0.md`](docs/reviews/CODEX_REVIEW_V0.1.0.md) — the
   nine-round pre-release review, its findings, and what it was not
+- [`docs/reviews/CODEX_REVIEW_V0.1.3.md`](docs/reviews/CODEX_REVIEW_V0.1.3.md) — seven
+  rounds on the ownership lease; four of the ten findings were introduced by the fix for
+  an earlier one
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed and why
 
 ## Status

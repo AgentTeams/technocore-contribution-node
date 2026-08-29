@@ -4,6 +4,12 @@
 
 A claim is a lease. Nothing was renewing it.
 
+### Reviewed
+
+Seven rounds before the pull request; ten findings, all fixed, four of them introduced by
+the fix for an earlier one. The merge was blocked four times. See
+[`docs/reviews/CODEX_REVIEW_V0.1.3.md`](docs/reviews/CODEX_REVIEW_V0.1.3.md).
+
 ### The gap
 
 `v0.1.2` made every path check whether the result room is owned by this node. None of
