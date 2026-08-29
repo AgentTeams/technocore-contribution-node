@@ -39,6 +39,20 @@ Without this change it would have been lost again by 2026-09-05.
 
 ### Fixed
 
+- **A failed renewal waited out a full interval.** The loop slept six hours whatever the
+  outcome, so it waited longest exactly when waiting was worst: a node restarting on day
+  six, whose first attempt met a 503, would have slept past the expiry before trying
+  again. A renewal runs on a schedule; a failure now runs on a clock — 60s, doubling to
+  the interval, reset by a success. `owned_by_other` and `unclaimable` keep the full
+  interval, because neither is fixed by asking again in a minute.
+- **A nonce conflict was treated as a lost room.** `/kv/room-nonce/<room>` is shared with
+  the allow-list namespace and advances on every accepted signed write, so it can pass
+  the read before the write lands. A `409` there means the counter moved, not that the
+  room is gone; it is retried once with a freshly read, higher nonce — a different
+  request, not the same one resent.
+- **A reclaim did not reset the published lease age.** A claim writes the same note a
+  renewal writes, so it resets the same clock. Recording only renewals left the lease age
+  reading `null` on a node that had just recovered the room.
 - The test double for the upstream returned a constant replay counter, so a renewal that
   reused a nonce passed locally and would have been refused by the real server. It now
   advances the counter and rejects a nonce that does not clear it.

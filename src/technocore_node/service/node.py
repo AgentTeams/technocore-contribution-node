@@ -621,6 +621,12 @@ class Node:
     #: still holds. A cadence that only just fits leaves no room for the ordinary.
     OWNERSHIP_RENEWAL_SECONDS = 6 * 3600
 
+    #: How soon to try again after a renewal fails, doubling up to the interval above.
+    #: A fixed cadence waits longest exactly when waiting is worst: a node restarting on
+    #: day six, whose first attempt meets a 503, would have slept past the expiry without
+    #: trying again. The lease is renewed on a schedule; a failure is retried on a clock.
+    OWNERSHIP_RETRY_FLOOR_SECONDS = 60
+
     #: What the upstream publishes as `retention_seconds`. Recorded so the cadence above
     #: can be checked against it rather than against a remembered number, and so the
     #: reported lease age means something to a reader who does not know the rule.
@@ -685,6 +691,10 @@ class Node:
             )
             return "failed"
         if claimed:
+            # A claim is a successful write to the same note a renewal writes, so it
+            # resets the same clock. Recording only renewals would leave the published
+            # lease age reading `null` on a node that had just recovered the room.
+            self.ledger.set_state("owned_room_renewed", utcnow())
             log.warning(
                 "the ownership lease had lapsed and was reclaimed",
                 extra={"fields": {"room": self.result_room}},
@@ -704,9 +714,11 @@ class Node:
         calendar regardless. Tying the renewal to the loop that reads jobs would mean the
         room is lost precisely while the node is being careful.
         """
+        failures = 0
         while True:
+            outcome = "failed"
             try:
-                await self.maintain_result_room_ownership()
+                outcome = await self.maintain_result_room_ownership()
                 await self.observe_reachability()
             except asyncio.CancelledError:
                 raise
@@ -714,7 +726,25 @@ class Node:
                 # This loop must outlive anything it touches. A renewal that raises is a
                 # renewal to retry, not a reason to stop renewing.
                 log.exception("ownership lease cycle failed", extra={"fields": {}})
-            await asyncio.sleep(self.OWNERSHIP_RENEWAL_SECONDS)
+
+            if outcome in ("renewed", "claimed"):
+                failures = 0
+                delay = self.OWNERSHIP_RENEWAL_SECONDS
+            elif outcome == "failed":
+                # Transient: an upstream 5xx, a rate limit, a contended nonce. Back off
+                # from seconds rather than sleeping through the window.
+                failures += 1
+                delay = min(
+                    self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
+                    self.OWNERSHIP_RENEWAL_SECONDS,
+                )
+            else:
+                # `owned_by_other` or `unclaimable`. Neither is fixed by asking again in a
+                # minute, and hammering somebody else's server over a state only they can
+                # change is its own fault.
+                failures = 0
+                delay = self.OWNERSHIP_RENEWAL_SECONDS
+            await asyncio.sleep(delay)
 
     async def run_mailbox(self) -> None:
         backoff = 1.0

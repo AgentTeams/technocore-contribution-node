@@ -307,3 +307,131 @@ def test_a_future_renewal_timestamp_is_not_reported_as_fresh(node: Node) -> None
     node.ledger.set_state("owned_room_renewed", "2099-01-01T00:00:00+00:00")
 
     assert node.availability()["ownership_lease"]["renewed_seconds_ago"] is None
+
+
+# ------------------------------------------------------ failing safely
+
+
+async def _nothing() -> None:
+    """A stand-in that does not itself sleep — the sleeps are what is being measured."""
+
+
+async def test_a_contended_nonce_is_retried_rather_than_treated_as_a_loss(
+    node: Node, upstream: Upstream
+) -> None:
+    """409 means the replay counter moved, not that the room is gone.
+
+    `/kv/room-nonce/<room>` is shared with the allow-list namespace and advances on every
+    accepted signed write, so it can pass the read before this write lands. Giving up on
+    a 409 would surrender a renewal to a race that a second, higher nonce settles.
+    """
+    real = upstream.handler
+    seen = {"n": 0}
+
+    def conflict_once(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.startswith("/kv/room-owners/"):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return httpx.Response(409, text="nonce not advancing")
+        return real(request)
+
+    node.client._http = httpx.AsyncClient(  # type: ignore[attr-defined]
+        transport=httpx.MockTransport(conflict_once), base_url="https://upstream.invalid"
+    )
+
+    assert await node.maintain_result_room_ownership() == "renewed"
+    assert seen["n"] == 2
+
+
+async def test_a_persistent_conflict_gives_up_without_claiming_a_renewal(
+    node: Node, upstream: Upstream
+) -> None:
+    """Two attempts, then hand it back. Reporting success here would hide the expiry."""
+
+    def always_conflict(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.startswith("/kv/room-owners/"):
+            return httpx.Response(409, text="nonce not advancing")
+        return upstream.handler(request)
+
+    node.client._http = httpx.AsyncClient(  # type: ignore[attr-defined]
+        transport=httpx.MockTransport(always_conflict), base_url="https://upstream.invalid"
+    )
+
+    assert await node.maintain_result_room_ownership() == "failed"
+    assert node.availability()["ownership_lease"]["renewed_at"] is None
+
+
+async def test_a_reclaim_resets_the_published_lease_age(node: Node, upstream: Upstream) -> None:
+    """A claim writes the same note a renewal writes, so it resets the same clock."""
+    upstream.owner = None
+
+    assert await node.maintain_result_room_ownership() == "claimed"
+
+    assert node.availability()["ownership_lease"]["renewed_at"] is not None
+
+
+async def test_a_failed_renewal_is_retried_in_seconds_not_hours(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixed cadence waited longest exactly when waiting was worst.
+
+    A node restarting on day six, whose first attempt met a 503, slept another six hours
+    — past the seven-day expiry — before trying again. The renewal runs on a schedule;
+    a failure has to run on a clock.
+    """
+    slept: list[float] = []
+    outcomes = iter(["failed", "failed", "renewed", "failed"])
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == 4:
+            raise asyncio.CancelledError
+
+    async def next_outcome() -> str:
+        return next(outcomes)
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", next_outcome)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    floor = Node.OWNERSHIP_RETRY_FLOOR_SECONDS
+    assert slept[0] == floor
+    assert slept[1] == floor * 2
+    # A success resets both the delay and the backoff, so the next failure starts over.
+    assert slept[2] == Node.OWNERSHIP_RENEWAL_SECONDS
+    assert slept[3] == floor
+
+
+async def test_a_state_only_the_upstream_can_change_is_not_hammered(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`owned_by_other` and `unclaimable` are not fixed by asking again in a minute."""
+    slept: list[float] = []
+    outcomes = iter(["owned_by_other", "unclaimable"])
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == 2:
+            raise asyncio.CancelledError
+
+    async def next_outcome() -> str:
+        return next(outcomes)
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", next_outcome)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    assert slept == [Node.OWNERSHIP_RENEWAL_SECONDS, Node.OWNERSHIP_RENEWAL_SECONDS]
+
+
+def test_the_backoff_can_never_exceed_the_renewal_interval() -> None:
+    """Doubling forever would reinvent the bug it exists to fix."""
+    floor, interval = Node.OWNERSHIP_RETRY_FLOOR_SECONDS, Node.OWNERSHIP_RENEWAL_SECONDS
+    for failures in range(1, 40):
+        assert min(floor * 2 ** (failures - 1), interval) <= interval

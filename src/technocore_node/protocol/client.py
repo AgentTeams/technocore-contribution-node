@@ -475,24 +475,37 @@ class TechnocoreClient:
             # maintenance loop and taking a stranger's room.
             return False
 
-        nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000))
-        payload = note_payload("room-owners", room, nonce, self.did)
-        response = await self._direct(
-            "POST",
-            f"/kv/room-owners/{quote(room, safe='')}",
-            json={
-                "value": self.did,
-                "did": self.did,
-                "sig": didkey.sign(self._key, payload),
-                "nonce": str(nonce),
-            },
-        )
-        if response.status_code == 403:
-            # Ownership changed between the read above and this write. Not an error, and
-            # not something to retry: the answer is that the room is no longer ours.
-            return False
-        self._check(response)
-        return True
+        # Two attempts, because a 409 here is a replay counter that moved, not a room
+        # that was lost. `/kv/room-nonce/<room>` is shared with the allow-list namespace
+        # and advances on every accepted signed write, so it can pass this read before
+        # the write lands. Each attempt reads the counter again and signs a fresh, higher
+        # nonce — a different request, not the same one resent.
+        for attempt in (1, 2):
+            nonce = max(await self.room_nonce(room) + 1, int(time.time() * 1000) + attempt)
+            payload = note_payload("room-owners", room, nonce, self.did)
+            response = await self._direct(
+                "POST",
+                f"/kv/room-owners/{quote(room, safe='')}",
+                json={
+                    "value": self.did,
+                    "did": self.did,
+                    "sig": didkey.sign(self._key, payload),
+                    "nonce": str(nonce),
+                },
+            )
+            if response.status_code == 403:
+                # Ownership changed between the read above and this write. Not an error,
+                # and not something to retry: the room is no longer ours.
+                return False
+            if response.status_code == 409 and attempt == 1:
+                continue
+            if response.status_code == 409:
+                # Still contended. The caller retries soon rather than waiting out a full
+                # renewal interval, so losing this one costs minutes, not the lease.
+                return False
+            self._check(response)
+            return True
+        return False
 
     async def room_owner(self, room: str) -> str | None:
         """Whoever owns `room`, or None when it is an ordinary open room."""
