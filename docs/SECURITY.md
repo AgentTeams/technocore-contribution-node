@@ -121,7 +121,23 @@ by a different road.
 So the gate closes after 24 hours without a successful renewal: four missed attempts, and
 six days clear of the upstream's deletion. Early enough that somebody can still fix it,
 late enough that a bad afternoon does not stop the node. `/v1/info` reports it as a
-`stop_reason` like any other, and `ownership_lease.renewed_seconds_ago` alongside.
+`stop_reason` like any other, and `ownership_lease` alongside.
+
+**Two signals, because each covers the other's blind spot.** The age catches a loop that
+stopped — cancelled, crashed, never started — where no failure is ever recorded. A count
+of consecutive failures catches what the age cannot see: an age is a subtraction from
+`now`, so a clock moved backwards, a ledger restored from a backup, or a row edited by
+hand all make a dead lease look freshly renewed. A count cannot be walked back by changing
+the time. Either signal closes the gate; a successful renewal clears both.
+
+**And the same condition guards the sink, not only the gate.** `owns_result_room()` is
+checked independently by `publish`, `publish_audit_copy` and `sync_owned_room`, and
+`reconcile_audit_copies` deliberately runs even while intake is shut so that receipts owed
+from before a closure still land. While that guard asked only *who owns the room*, a node
+whose renewals had been failing for a week would have gone on writing audit copies right
+up to the sweep — and the first of them turns a room that could have been reclaimed into
+one with messages in it, which can never be claimed again. The 2026-08-28 accident,
+produced by the machinery built to prevent it.
 
 **The gate is separate from the status report on purpose.** `v0.1.1` had `availability()`
 describing the node as unusable while the mailbox loop went on accepting work underneath

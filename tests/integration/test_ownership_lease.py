@@ -513,3 +513,78 @@ def test_a_room_owned_by_another_key_reports_that_first(node: Node) -> None:
 
     assert any("owned by another key" in r for r in reasons)
     assert not any("lease" in r for r in reasons)
+
+
+# ----------------------------------------------------- the sink, too
+
+
+async def test_a_dead_lease_stops_the_write_itself_not_only_the_gate(
+    node: Node, upstream: Upstream
+) -> None:
+    """`reconcile_audit_copies` runs while the gate is shut. On purpose.
+
+    Receipts owed from before a closure are supposed to land once things recover, so the
+    audit publisher is deliberately not behind the intake gate. Its guard is
+    `owns_result_room()` — and while that checked only who owns the room, a node whose
+    renewals had been failing for a week would have gone on writing audit copies right up
+    to the sweep. The first of them turns a room that could have been reclaimed into one
+    with messages in it, which can never be claimed again.
+    """
+    _owned_and_renewed(node, utcnow())
+    assert node.owns_result_room() is True
+
+    stale = (
+        datetime.now(UTC) - timedelta(seconds=Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS + 60)
+    ).isoformat()
+    node.ledger.set_state("owned_room_renewed", stale)
+
+    assert node.owns_result_room() is False
+    assert await node.publish(node.result_room, {"type": "receipt"}) is None
+    assert await node.publish_audit_copy("job-1", {"type": "receipt", "job_id": "job-1"}) is None
+    assert await node.sync_owned_room() == 0
+
+
+async def test_a_failure_streak_stops_the_write_even_with_a_fresh_timestamp(
+    node: Node, upstream: Upstream
+) -> None:
+    """The clock-independent half. An age is a subtraction from `now`.
+
+    A clock moved backwards — or a ledger restored, or a row edited — makes a stale lease
+    look freshly renewed, and every check built on that timestamp opens again. A count of
+    consecutive failures cannot be walked back by changing the time.
+    """
+    _owned_and_renewed(node, utcnow())
+    node.ledger.set_state(
+        "owned_room_renewal_failures", str(Node.OWNERSHIP_MAX_CONSECUTIVE_FAILURES)
+    )
+
+    assert node.owns_result_room() is False
+    assert node.safety_state()[0] is False
+    assert any("times in a row" in r for r in node.safety_state()[1])
+    assert await node.publish_audit_copy("job-2", {"type": "receipt", "job_id": "job-2"}) is None
+
+
+async def test_a_successful_renewal_clears_the_streak(node: Node, upstream: Upstream) -> None:
+    """Otherwise one bad week would shut the node permanently."""
+    node.ledger.set_state("owned_room_renewal_failures", "9")
+
+    assert await node.maintain_result_room_ownership() == "renewed"
+
+    assert node.ledger.get_state("owned_room_renewal_failures")[0] == "0"
+    assert node.availability()["ownership_lease"]["consecutive_failures"] == 0
+    assert node.availability()["ownership_lease"]["live"] is True
+
+
+async def test_every_failing_path_counts(node: Node, upstream: Upstream) -> None:
+    """A failure that is not counted is a failure the clock-independent check cannot see."""
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    node.client._http = httpx.AsyncClient(  # type: ignore[attr-defined]
+        transport=httpx.MockTransport(unavailable), base_url="https://upstream.invalid"
+    )
+
+    for expected in range(1, 4):
+        assert await node.maintain_result_room_ownership() == "failed"
+        assert node.ledger.get_state("owned_room_renewal_failures")[0] == str(expected)

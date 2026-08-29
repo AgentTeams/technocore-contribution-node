@@ -33,6 +33,16 @@ Without this change it would have been lost again by 2026-09-05.
 - **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
   ownership note and never to the room. Writing to the room is what made it unclaimable
   the first time. A room that can no longer be claimed is reported and left alone.
+- **The lease guards the write, not only the gate.** `owns_result_room()` is checked
+  independently by `publish`, `publish_audit_copy` and `sync_owned_room`, and
+  `reconcile_audit_copies` runs even while intake is shut so receipts owed from before a
+  closure still land. Asking only who owns the room would have let a node whose renewals
+  had failed for a week keep writing audit copies until the sweep — and the first turns a
+  reclaimable room into one with messages in it, which can never be claimed again.
+- **A failure count as well as an age.** An age is a subtraction from `now`, so a clock
+  moved backwards, a restored ledger or an edited row makes a dead lease look fresh. The
+  count cannot be walked back by changing the time; the age catches a loop that stopped
+  and recorded nothing. Either closes the gate, a renewal clears both.
 - **The lease age is a gate condition.** The gate closes after 24 hours without a
   successful renewal — four missed attempts, six days clear of the upstream's deletion.
   Publishing the number and stopping there would have repeated the `v0.1.1` mistake this

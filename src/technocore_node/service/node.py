@@ -638,10 +638,60 @@ class Node:
     #: will still be ours when a receipt published today is read tomorrow.
     OWNERSHIP_LEASE_MAX_AGE_SECONDS = 24 * 3600
 
+    #: Consecutive renewal failures after which the lease is treated as dead, whatever
+    #: the clock says. With the backoff above, this many failures is roughly a day of
+    #: trying — but the point is that it is *counted*, not timed: an age is a subtraction
+    #: from `now`, and a clock moved backwards makes a stale lease look fresh. A count
+    #: cannot be walked back by changing the time.
+    OWNERSHIP_MAX_CONSECUTIVE_FAILURES = 12
+
+    def _lease_is_live(self) -> tuple[bool, str | None]:
+        """Whether the ownership lease is being kept, and why not when it is not.
+
+        Two signals, because each covers the other's blind spot. The age catches a loop
+        that stopped — cancelled, crashed, never started — where no failure is ever
+        recorded. The failure count catches everything the age cannot see: a clock moved
+        backwards, a ledger restored from a backup, a timestamp edited by hand. Either
+        one closes the gate.
+        """
+        failures = self.ledger.get_state("owned_room_renewal_failures")[0]
+        streak = int(failures) if failures and failures.isdigit() else 0
+        if streak >= self.OWNERSHIP_MAX_CONSECUTIVE_FAILURES:
+            return False, (
+                f"the result room ownership lease has failed to renew {streak} times in a "
+                f"row; upstream deletes an unwritten note after "
+                f"{self.UPSTREAM_NOTE_RETENTION_SECONDS}s"
+            )
+
+        age = self._age_of(self.ledger.get_state("owned_room_renewed")[0])
+        if age is None:
+            return False, (
+                "the result room ownership lease has never been renewed by this node, "
+                "so there is no evidence it will still hold"
+            )
+        if age > self.OWNERSHIP_LEASE_MAX_AGE_SECONDS:
+            return False, (
+                f"the result room ownership lease was last renewed {age}s ago "
+                f"(limit {self.OWNERSHIP_LEASE_MAX_AGE_SECONDS}s); upstream deletes an "
+                f"unwritten note after {self.UPSTREAM_NOTE_RETENTION_SECONDS}s, so the "
+                "room is on its way to being lost"
+            )
+        return True, None
+
     #: What the upstream publishes as `retention_seconds`. Recorded so the cadence above
     #: can be checked against it rather than against a remembered number, and so the
     #: reported lease age means something to a reader who does not know the rule.
     UPSTREAM_NOTE_RETENTION_SECONDS = 7 * 24 * 3600
+
+    def _record_lease_outcome(self, *, renewed: bool) -> None:
+        """One place where both lease signals are written, so they cannot disagree."""
+        if renewed:
+            self.ledger.set_state("owned_room_renewed", utcnow())
+            self.ledger.set_state("owned_room_renewal_failures", "0")
+            return
+        previous = self.ledger.get_state("owned_room_renewal_failures")[0]
+        streak = int(previous) + 1 if previous and previous.isdigit() else 1
+        self.ledger.set_state("owned_room_renewal_failures", str(streak))
 
     async def maintain_result_room_ownership(self) -> str:
         """Renew, or recover, this node's claim on the result room. One cycle.
@@ -662,6 +712,7 @@ class Node:
                 "could not read result room ownership",
                 extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
             )
+            self._record_lease_outcome(renewed=False)
             return "failed"
 
         if owner == self.did:
@@ -672,11 +723,13 @@ class Node:
                     "ownership renewal failed",
                     extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
                 )
+                self._record_lease_outcome(renewed=False)
                 return "failed"
             if renewed:
-                self.ledger.set_state("owned_room_renewed", utcnow())
+                self._record_lease_outcome(renewed=True)
                 log.info("ownership lease renewed", extra={"fields": {"room": self.result_room}})
                 return "renewed"
+            self._record_lease_outcome(renewed=False)
             return "failed"
 
         if owner is not None:
@@ -700,12 +753,13 @@ class Node:
                 "reclaim failed",
                 extra={"fields": {"room": self.result_room, "error": str(exc)[:200]}},
             )
+            self._record_lease_outcome(renewed=False)
             return "failed"
         if claimed:
             # A claim is a successful write to the same note a renewal writes, so it
             # resets the same clock. Recording only renewals would leave the published
             # lease age reading `null` on a node that had just recovered the room.
-            self.ledger.set_state("owned_room_renewed", utcnow())
+            self._record_lease_outcome(renewed=True)
             log.warning(
                 "the ownership lease had lapsed and was reclaimed",
                 extra={"fields": {"room": self.result_room}},
@@ -872,22 +926,12 @@ class Node:
                 "cannot publish an auditable record there"
             )
 
-        lease_age = self._age_of(self.ledger.get_state("owned_room_renewed")[0])
         if not reasons:
             # Only when ownership itself checked out: a room that is not ours has a more
             # immediate problem than an unrenewed lease, and saying both would bury it.
-            if lease_age is None:
-                reasons.append(
-                    "the result room ownership lease has never been renewed by this node, "
-                    "so there is no evidence it will still hold"
-                )
-            elif lease_age > self.OWNERSHIP_LEASE_MAX_AGE_SECONDS:
-                reasons.append(
-                    f"the result room ownership lease was last renewed {lease_age}s ago "
-                    f"(limit {self.OWNERSHIP_LEASE_MAX_AGE_SECONDS}s); upstream deletes an "
-                    f"unwritten note after {self.UPSTREAM_NOTE_RETENTION_SECONDS}s, so the "
-                    "room is on its way to being lost"
-                )
+            live, why = self._lease_is_live()
+            if not live and why:
+                reasons.append(why)
 
         if not self.settings.public_url:
             reasons.append("no public URL is configured, so a requester cannot verify a receipt")
@@ -908,16 +952,27 @@ class Node:
         return self.safety_state()[0]
 
     def owns_result_room(self) -> bool:
-        """Confirmed, from a successful read, that the result room is this node's.
+        """Confirmed ours, from a recent read, and on a lease this node is still keeping.
 
         Deliberately independent of :meth:`can_accept_third_party_jobs`: a write to the
-        audit room must be refused on the ownership fact alone, whatever else is or is
-        not true, and whichever caller thought it had already checked.
+        audit room must be refused on the room's own facts, whatever else is or is not
+        true, and whichever caller thought it had already checked.
+
+        The lease belongs here and not only in the gate. This is the sink — `publish`,
+        `publish_audit_copy` and `sync_owned_room` all end at it — and
+        `reconcile_audit_copies` runs even while the gate is shut, by design, so that
+        receipts owed from before a closure still land. Without the lease check, a node
+        whose renewals had been failing for a week would keep writing audit copies into
+        the room right up to the sweep, and the first of them would turn a room it could
+        have reclaimed into one with messages in it, which can never be claimed again.
+        That is the accident of 2026-08-28, produced by the machinery meant to prevent it.
         """
         owner, observed, owner_err, age = self._ownership_observation()
-        return (
+        if not (
             bool(observed) and not owner_err and owner == self.did and self._ownership_is_fresh(age)
-        )
+        ):
+            return False
+        return self._lease_is_live()[0]
 
     def availability(self) -> dict[str, Any]:
         """What this node can honestly say about being reachable, and on what evidence.
@@ -955,6 +1010,7 @@ class Node:
             intake = "unverified"
 
         renewed_at, _ = self.ledger.get_state("owned_room_renewed")
+        failures, _ = self.ledger.get_state("owned_room_renewal_failures")
         return {
             "third_party_intake": intake,
             # The lease, not just the ownership. A room that is ours today and whose
@@ -963,6 +1019,8 @@ class Node:
             "ownership_lease": {
                 "renewed_at": renewed_at,
                 "renewed_seconds_ago": self._age_of(renewed_at),
+                "consecutive_failures": int(failures) if failures and failures.isdigit() else 0,
+                "live": self._lease_is_live()[0],
                 "upstream_expiry_seconds": self.UPSTREAM_NOTE_RETENTION_SECONDS,
                 "note": (
                     "Ownership upstream is a note, and a note with no write for "
