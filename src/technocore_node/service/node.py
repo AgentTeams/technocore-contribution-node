@@ -623,6 +623,15 @@ class Node:
     #: trying again. The lease is renewed on a schedule; a failure is retried on a clock.
     OWNERSHIP_RETRY_FLOOR_SECONDS = 60
 
+    #: How often ownership is re-observed, as opposed to renewed. Two different jobs on
+    #: two different clocks: a renewal is a write, and six hours between them is right
+    #: against a seven-day expiry — but `OWNERSHIP_MAX_AGE_SECONDS` expires an observation
+    #: in fifteen minutes, so a loop that only looked when it wrote left the gate reading
+    #: "stale" for the other five and three-quarter hours. Harmless while the mailbox loop
+    #: is running, because that observes every cycle. Fatal to an HTTP-only node, which
+    #: has no such loop and would refuse almost every request for want of a fresh look.
+    OWNERSHIP_OBSERVATION_SECONDS = 300
+
     #: How stale the lease may be before the gate closes. Four missed renewals, and six
     #: days clear of the upstream's expiry — long enough that a bad afternoon does not
     #: stop the node, short enough that there is a week to notice.
@@ -805,10 +814,34 @@ class Node:
         room is lost precisely while the node is being careful.
         """
         failures = 0
+        until_renewal = 0.0
         while True:
-            outcome = "failed"
             try:
-                outcome = await self.maintain_result_room_ownership()
+                if until_renewal <= 0:
+                    outcome = await self.maintain_result_room_ownership()
+                    if outcome in ("renewed", "claimed"):
+                        failures = 0
+                        until_renewal = self.OWNERSHIP_RENEWAL_SECONDS
+                    elif outcome == "failed":
+                        # Transient: an upstream 5xx, a rate limit, a contended nonce.
+                        # Back off from seconds rather than sleeping through the window.
+                        failures += 1
+                        until_renewal = min(
+                            self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
+                            self.OWNERSHIP_RENEWAL_SECONDS,
+                        )
+                    else:
+                        # `owned_by_other` or `unclaimable`. Neither is fixed by asking
+                        # again in a minute, and hammering somebody else's server over a
+                        # state only they can change is its own fault.
+                        failures = 0
+                        until_renewal = self.OWNERSHIP_RENEWAL_SECONDS
+
+                # Every cycle, not only the ones that renew. The gate reads an observation
+                # that expires in minutes; the renewal writes on a schedule measured in
+                # hours. Tying the two together left the gate stale between renewals — a
+                # non-issue while the mailbox loop is observing anyway, and the difference
+                # between working and not for a node that runs the HTTP lane alone.
                 await self.observe_reachability()
             except asyncio.CancelledError:
                 raise
@@ -816,25 +849,16 @@ class Node:
                 # This loop must outlive anything it touches. A renewal that raises is a
                 # renewal to retry, not a reason to stop renewing.
                 log.exception("ownership lease cycle failed", extra={"fields": {}})
+                if until_renewal <= 0:
+                    failures += 1
+                    until_renewal = min(
+                        self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
+                        self.OWNERSHIP_RENEWAL_SECONDS,
+                    )
 
-            if outcome in ("renewed", "claimed"):
-                failures = 0
-                delay = self.OWNERSHIP_RENEWAL_SECONDS
-            elif outcome == "failed":
-                # Transient: an upstream 5xx, a rate limit, a contended nonce. Back off
-                # from seconds rather than sleeping through the window.
-                failures += 1
-                delay = min(
-                    self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
-                    self.OWNERSHIP_RENEWAL_SECONDS,
-                )
-            else:
-                # `owned_by_other` or `unclaimable`. Neither is fixed by asking again in a
-                # minute, and hammering somebody else's server over a state only they can
-                # change is its own fault.
-                failures = 0
-                delay = self.OWNERSHIP_RENEWAL_SECONDS
-            await asyncio.sleep(delay)
+            step = min(self.OWNERSHIP_OBSERVATION_SECONDS, max(until_renewal, 1.0))
+            await asyncio.sleep(step)
+            until_renewal -= step
 
     async def run_mailbox(self) -> None:
         backoff = 1.0

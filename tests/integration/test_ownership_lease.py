@@ -372,6 +372,43 @@ async def test_a_reclaim_resets_the_published_lease_age(node: Node, upstream: Up
     assert node.availability()["ownership_lease"]["renewed_at"] is not None
 
 
+async def _drive(
+    node: Node, monkeypatch: pytest.MonkeyPatch, outcomes: list[str], cycles: float
+) -> list[float]:
+    """Run the lease loop for `cycles` sleeps, returning the gap before each renewal.
+
+    Sleeps are now observation-sized, so the interesting number is not any one of them —
+    it is how much time passes between one renewal attempt and the next.
+    """
+    slept: list[float] = []
+    gaps: list[float] = []
+    since = 0.0
+    pending = iter(outcomes)
+
+    async def record(seconds: float) -> None:
+        nonlocal since
+        slept.append(seconds)
+        since += seconds
+        if len(slept) >= cycles:
+            raise asyncio.CancelledError
+
+    async def renew() -> str:
+        nonlocal since
+        gaps.append(since)
+        since = 0.0
+        return next(pending)
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", renew)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    assert max(slept) <= Node.OWNERSHIP_OBSERVATION_SECONDS
+    return gaps
+
+
 async def test_a_failed_renewal_is_retried_in_seconds_not_hours(
     node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -381,55 +418,68 @@ async def test_a_failed_renewal_is_retried_in_seconds_not_hours(
     — past the seven-day expiry — before trying again. The renewal runs on a schedule;
     a failure has to run on a clock.
     """
+    floor = Node.OWNERSHIP_RETRY_FLOOR_SECONDS
+    # Enough cycles to cross a full renewal interval in observation-sized steps, so the
+    # reset after the success is observed rather than assumed.
+    cycles = 4 + Node.OWNERSHIP_RENEWAL_SECONDS // Node.OWNERSHIP_OBSERVATION_SECONDS
+    gaps = await _drive(node, monkeypatch, ["failed", "failed", "renewed", "failed"], cycles)
+
+    assert gaps[0] == 0  # the first attempt is immediate, on startup
+    assert gaps[1] == floor
+    assert gaps[2] == floor * 2
+    # A success resets both the delay and the backoff, so the next failure starts over.
+    assert gaps[3] == Node.OWNERSHIP_RENEWAL_SECONDS
+
+
+async def test_ownership_is_observed_far_more_often_than_it_is_renewed(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two jobs, two clocks. Tying them together broke the lane this release exists for.
+
+    A renewal is a write, and six hours between them is right against a seven-day expiry.
+    An observation expires in fifteen minutes. A loop that only looked when it wrote left
+    the gate reading `stale` for the rest of the interval — harmless while the mailbox
+    loop is observing anyway, and the difference between working and not for a node
+    running the HTTP lane alone, which has no such loop.
+    """
+    looks = 0
+
+    async def observe() -> None:
+        nonlocal looks
+        looks += 1
+
     slept: list[float] = []
-    outcomes = iter(["failed", "failed", "renewed", "failed"])
 
     async def record(seconds: float) -> None:
         slept.append(seconds)
-        if len(slept) == 4:
+        if len(slept) >= 12:
             raise asyncio.CancelledError
 
-    async def next_outcome() -> str:
-        return next(outcomes)
+    async def renew() -> str:
+        return "renewed"
 
     monkeypatch.setattr(asyncio, "sleep", record)
-    monkeypatch.setattr(node, "maintain_result_room_ownership", next_outcome)
-    monkeypatch.setattr(node, "observe_reachability", _nothing)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", renew)
+    monkeypatch.setattr(node, "observe_reachability", observe)
 
     with pytest.raises(asyncio.CancelledError):
         await node.run_ownership_lease()
 
-    floor = Node.OWNERSHIP_RETRY_FLOOR_SECONDS
-    assert slept[0] == floor
-    assert slept[1] == floor * 2
-    # A success resets both the delay and the backoff, so the next failure starts over.
-    assert slept[2] == Node.OWNERSHIP_RENEWAL_SECONDS
-    assert slept[3] == floor
+    assert looks == 12
+    assert max(slept) <= Node.OWNERSHIP_OBSERVATION_SECONDS
+    # The observation interval must leave the gate's freshness limit real room, or the
+    # gate closes between two consecutive looks and the loop is decorative.
+    assert Node.OWNERSHIP_OBSERVATION_SECONDS * 2 <= Node.OWNERSHIP_MAX_AGE_SECONDS
 
 
 async def test_a_state_only_the_upstream_can_change_is_not_hammered(
     node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`owned_by_other` and `unclaimable` are not fixed by asking again in a minute."""
-    slept: list[float] = []
-    outcomes = iter(["owned_by_other", "unclaimable"])
+    cycles = 2 + Node.OWNERSHIP_RENEWAL_SECONDS // Node.OWNERSHIP_OBSERVATION_SECONDS
+    gaps = await _drive(node, monkeypatch, ["owned_by_other", "unclaimable"], cycles)
 
-    async def record(seconds: float) -> None:
-        slept.append(seconds)
-        if len(slept) == 2:
-            raise asyncio.CancelledError
-
-    async def next_outcome() -> str:
-        return next(outcomes)
-
-    monkeypatch.setattr(asyncio, "sleep", record)
-    monkeypatch.setattr(node, "maintain_result_room_ownership", next_outcome)
-    monkeypatch.setattr(node, "observe_reachability", _nothing)
-
-    with pytest.raises(asyncio.CancelledError):
-        await node.run_ownership_lease()
-
-    assert slept == [Node.OWNERSHIP_RENEWAL_SECONDS, Node.OWNERSHIP_RENEWAL_SECONDS]
+    assert gaps[1] == Node.OWNERSHIP_RENEWAL_SECONDS
 
 
 def test_the_backoff_can_never_exceed_the_renewal_interval() -> None:
