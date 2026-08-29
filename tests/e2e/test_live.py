@@ -546,7 +546,7 @@ async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
         ledger=ledger,
     )
     try:
-        assert await node.client.claim_room(node.result_room) is True
+        assert await node.claim_result_room() is True
         # The gate does not take a claim's word for it: ownership has to be confirmed by
         # a read before the node will do work for anyone. This is the real sequence an
         # operator follows, so the test follows it too.
@@ -620,7 +620,7 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
         ledger=ledger,
     )
     try:
-        await node.client.claim_room(node.result_room)
+        await node.claim_result_room()
         await node.observe_reachability()
         requester_key = Ed25519PrivateKey.generate()
         await node.process_message(
@@ -679,7 +679,7 @@ async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
         ledger=ledger,
     )
     try:
-        assert await node.client.claim_room(node.result_room) is True
+        assert await node.claim_result_room() is True
         # The gate does not take a claim's word for it: ownership has to be confirmed by
         # a read before the node will do work for anyone. This is the real sequence an
         # operator follows, so the test follows it too.
@@ -771,7 +771,7 @@ async def test_27_a_copy_that_landed_before_a_crash_is_not_published_twice(
         ledger=ledger,
     )
     try:
-        assert await node.client.claim_room(node.result_room) is True
+        assert await node.claim_result_room() is True
         # The gate does not take a claim's word for it: ownership has to be confirmed by
         # a read before the node will do work for anyone. This is the real sequence an
         # operator follows, so the test follows it too.

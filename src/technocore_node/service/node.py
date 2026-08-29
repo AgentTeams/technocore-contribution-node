@@ -710,6 +710,20 @@ class Node:
         streak = int(previous) + 1 if previous and previous.isdigit() else 1
         self.ledger.set_state("owned_room_renewal_failures", str(streak))
 
+    async def claim_result_room(self) -> bool:
+        """Claim the result room and start its lease, as one step.
+
+        The two belong together and were briefly separable, which cost a P0 in review and
+        a broken recovery command before that: a claim that is not recorded leaves the
+        sink guard refusing writes to a room this node has just taken, and every caller
+        that claims has to remember a second call to avoid it. Callers that claim the
+        result room should use this rather than reaching for the client.
+        """
+        claimed = await self.client.claim_room(self.result_room)
+        if claimed:
+            self.record_lease_outcome(self.result_room, renewed=True)
+        return claimed
+
     async def maintain_result_room_ownership(self) -> str:
         """Renew, or recover, this node's claim on the result room. One cycle.
 
@@ -764,7 +778,7 @@ class Node:
         # `claim_room` carries `if_absent`, so it refuses rather than overwrites if
         # somebody claimed it a moment ago.
         try:
-            claimed = await self.client.claim_room(self.result_room)
+            claimed = await self.claim_result_room()
         except TechnocoreError as exc:
             log.warning(
                 "reclaim failed",
@@ -773,10 +787,8 @@ class Node:
             self.record_lease_outcome(self.result_room, renewed=False)
             return "failed"
         if claimed:
-            # A claim is a successful write to the same note a renewal writes, so it
-            # resets the same clock. Recording only renewals would leave the published
-            # lease age reading `null` on a node that had just recovered the room.
-            self.record_lease_outcome(self.result_room, renewed=True)
+            # The lease was started by `claim_result_room`: a claim is a successful write
+            # to the same note a renewal writes, and resets the same clock.
             log.warning(
                 "the ownership lease had lapsed and was reclaimed",
                 extra={"fields": {"room": self.result_room}},

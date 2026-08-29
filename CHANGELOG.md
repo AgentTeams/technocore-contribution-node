@@ -33,6 +33,11 @@ Without this change it would have been lost again by 2026-09-05.
 - **A lapsed lease is reclaimed**, through `claim_room`, which writes only to the
   ownership note and never to the room. Writing to the room is what made it unclaimable
   the first time. A room that can no longer be claimed is reported and left alone.
+- **The live suite claimed the room without starting its lease**, so requiring a live
+  lease at the sink broke three of its tests — visible only in CI, which is where that
+  suite runs. `Node.claim_result_room()` now does both as one step, and the callers that
+  claim the result room use it instead of reaching for the client: the two belong
+  together, and having them separable had already cost a P0 and a broken recovery command.
 - **Claiming an unrelated room started the result room's lease.** `claim-room` takes
   whichever `d-` room it is given, and the lease outcome was recorded without naming one —
   so claiming any free room marked the result room's lease live, and the sink guard, newly

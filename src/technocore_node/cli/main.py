@@ -314,12 +314,10 @@ def cmd_recover_result_room(args: argparse.Namespace) -> int:
             # One attempt. Never retried: a claim carries a signed nonce, and resending it
             # after an ambiguous reply is how one intent becomes two writes.
             try:
-                claimed = await node.client.claim_room(node.result_room)
-                if claimed:
-                    # The lease starts now. Without this the attest step below is refused
-                    # by this node's own sink guard, which requires a live lease and would
-                    # have no record of the write that just succeeded.
-                    node.record_lease_outcome(node.result_room, renewed=True)
+                # Claims and starts the lease together. Separately, the attest step below
+                # is refused by this node's own sink guard, which requires a live lease
+                # and would have no record of the write that just succeeded.
+                claimed = await node.claim_result_room()
                 step("claim", ok=True, accepted=claimed)
             except TechnocoreError as exc:
                 step(
