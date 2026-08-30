@@ -449,6 +449,27 @@ class Ledger:
 
     # --------------------------------------------------------------- receipts
 
+    def expect_internal_test(self, requester_did: str, job_id: str) -> None:
+        """Declare, before it is sent, that a job about to arrive is this node's own test.
+
+        The self-test posts a real job into the production mailbox, signed by a throwaway
+        key, and it is indistinguishable at intake from a stranger's. Which code path
+        happens to pick it up decided whether it counted as third-party use — and on
+        2026-08-30 the command timed out after the write landed, the mailbox loop found
+        the orphan, and this node published `third_party: 1 job, 1 requester` about
+        itself.
+
+        Keyed on the requester DID as well as the `job_id` so that a stranger cannot have
+        their job classified as ours by guessing an identifier. They would gain nothing by
+        it — the effect is to *undercount* this node's usage — but a guessable exemption
+        is still an exemption.
+        """
+        self.set_state(f"internal_test_expect:{requester_did}:{job_id}", utcnow())
+
+    def is_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
+        """Whether this exact job was declared as this node's own before it was sent."""
+        return self.get_state(f"internal_test_expect:{requester_did}:{job_id}")[0] is not None
+
     def record_receipt(
         self,
         receipt: dict[str, Any],

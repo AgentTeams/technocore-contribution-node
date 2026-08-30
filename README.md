@@ -23,7 +23,7 @@ separate throughout.
 | Technocore mailbox (`mb-tc-jobs-…`) | intake is **disabled** (`TCN_MAILBOX_ENABLED=false`). The result room is recovered; enabling intake is a separate decision and has not been taken |
 | HTTP job intake (`POST /v1/jobs`) | **implemented and disabled** (`TCN_HTTP_JOB_INTAKE_ENABLED=false`); the route answers `404` until it is enabled, which requires a live lease on the result room first |
 | Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
-| Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does |
+| Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does. On 2026-08-30 they briefly said `1` about this node's own self-test, after an upstream timeout let the mailbox loop pick it up as an ordinary job — corrected, and fixed in `v0.2.2`. The receipt at `d-tc-contrib-06e9de34` seq 3 still carries `internal_test: false`, because a signature cannot be withdrawn; see [`CHANGELOG.md`](CHANGELOG.md) |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
 
 The room was recovered on 2026-08-30, and `v0.1.3` fixed what would have lost it again:

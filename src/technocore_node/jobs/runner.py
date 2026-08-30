@@ -266,6 +266,12 @@ class JobRunner:
         internal_test: bool,
         started: datetime,
     ) -> Outcome | None:
+        if not internal_test and self.ledger.is_expected_internal_test(requester_did, job_id):
+            # Declared as this node's own before it was sent. Decided here, once, after
+            # the job_id is known — not by whichever caller happens to run it, which is
+            # what let a self-test be published as third-party use.
+            internal_test = True
+
         resuming = False
         owner = self.ledger.job_requester(job_id)
         if owner is not None:
