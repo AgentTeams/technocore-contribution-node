@@ -315,18 +315,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                     if seq is not None:
                         verifiable = True
-                    if publish_outcome == "refused_duplicate":
-                        # The upstream says this exact attestation is already in the room.
-                        # That is a presence, not a failure — and the only reason the read
-                        # above did not see it is that the read and the write disagree,
-                        # which is what happened on 2026-08-30.
-                        already_present = True
-                        verifiable = True
-                        log.info(
-                            "attestation already present; upstream refused the duplicate",
-                            extra={"fields": {"room": node.result_room}},
-                        )
-                    elif publish_outcome in ("refused_locally", "too_large", "bad_room"):
+                    if publish_outcome in ("refused_locally", "too_large", "bad_room"):
                         # Nothing left this machine. `publish_reporting` says so rather
                         # than this reading mutable state back and guessing, which can be
                         # wrong in both directions: ownership can lapse between a real

@@ -155,14 +155,20 @@ class Node:
 
         `published` — the server answered with a sequence.
         `refused_locally` / `too_large` / `bad_room` — nothing was sent.
-        `refused_duplicate` — the upstream says this exact text is already in the room.
-        `rate_limited` — the upstream refused it outright; it was not stored.
-        `unconfirmed` — a request went out and its fate is genuinely unknown.
+        `unconfirmed` — a request went out and its fate is not known.
 
-        The refusals are separated from `unconfirmed` because they are *not* unknown. An
-        earlier version folded them together, and a caller reporting "it may have landed"
-        would then have said so about a request that never left, or one the server
-        explicitly rejected.
+        Three states, because three is what this can actually tell apart. A version of
+        this returned `refused_duplicate` and `rate_limited` as well, on the reasoning
+        that the upstream's own refusals are answers rather than silences. They are not,
+        from here: `say_signed` POSTs and *then* reads the message back, so a 429 — or
+        anything else — raised by that read arrives after a write that may well have
+        succeeded. Reporting "the server declined to store it" would have described a
+        message that was stored.
+
+        A duplicate refusal was worse. It says an identical *text* was accepted recently,
+        counted by text and not by sender, so a stranger posting the same JSON produces
+        it — and it says nothing about whether this node's signed copy is in the room now.
+        Treating it as proof of presence made a claim anyone could arrange.
 
         Three of those collapse into `None`, and a caller that has to distinguish them
         was inferring which by re-reading mutable state afterwards. That is a guess, and
@@ -209,16 +215,6 @@ class Node:
         try:
             confirmation = await self.client.say_signed(room, text)
         except (RateLimited, DuplicateRefused, TechnocoreError) as exc:
-            # The upstream's own refusals are answers, not silences: a duplicate means it
-            # says this exact text is already there, and a rate limit means it declined to
-            # store it. Only an error that leaves the request's fate open is `unconfirmed`.
-            outcome = (
-                "refused_duplicate"
-                if isinstance(exc, DuplicateRefused)
-                else "rate_limited"
-                if isinstance(exc, RateLimited)
-                else "unconfirmed"
-            )
             # Keep the server's own words. When the reason a receipt cannot be published
             # is upstream capacity, that sentence is the most useful thing this node can
             # hand a reader asking whether it works — and it is observed rather than
@@ -240,10 +236,11 @@ class Node:
                     "fields": {"room": room, "type": obj.get("type"), "error": type(exc).__name__}
                 },
             )
-            # For `unconfirmed`, the request was made and whether it landed is not known
-            # from here: on 2026-08-30 a write reported as a 503 was in the room
-            # afterwards.
-            return None, outcome
+            # The request was made and whether it landed is not known from here. The POST
+            # is at the top of `say_signed` and the read-back is under it, so every error
+            # from this point on is ambiguous — and on 2026-08-30 a write reported as a
+            # 503 was in the room afterwards.
+            return None, "unconfirmed"
 
         if room in (self.result_room, self.mailbox):
             self.ledger.set_state(f"last_publish_error:{room}", None)

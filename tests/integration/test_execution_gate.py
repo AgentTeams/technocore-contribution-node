@@ -834,22 +834,23 @@ async def _publish_raising(node: Node, exc: Exception) -> tuple[int | None, str]
     return await node.publish_reporting("p-somewhere", {"type": "note"})
 
 
-async def test_an_upstream_refusal_is_not_reported_as_an_unknown_outcome(node: Node) -> None:
-    """The upstream's own answers are answers.
+async def test_every_error_after_the_post_is_unconfirmed_whatever_its_kind(node: Node) -> None:
+    """The upstream's refusals are not answers from here, because of where they arrive.
 
-    A duplicate refusal says this exact text is already in the room; a rate limit says it
-    declined to store it. Only an error that leaves the request's fate open is unknown,
-    and folding these in would have a caller say "it may have landed" about a request the
-    server answered definitively.
+    `say_signed` POSTs and *then* reads the message back, so a 429 raised by that read
+    comes after a write that may well have succeeded. An earlier version reported those
+    as `rate_limited`, meaning "not stored" — about a message that was stored.
+
+    A duplicate refusal was worse: it says an identical *text* was accepted recently,
+    counted by text and not by sender, so a stranger posting the same JSON produces it.
+    Reporting it as proof the attestation is present made a claim anyone could arrange.
     """
-    seq, outcome = await _publish_raising(node, DuplicateRefused("422 duplicate"))
-    assert (seq, outcome) == (None, "refused_duplicate")
-
-    seq, outcome = await _publish_raising(node, RateLimited(1.0, "429"))
-    assert (seq, outcome) == (None, "rate_limited")
-
-    seq, outcome = await _publish_raising(node, TechnocoreError("HTTP 503: Service Unavailable"))
-    assert (seq, outcome) == (None, "unconfirmed")
+    for exc in (
+        DuplicateRefused("422 duplicate"),
+        RateLimited(1.0, "429"),
+        TechnocoreError("HTTP 503: Service Unavailable"),
+    ):
+        assert await _publish_raising(node, exc) == (None, "unconfirmed"), exc
 
 
 async def test_a_room_name_the_client_would_reject_is_refused_before_sending(

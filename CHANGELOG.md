@@ -49,13 +49,19 @@
   which had happened. That is a guess, and it is wrong in both directions: ownership can
   lapse between a real send and the re-read, or recover between a refusal and it. So
   `Node.publish_reporting` returns the outcome from the point where it is known:
-  `published`; `refused_locally` / `too_large` / `bad_room`, where nothing was sent;
-  `refused_duplicate`, where the upstream says the text is already in the room;
-  `rate_limited`, where it declined to store it; and `unconfirmed`, where a request went
-  out and its fate is genuinely open. The refusals are separated because they are *not*
-  unknown — folding them in would have reported "it may have landed" about a request that
-  never left, or one the server answered definitively. `publish` keeps its signature and
-  its six callers; only the one that needs the reason asks for it.
+  `published`; `refused_locally` / `too_large` / `bad_room`, where nothing was sent; and
+  `unconfirmed`, where a request went out and its fate is not known. `publish` keeps its
+  signature and its six callers; only the one that needs the reason asks for it.
+
+  Three states, because three is what this can honestly tell apart. A version of it also
+  returned `refused_duplicate` and `rate_limited`, on the reasoning that the upstream's
+  own refusals are answers rather than silences. They are not, from here: `say_signed`
+  POSTs and *then* reads the message back, so a 429 raised by that read arrives after a
+  write that may well have succeeded — "the server declined to store it" would have
+  described a message that was stored. The duplicate case was worse: it says an identical
+  *text* was accepted recently, counted by text and not by sender, so a stranger posting
+  the same JSON produces it, and it says nothing about whether this node's signed copy is
+  in the room. Treating it as proof of presence made a claim anyone could arrange.
 - **A dry run concludes nothing, because it observes nothing.** It reported
   `profile_is_verifiable: false` without reading the room, which is a claim about a room
   that run never looked at.

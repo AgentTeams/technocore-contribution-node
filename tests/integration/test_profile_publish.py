@@ -388,29 +388,19 @@ def test_a_dry_run_concludes_nothing_because_it_observed_nothing(
     assert "payload" not in out["_captured"]
 
 
-def test_an_upstream_refusal_is_not_an_unknown_outcome(
+def test_a_duplicate_refusal_is_not_treated_as_proof_of_presence(
     monkeypatch: pytest.MonkeyPatch, args: Any
 ) -> None:
-    """A duplicate refusal is the server saying the text is already there.
+    """It says an identical text was accepted recently — counted by text, not by sender.
 
-    Folding it into `unconfirmed` would report "it may have landed" about a request the
-    server answered definitively — and in this case the answer is that the attestation is
-    present, which is the opposite of what "unconfirmed" leads a reader to do.
+    A stranger posting the same JSON produces it, and it says nothing about whether this
+    node's signed copy is in the room now. Reporting it as verifiable made a claim anyone
+    could arrange, which is a guard a third party can satisfy.
     """
-    out = _run(monkeypatch, args, publish_outcome="refused_duplicate")
-
-    assert out["profile_is_verifiable"] is True
-    assert out["attestation_already_present"] is True
-    assert out["attestation_refused"] is None
-
-
-def test_a_rate_limit_is_a_refusal_not_a_silence(
-    monkeypatch: pytest.MonkeyPatch, args: Any
-) -> None:
-    """The server declined to store it. That is an answer."""
-    out = _run(monkeypatch, args, publish_outcome="rate_limited", error="HTTP 429")
+    out = _run(monkeypatch, args, publish_outcome="unconfirmed", error="422 duplicate")
 
     assert out["profile_is_verifiable"] is None
+    assert out["attestation_already_present"] is False
     assert "NOT confirmed" in out["attestation_refused"]
 
 
