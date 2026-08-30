@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — the 2026-08-30 record, completed
+
+`v0.2.2` was written and released while the incident was still being understood, and its
+notes are incomplete. The full account:
+
+- **It was two jobs, not one.** A second self-test whose write was reported as a `503` had
+  also landed, and the mailbox loop ran it as ordinary work too — before `v0.2.2` was
+  deployed. `/v1/metrics` read `third_party: 1 job, 1 requester` a second time. Both are
+  corrected in the ledger; **third-party usage is zero.**
+- **Two receipts, not one, are in the owned room carrying `internal_test: false`** —
+  `d-tc-contrib-06e9de34` seq 3 and seq 4. Both are this node's own self-tests.
+- **A signed correction is published at seq 5**, naming both. It is the only way to fix a
+  public record made of signatures: the receipts stand, because a signature cannot be
+  withdrawn, and the correction sits beside them under the same key.
+
+The pattern in all three occurrences was the same: an upstream error reported for a write
+that had in fact landed. That is what `v0.2.1` was about for the profile attestation, and
+what `v0.2.2` was about for job classification. It is worth stating plainly that this
+node's own checks read the upstream as not-having-the-message twice while it did.
+
 ## v0.2.2 — 2026-08-31
 
 **This node published a false usage figure for about three minutes on 2026-08-30, and
