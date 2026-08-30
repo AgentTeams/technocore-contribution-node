@@ -43,6 +43,14 @@ the pieces are assembled and running.
   `unclaimable`, where only the upstream can change anything, and which by definition
   records no renewal — looked overdue on every cycle, so the node would have written to
   somebody else's server every five minutes rather than every six hours.
+- **The wait ends on whichever deadline is nearer**, which is what the pair is for. The
+  sleep read only the monotonic one, so the wall-clock arm was noticed at the top of the
+  next cycle instead — within an observation interval, harmless at this cadence, and
+  still not what the docstring said. A docstring that overstates a safety property is how
+  the next person comes to rely on one that is not there.
+- **The backoff counter stops at its ceiling.** Past that point another doubling changes
+  no behaviour, and a number that only goes up is one nobody can reason about a week into
+  an outage.
 - **The renewal and the observation have a `try` each.** They had one between them, and
   a failed look pushed out a renewal it has nothing to do with. Worse, the handler
   re-read the ledger that had just raised, which raised again out of the handler and

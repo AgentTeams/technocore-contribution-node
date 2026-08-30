@@ -636,6 +636,11 @@ class Node:
     #: has no such loop and would refuse almost every request for want of a fresh look.
     OWNERSHIP_OBSERVATION_SECONDS = 300
 
+    #: Where the renewal backoff stops doubling. Chosen so the delay reaches the renewal
+    #: interval; counting past it changes no behaviour and only produces a number that
+    #: grows without bound through a long outage.
+    _MAX_BACKOFF_DOUBLINGS = 12
+
     #: How stale the lease may be before the gate closes. Four missed renewals, and six
     #: days clear of the upstream's expiry — long enough that a bad afternoon does not
     #: stop the node, short enough that there is a week to notice.
@@ -851,8 +856,11 @@ class Node:
                     delay: float = self.OWNERSHIP_RENEWAL_SECONDS
                 elif outcome == "failed":
                     # Transient: an upstream 5xx, a rate limit, a contended nonce. Back
-                    # off from seconds rather than sleeping through the window.
-                    failures += 1
+                    # off from seconds rather than sleeping through the window. The count
+                    # stops at the ceiling rather than climbing forever: past that point
+                    # it changes nothing, and a counter that only goes up is a number
+                    # nobody can reason about a week into an outage.
+                    failures = min(failures + 1, self._MAX_BACKOFF_DOUBLINGS)
                     delay = min(
                         self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
                         self.OWNERSHIP_RENEWAL_SECONDS,
@@ -877,13 +885,20 @@ class Node:
             except Exception:
                 log.exception("ownership observation failed", extra={"fields": {}})
 
-            # Recomputed from the deadline rather than by subtracting the sleep that was
+            # Recomputed from the deadlines rather than by subtracting the sleep that was
             # asked for. They are not the same number: a stalled loop returns from
             # `sleep(300)` long after 300 seconds, and a counter that only ever loses 300
             # would go on believing hours remain while the lease expired underneath it.
-            await asyncio.sleep(
-                min(self.OWNERSHIP_OBSERVATION_SECONDS, max(mono_due - loop.time(), 1.0))
+            #
+            # Both deadlines, not just the monotonic one. Waking on whichever is nearer is
+            # the promise made above; sleeping on `mono_due` alone would keep it only to
+            # within an observation interval, and a docstring that overstates a safety
+            # property is how the next person comes to rely on one that is not there.
+            remaining = min(
+                mono_due - loop.time(),
+                (wall_due - datetime.now(UTC)).total_seconds(),
             )
+            await asyncio.sleep(min(self.OWNERSHIP_OBSERVATION_SECONDS, max(remaining, 1.0)))
 
     async def run_mailbox(self) -> None:
         backoff = 1.0
