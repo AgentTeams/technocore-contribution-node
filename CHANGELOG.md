@@ -31,12 +31,23 @@ the pieces are assembled and running.
   that was *asked for* is not the same as subtracting the time that *passed*: a
   `sleep(300)` returning six days late — a blocked event loop — still cost the counter
   300, so it went on believing hours remained while the lease expired underneath it.
-- **And a second clock, because neither sees everything.** The loop's monotonic deadline
-  drives the ordinary cadence and survives a stalled loop; it does not advance while a
-  Linux host is suspended, so the recorded renewal timestamp — wall clock, and the same
-  value the gate reads — is consulted too. Either being due is enough, and an absent or
-  unreadable timestamp counts as due: renewing sooner than necessary costs one request,
-  and not renewing costs the room.
+- **And a second clock, because neither sees everything.** The wait is a *pair* of
+  deadlines — one monotonic, one wall clock — set together from one delay and read
+  together. Monotonic survives a stalled loop but does not advance while a Linux host is
+  suspended; wall clock advances across a suspend. Whichever arrives first ends the wait,
+  and because both were set from the same delay neither can shorten a wait chosen
+  deliberately.
+
+  That last part was learned the hard way. Deriving the wall-clock deadline from the
+  *recorded renewal time* instead meant a state the loop had chosen to wait out —
+  `unclaimable`, where only the upstream can change anything, and which by definition
+  records no renewal — looked overdue on every cycle, so the node would have written to
+  somebody else's server every five minutes rather than every six hours.
+- **The renewal and the observation have a `try` each.** They had one between them, and
+  a failed look pushed out a renewal it has nothing to do with. Worse, the handler
+  re-read the ledger that had just raised, which raised again out of the handler and
+  ended the loop — killing the renewal and the observation, silently, in the task whose
+  whole job is to keep the room.
 
 ### Unchanged
 

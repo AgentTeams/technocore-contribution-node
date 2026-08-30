@@ -401,7 +401,10 @@ async def _drive(
         nonlocal since
         gaps.append(since)
         since = 0.0
-        node.ledger.set_state("owned_room_renewed", utcnow())
+        # Deliberately does NOT record a renewal. An earlier version of this helper did,
+        # which made the wall-clock arm read fresh on every cycle and hid the defect it
+        # was supposed to catch: a state the loop had chosen to wait out looked overdue
+        # every five minutes.
         return next(pending)
 
     monkeypatch.setattr(asyncio, "sleep", record)
@@ -467,7 +470,6 @@ async def test_ownership_is_observed_far_more_often_than_it_is_renewed(
             raise asyncio.CancelledError
 
     async def renew() -> str:
-        node.ledger.set_state("owned_room_renewed", utcnow())
         return "renewed"
 
     monkeypatch.setattr(asyncio, "sleep", record)
@@ -740,7 +742,6 @@ async def test_a_stalled_loop_does_not_carry_a_stale_deadline_forward(
 
     async def renew() -> str:
         renewals.append(clock)
-        node.ledger.set_state("owned_room_renewed", utcnow())
         return "renewed"
 
     monkeypatch.setattr(asyncio, "sleep", record)
@@ -757,31 +758,166 @@ async def test_a_stalled_loop_does_not_carry_a_stale_deadline_forward(
     assert renewals[1] >= 6 * 24 * 3600
 
 
-async def test_a_suspended_host_renews_on_the_recorded_age_not_the_loop_clock(
+async def test_a_suspended_host_renews_on_the_wall_clock_deadline(
     node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`time.monotonic` does not advance while a Linux host is suspended.
 
-    So the loop's own deadline cannot see that week, and would wake with the countdown it
-    went to sleep with and a lease already gone. The recorded timestamp is wall clock and
-    is the same value the gate reads, so it is consulted too — and either one being due is
-    enough.
+    So the loop's own deadline cannot see that week: it would wake with the countdown it
+    went to sleep with and a lease already gone. A wall-clock deadline, set from the same
+    delay at the same moment, does see it — and because it was set from the same delay it
+    can never shorten a wait that was chosen deliberately, which is what reading the
+    recorded renewal time instead got wrong.
     """
     loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "time", lambda: 0.0)  # a clock that never moves
+    monkeypatch.setattr(loop, "time", lambda: 0.0)  # a monotonic clock that never moves
+    renewals = 0
 
-    node.ledger.set_state(
-        "owned_room_renewed",
-        (datetime.now(UTC) - timedelta(seconds=Node.OWNERSHIP_RENEWAL_SECONDS + 60)).isoformat(),
+    async def renew() -> str:
+        nonlocal renewals
+        renewals += 1
+        return "renewed"
+
+    async def stop(seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(node, "maintain_result_room_ownership", renew)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+    monkeypatch.setattr(asyncio, "sleep", stop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+    assert renewals == 1
+
+    # A week later on the wall clock, with the monotonic clock still at zero.
+    real_now = datetime.now
+    monkeypatch.setattr(
+        "technocore_node.service.node.datetime",
+        type("D", (), {"now": staticmethod(lambda tz=None: real_now(tz) + timedelta(days=7))}),
     )
-    assert node._renewal_is_due(0.0, renew_at=1e9) is True
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+    assert renewals == 2
 
-    node.ledger.set_state("owned_room_renewed", utcnow())
-    assert node._renewal_is_due(0.0, renew_at=1e9) is False
 
-    # Never renewed, or a timestamp that will not parse: due. Renewing sooner than
-    # necessary costs one request; not renewing costs the room.
+async def test_a_state_only_the_upstream_can_change_is_not_written_to_every_cycle(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unclaimable` means the upstream must change before anything here can.
+
+    The deadline used to be derived from the recorded renewal time — which `unclaimable`
+    never updates, because nothing was renewed. So the wait the loop had deliberately
+    chosen looked overdue on the very next cycle, and the node sent a claim to somebody
+    else's server every five minutes instead of every six hours.
+    """
+    attempts = 0
+
+    async def unclaimable() -> str:
+        nonlocal attempts
+        attempts += 1
+        return "unclaimable"
+
     node.ledger.set_state("owned_room_renewed", None)
-    assert node._renewal_is_due(0.0, renew_at=1e9) is True
-    node.ledger.set_state("owned_room_renewed", "not a timestamp")
-    assert node._renewal_is_due(0.0, renew_at=1e9) is True
+    cycles = 3 + Node.OWNERSHIP_RENEWAL_SECONDS // Node.OWNERSHIP_OBSERVATION_SECONDS
+    monkeypatch.setattr(node, "maintain_result_room_ownership", unclaimable)
+
+    clock = 0.0
+    loop = asyncio.get_running_loop()
+    seen = 0
+
+    async def record(seconds: float) -> None:
+        nonlocal clock, seen
+        clock += seconds
+        seen += 1
+        if seen >= cycles:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(loop, "time", lambda: clock)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    # One at startup, one when six hours had actually passed. Not one per cycle.
+    assert attempts == 2
+
+
+async def test_an_observation_failure_does_not_push_out_a_renewal(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two concerns, two `try` blocks. A failed look says nothing about the lease."""
+    attempts = 0
+
+    async def renew() -> str:
+        nonlocal attempts
+        attempts += 1
+        return "renewed"
+
+    async def blind() -> None:
+        raise TechnocoreError("upstream unavailable")
+
+    clock = 0.0
+    loop = asyncio.get_running_loop()
+    seen = 0
+    cycles = 2 + Node.OWNERSHIP_RENEWAL_SECONDS // Node.OWNERSHIP_OBSERVATION_SECONDS
+
+    async def record(seconds: float) -> None:
+        nonlocal clock, seen
+        clock += seconds
+        seen += 1
+        if seen >= cycles:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(loop, "time", lambda: clock)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", renew)
+    monkeypatch.setattr(node, "observe_reachability", blind)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    # The renewal kept its own schedule: once at startup, once six hours later.
+    assert attempts == 2
+
+
+async def test_a_ledger_failure_does_not_kill_the_loop(
+    node: Node, upstream: Upstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The task that protects the lease must not be the one that dies.
+
+    An earlier version read the ledger to decide whether a renewal was due, and read it
+    again inside the handler for the exception that read had raised. The second read
+    raised the same way, out of the handler, and the loop ended — taking the renewal and
+    the five-minute observation with it, silently.
+    """
+    calls = 0
+
+    async def sometimes() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("ledger is unavailable")
+        return "renewed"
+
+    clock = 0.0
+    loop = asyncio.get_running_loop()
+    seen = 0
+
+    async def record(seconds: float) -> None:
+        nonlocal clock, seen
+        clock += seconds
+        seen += 1
+        if seen >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    monkeypatch.setattr(loop, "time", lambda: clock)
+    monkeypatch.setattr(node, "maintain_result_room_ownership", sometimes)
+    monkeypatch.setattr(node, "observe_reachability", _nothing)
+
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_ownership_lease()
+
+    # It survived the raise and retried on the backoff rather than ending.
+    assert calls >= 2

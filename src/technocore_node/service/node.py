@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx2 as httpx
@@ -809,24 +809,6 @@ class Node:
         )
         return "unclaimable"
 
-    def _renewal_is_due(self, now: float, renew_at: float) -> bool:
-        """Whether to renew, on the loop's clock or on the recorded lease's.
-
-        Two answers to the same question, because neither clock sees everything. The
-        loop's monotonic deadline drives the ordinary cadence and survives a stalled
-        event loop. It does *not* advance while the machine is suspended, though — on
-        Linux `time.monotonic` excludes that — so a host asleep for a week would wake
-        with the deadline it went to sleep with and a lease already gone.
-
-        The recorded timestamp does see it, being wall clock, and is the same value the
-        gate reads. Unreadable or absent counts as due: renewing sooner than necessary
-        costs one request, and not renewing costs the room.
-        """
-        if now >= renew_at:
-            return True
-        age = self._age_of(self.ledger.get_state("owned_room_renewed")[0])
-        return age is None or age >= self.OWNERSHIP_RENEWAL_SECONDS
-
     async def run_ownership_lease(self) -> None:
         """Renew the lease forever, whatever else this node is or is not doing.
 
@@ -834,58 +816,73 @@ class Node:
         time — it is off in production as this is written — and the lease expires on the
         calendar regardless. Tying the renewal to the loop that reads jobs would mean the
         room is lost precisely while the node is being careful.
+
+        The wait is held as a **pair** of deadlines, set together from one delay and read
+        together. Neither clock sees everything: `loop.time()` is monotonic, so it
+        survives a stalled event loop but does not advance while a Linux host is
+        suspended; wall clock does advance across a suspend but can be stepped. Whichever
+        arrives first ends the wait, and because both were set from the same delay,
+        neither can shorten a wait that was chosen deliberately.
+
+        That last part is the whole reason the deadlines are held here rather than
+        derived from the recorded renewal time. Deriving them meant a state the loop had
+        chosen to wait out — `unclaimable`, where only the upstream can change anything —
+        looked overdue on every cycle, and the node wrote to somebody else's server every
+        five minutes instead of every six hours.
         """
         loop = asyncio.get_running_loop()
         failures = 0
-        renew_at = 0.0
-        while True:
-            try:
-                if self._renewal_is_due(loop.time(), renew_at):
-                    outcome = await self.maintain_result_room_ownership()
-                    if outcome in ("renewed", "claimed"):
-                        failures = 0
-                        renew_at = loop.time() + self.OWNERSHIP_RENEWAL_SECONDS
-                    elif outcome == "failed":
-                        # Transient: an upstream 5xx, a rate limit, a contended nonce.
-                        # Back off from seconds rather than sleeping through the window.
-                        failures += 1
-                        renew_at = loop.time() + min(
-                            self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
-                            self.OWNERSHIP_RENEWAL_SECONDS,
-                        )
-                    else:
-                        # `owned_by_other` or `unclaimable`. Neither is fixed by asking
-                        # again in a minute, and hammering somebody else's server over a
-                        # state only they can change is its own fault.
-                        failures = 0
-                        renew_at = loop.time() + self.OWNERSHIP_RENEWAL_SECONDS
+        mono_due, wall_due = loop.time(), datetime.now(UTC)
 
-                # Every cycle, not only the ones that renew. The gate reads an observation
-                # that expires in minutes; the renewal writes on a schedule measured in
-                # hours. Tying the two together left the gate stale between renewals — a
-                # non-issue while the mailbox loop is observing anyway, and the difference
-                # between working and not for any intake that runs without it.
+        while True:
+            if loop.time() >= mono_due or datetime.now(UTC) >= wall_due:
+                try:
+                    outcome = await self.maintain_result_room_ownership()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # This loop must outlive anything it touches. A renewal that raises
+                    # is a renewal to retry, not a reason to stop renewing.
+                    log.exception("ownership renewal failed", extra={"fields": {}})
+                    outcome = "failed"
+
+                if outcome in ("renewed", "claimed"):
+                    failures = 0
+                    delay: float = self.OWNERSHIP_RENEWAL_SECONDS
+                elif outcome == "failed":
+                    # Transient: an upstream 5xx, a rate limit, a contended nonce. Back
+                    # off from seconds rather than sleeping through the window.
+                    failures += 1
+                    delay = min(
+                        self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
+                        self.OWNERSHIP_RENEWAL_SECONDS,
+                    )
+                else:
+                    # `owned_by_other` or `unclaimable`. Neither is fixed by asking again
+                    # in a minute, and hammering somebody else's server over a state only
+                    # they can change is its own fault.
+                    failures = 0
+                    delay = self.OWNERSHIP_RENEWAL_SECONDS
+                mono_due = loop.time() + delay
+                wall_due = datetime.now(UTC) + timedelta(seconds=delay)
+
+            try:
+                # Every cycle, not only the ones that renew, and in its own `try` so that
+                # a failed look does not push out a renewal it has nothing to do with.
+                # The gate reads an observation that expires in minutes; the renewal
+                # writes on a schedule measured in hours.
                 await self.observe_reachability()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # This loop must outlive anything it touches. A renewal that raises is a
-                # renewal to retry, not a reason to stop renewing.
-                log.exception("ownership lease cycle failed", extra={"fields": {}})
-                if self._renewal_is_due(loop.time(), renew_at):
-                    failures += 1
-                    renew_at = loop.time() + min(
-                        self.OWNERSHIP_RETRY_FLOOR_SECONDS * 2 ** (failures - 1),
-                        self.OWNERSHIP_RENEWAL_SECONDS,
-                    )
+                log.exception("ownership observation failed", extra={"fields": {}})
 
-            # Recomputed from the deadline every cycle rather than by subtracting the
-            # sleep that was asked for. They are not the same number: a stalled event
-            # loop returns from `sleep(300)` long after 300 seconds, and a counter that
-            # only ever loses 300 would go on believing hours remain while the lease
-            # expired underneath it.
+            # Recomputed from the deadline rather than by subtracting the sleep that was
+            # asked for. They are not the same number: a stalled loop returns from
+            # `sleep(300)` long after 300 seconds, and a counter that only ever loses 300
+            # would go on believing hours remain while the lease expired underneath it.
             await asyncio.sleep(
-                min(self.OWNERSHIP_OBSERVATION_SECONDS, max(renew_at - loop.time(), 1.0))
+                min(self.OWNERSHIP_OBSERVATION_SECONDS, max(mono_due - loop.time(), 1.0))
             )
 
     async def run_mailbox(self) -> None:
