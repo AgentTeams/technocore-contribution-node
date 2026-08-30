@@ -1,0 +1,896 @@
+"""Signed job submission over HTTP.
+
+The interesting tests here are not "does a valid job work". They are the ones about what a
+second transport makes newly possible: a signature captured from a world-readable room
+being replayed into this endpoint, a request resent verbatim, a body edited after signing,
+and an endpoint that answers while the node is in no position to issue a receipt anyone
+could check.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import threading
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi.testclient import TestClient
+
+from technocore_node.api import create_app
+from technocore_node.config import load_settings
+from technocore_node.crypto import didkey, keystore
+from technocore_node.jobs.runner import RejectedJob
+from technocore_node.jobs.tasks import REGISTRY
+from technocore_node.ledger.db import utcnow
+from technocore_node.protocol.envelope import message_payload
+from technocore_node.protocol.http_envelope import (
+    HTTP_JOB_DOMAIN,
+    body_digest,
+    crosses_domains,
+    http_job_payload,
+    verify_http_job,
+)
+from technocore_node.protocol.sweep import valid_name
+from technocore_node.receipts import verify_receipt
+from technocore_node.service.node import Node
+
+PASSPHRASE = b"test-secret-do-not-use"
+
+
+@pytest.fixture
+def requester() -> tuple[Ed25519PrivateKey, str]:
+    key = Ed25519PrivateKey.generate()
+    return key, didkey.encode_did(key.public_key())
+
+
+@pytest.fixture
+def node(
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    published: list[tuple[str, dict[str, Any]]],
+) -> Node:
+    monkeypatch.setenv("TCN_HTTP_JOB_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("TCN_PUBLIC_URL", "https://example.invalid")
+    keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
+    node = Node(load_settings())
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    # The gate: a receipt is only worth issuing if the room it will be audited in is ours.
+    node.ledger.set_state("owned_room_owner", node.did)
+    node.ledger.set_state("owned_room_observed", "1")
+    node.ledger.set_state("owned_room_error", None)
+    # Owning the room and holding a live lease on it are two facts, and a node in
+    # production has both. `v0.1.3` made the gate and the sink require the second, so
+    # setting only the first leaves every test here running against a state the node is
+    # now right to refuse.
+    node.ledger.set_state("owned_room_renewed", utcnow())
+
+    # The audit copy goes to a real room over a real socket. These tests are about the
+    # intake lane, not about publishing, so the sink is recorded instead of sent — and
+    # `tests/conftest.py` blocks the socket anyway, so a future test that forgets this
+    # fails rather than writing to somebody's server.
+    async def record(room: str, payload: dict[str, Any]) -> int | None:
+        published.append((room, payload))
+        return len(published)
+
+    monkeypatch.setattr(node, "publish", record)
+    return node
+
+
+@pytest.fixture
+def published() -> list[tuple[str, dict[str, Any]]]:
+    return []
+
+
+@pytest.fixture
+def client(node: Node) -> TestClient:
+    return TestClient(create_app(node), raise_server_exceptions=False)
+
+
+def _explode(*args: Any, **kwargs: Any) -> None:
+    raise sqlite3.OperationalError("disk I/O error")
+
+
+def _job(job_id: str = "http-job-000001", **over: Any) -> dict[str, Any]:
+    job = {
+        "v": "1",
+        "type": "job",
+        "job_id": job_id,
+        "task": "canonical_json_sha256",
+        "reply_room": "mb-p-unused-over-http",
+        "input": {"value": {"b": 1, "a": [1, 2]}},
+    }
+    job.update(over)
+    return job
+
+
+def _envelope(key: Ed25519PrivateKey, did: str, job: dict[str, Any], nonce: int) -> dict[str, Any]:
+    return {
+        "did": did,
+        "sig": didkey.sign(key, http_job_payload(did, nonce, job)),
+        "nonce": str(nonce),
+        "job": job,
+    }
+
+
+# ----------------------------------------------------------- domain separation
+
+
+def test_a_room_signature_cannot_be_replayed_into_this_endpoint(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Every signed message in a public room is world-readable.
+
+    Without a domain tag, one of those signatures would be a valid HTTP submission from
+    that key — and the key's owner never authorised a job at all. A signature means "I
+    authorised *this*", and it stops meaning that the moment two different requests can
+    share one.
+    """
+    key, did = requester
+    job = _job()
+    # A signature the requester made for a Technocore room, over the same bytes.
+    room_sig = didkey.sign(key, message_payload("lobby", 1, json.dumps(job, sort_keys=True)))
+
+    response = client.post("/v1/jobs", json={"did": did, "sig": room_sig, "nonce": "1", "job": job})
+    assert response.status_code == 401
+    assert response.json()["error"] == "bad_signature"
+
+
+def test_an_http_signature_is_not_a_valid_room_message(
+    requester: tuple[Ed25519PrivateKey, str],
+) -> None:
+    """And the reverse: one taken from here cannot be posted into a room as that key."""
+    key, did = requester
+    job = _job()
+    http_sig = didkey.sign(key, http_job_payload(did, 1, job))
+
+    room_payload = message_payload("lobby", 1, json.dumps(job, sort_keys=True))
+    assert not didkey.verify_ok(did, http_sig, room_payload)
+
+
+def test_the_two_payload_spaces_cannot_overlap() -> None:
+    """No room payload can start with the tag, because no room can be named it.
+
+    This is the whole basis of the separation, so it is asserted against the name rule
+    the upstream actually enforces rather than against a hand-written example: the tag
+    contains a `/`, and `NAME_RE` admits only `[a-z0-9_-]`. Should either side ever move,
+    this fails here rather than somewhere a signature is accepted twice.
+    """
+    assert "/" in HTTP_JOB_DOMAIN
+    assert not valid_name(HTTP_JOB_DOMAIN)
+    assert not valid_name(HTTP_JOB_DOMAIN.split("|")[0])
+    assert not crosses_domains(message_payload("lobby", 1, "anything at all"))
+    assert not crosses_domains(message_payload("d-tc-contrib-abc", 99, HTTP_JOB_DOMAIN))
+
+
+def test_the_domain_tag_is_version_pinned() -> None:
+    """A v2 scheme gets a different tag, so a v1 signature can never satisfy it."""
+    assert "/v1/" in HTTP_JOB_DOMAIN
+
+
+# ------------------------------------------------------------------- the body
+
+
+def test_editing_the_body_after_signing_invalidates_the_signature(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The nonce orders submissions; the body hash is what makes a captured one useless."""
+    key, did = requester
+    envelope = _envelope(key, did, _job(), 1)
+    envelope["job"]["task"] = "verify_receipt_chain"  # swapped after signing
+
+    response = client.post("/v1/jobs", json=envelope)
+    assert response.status_code == 401
+
+
+def test_the_signature_is_over_the_canonical_form_not_the_bytes(
+    requester: tuple[Ed25519PrivateKey, str],
+) -> None:
+    """Two encodings of one document must verify identically.
+
+    Otherwise a proxy that reformats JSON — or a client that orders keys differently —
+    silently invalidates a request that is, by any reading, the same request.
+    """
+    key, did = requester
+    job = _job()
+    reordered = json.loads(json.dumps(dict(reversed(list(job.items())))))
+    assert list(job) != list(reordered)
+    assert body_digest(job) == body_digest(reordered)
+
+    sig = didkey.sign(key, http_job_payload(did, 1, job))
+    verify_http_job(did, sig, "1", reordered)
+
+
+# ------------------------------------------------------------------- replay
+
+
+def test_the_same_request_twice_is_refused_the_second_time(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    key, did = requester
+    envelope = _envelope(key, did, _job("replay-00000001"), 100)
+
+    assert client.post("/v1/jobs", json=envelope).status_code == 200
+    second = client.post("/v1/jobs", json=envelope)
+    # The idempotency check answers first, which is the friendlier of the two refusals:
+    # a client retrying after a dropped response gets its receipt, not a scolding.
+    assert second.status_code == 200
+    assert second.json()["status"] == "already_completed"
+
+
+def test_a_stale_nonce_on_new_work_is_refused(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A captured request cannot be reused to authorise a *different* job."""
+    key, did = requester
+    assert (
+        client.post("/v1/jobs", json=_envelope(key, did, _job("first-000000001"), 500)).status_code
+        == 200
+    )
+
+    replayed = client.post("/v1/jobs", json=_envelope(key, did, _job("second-00000001"), 499))
+    assert replayed.status_code == 409
+    assert replayed.json()["error"] == "nonce_not_advancing"
+
+
+def test_one_requesters_nonce_is_not_anothers(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The counter is per key: a busy requester must not raise the floor for everyone."""
+    key_a, did_a = requester
+    key_b = Ed25519PrivateKey.generate()
+    did_b = didkey.encode_did(key_b.public_key())
+
+    assert (
+        client.post(
+            "/v1/jobs", json=_envelope(key_a, did_a, _job("a-0000000001"), 9000)
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post("/v1/jobs", json=_envelope(key_b, did_b, _job("b-0000000001"), 1)).status_code
+        == 200
+    )
+
+
+def test_the_signing_payload_endpoint_tells_a_caller_the_floor(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """So a client learns the rule from a document rather than from a 401."""
+    key, did = requester
+    client.post("/v1/jobs", json=_envelope(key, did, _job("floor-000000001"), 42))
+
+    body = client.get("/v1/jobs/signing-payload", params={"did": did}).json()
+    assert body["next_nonce_must_exceed"] == 42
+    assert HTTP_JOB_DOMAIN in body["payload_template"]
+
+
+# -------------------------------------------------------------- the gate
+
+
+def test_the_endpoint_is_absent_while_the_feature_is_off(env: dict[str, str]) -> None:
+    """404, not 403: a disabled lane is not a locked door to keep knocking on."""
+    keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
+    node = Node(load_settings())
+    assert node.settings.http_job_intake_enabled is False
+
+    client = TestClient(create_app(node), raise_server_exceptions=False)
+    response = client.post("/v1/jobs", json={"did": "x", "sig": "y", "nonce": "1", "job": {}})
+    assert response.status_code == 404
+
+
+def test_the_endpoint_refuses_while_the_safety_gate_is_closed(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The same gate the mailbox lane passes.
+
+    A receipt issued now could not be audited by anyone, so producing one would be worse
+    than declining — and the refusal says why, because a caller can do nothing about a
+    refusal whose shape they cannot see.
+    """
+    node.ledger.set_state("owned_room_owner", None)
+    client = TestClient(create_app(node), raise_server_exceptions=False)
+    key, did = requester
+
+    response = client.post("/v1/jobs", json=_envelope(key, did, _job(), 1))
+    assert response.status_code == 503
+    assert response.json()["error"] == "not_accepting_jobs"
+    assert "no owner" in response.json()["detail"]
+
+
+def test_a_rate_limited_requester_does_not_spend_a_nonce(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A refusal should not cost a counter the caller then has to reason about."""
+    key, did = requester
+    for _ in range(node.runner.requester_jobs_per_hour):
+        node.ledger.record_rejection(
+            job_id=None, requester_did=did, code="not_json", detail="", request_room="http"
+        )
+
+    before = node.ledger.http_nonce_floor(did)
+    response = client.post("/v1/jobs", json=_envelope(key, did, _job(), 777))
+    assert response.status_code == 429
+    assert node.ledger.http_nonce_floor(did) == before
+
+
+# ------------------------------------------------------- the work, and its proof
+
+
+def test_a_valid_job_returns_a_verifiable_receipt(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    key, did = requester
+    response = client.post("/v1/jobs", json=_envelope(key, did, _job("good-00000001"), 7))
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["result"]["summary"]["canonical"] == '{"a":[1,2],"b":1}'
+    assert verify_receipt(body["receipt"]) == []
+    assert body["receipt_url"].endswith("/v1/receipts/good-00000001")
+
+
+def test_the_receipt_is_retrievable_at_the_url_it_advertises(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    key, did = requester
+    client.post("/v1/jobs", json=_envelope(key, did, _job("fetch-000000001"), 8))
+
+    fetched = client.get("/v1/receipts/fetch-000000001").json()
+    assert fetched["status"] == "completed"
+    assert verify_receipt(fetched["receipt"]) == []
+
+
+@pytest.mark.parametrize(
+    ("job", "expected"),
+    [
+        (_job(task="rm -rf /"), "schema_invalid"),
+        (
+            _job(task="protocol_manifest_snapshot", input={"url": "http://169.254.169.254/"}),
+            "input_invalid",
+        ),
+        (_job(reply_room="lobby"), "reply_room_not_allowed"),
+        (_job(job_id="short"), "schema_invalid"),
+    ],
+)
+def test_the_http_lane_refuses_everything_the_mailbox_lane_does(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str], job: dict[str, Any], expected: str
+) -> None:
+    """One validator, one task registry, one set of refusals.
+
+    Duplicating a security-relevant pipeline per transport is how the two copies drift
+    apart, and the one nobody is looking at is the one that lets something through.
+    """
+    key, did = requester
+    response = client.post("/v1/jobs", json=_envelope(key, did, job, 3000))
+    assert response.status_code == 400
+    assert response.json()["error"] == expected
+
+
+def test_an_oversized_body_is_refused_before_it_is_parsed(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    key, did = requester
+    envelope = _envelope(key, did, _job(), 1)
+    envelope["padding"] = "x" * 20_000
+    response = client.post("/v1/jobs", content=json.dumps(envelope))
+    assert response.status_code == 413
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {},
+        {"did": "x"},
+        {"did": "x", "sig": "y", "nonce": "1"},
+        {"did": "x", "sig": "y", "nonce": 1, "job": {}},
+        {"did": "x", "sig": "y", "nonce": "1", "job": "not an object"},
+    ],
+)
+def test_a_malformed_envelope_is_refused(client: TestClient, envelope: dict[str, Any]) -> None:
+    response = client.post("/v1/jobs", json=envelope)
+    assert response.status_code == 400
+    assert response.json()["error"] in {"malformed_envelope", "not_an_object"}
+
+
+def test_the_endpoint_leaks_nothing_about_the_host(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    key, did = requester
+    bodies = [
+        client.post("/v1/jobs", json=_envelope(key, did, _job(), 1)).text,
+        client.post("/v1/jobs", json={"bad": True}).text,
+        client.get("/v1/jobs/signing-payload", params={"did": did}).text,
+    ]
+    for body in bodies:
+        lowered = body.lower()
+        for forbidden in ("/etc/", "/var/lib/", "/home/", "traceback", "passphrase", "sqlite"):
+            assert forbidden not in lowered, f"{forbidden!r} leaked"
+
+
+def test_the_audit_copy_goes_to_the_room_the_gate_checked(
+    client: TestClient,
+    node: Node,
+    requester: tuple[Ed25519PrivateKey, str],
+    published: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A receipt earned over HTTP is auditable in the same room as one earned in a room.
+
+    The gate's promise is that a receipt this node issues can be checked against a room
+    this node owns. That promise is only kept if the copy actually goes there, so the
+    destination is asserted rather than assumed — the two lanes must not diverge into one
+    auditable and one not.
+    """
+    key, did = requester
+    body = _envelope(key, did, _job("audited-00001"), 7)
+
+    assert client.post("/v1/jobs", json=body).status_code == 200
+
+    rooms = [room for room, _ in published]
+    assert rooms == [node.result_room]
+    assert published[0][1]["job_id"] == "audited-00001"
+    assert published[0][1]["type"] == "receipt"
+
+
+def test_the_published_example_produces_an_envelope_this_server_accepts(
+    client: TestClient, node: Node
+) -> None:
+    """`examples/send_job.py` is checked against the endpoint, not against its own docs.
+
+    The example reimplements the signing scheme from the specification so that a caller
+    need not install this package to use the node. That is the point of it, and also how
+    it comes to disagree with the server it is documenting — silently, and only for the
+    people who followed the instructions. So the envelope it builds is fed to the real
+    route here, and the receipt that comes back is checked by the other example.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[2] / "examples"
+    envelopes = importlib.util.spec_from_file_location("send_job", root / "send_job.py")
+    assert envelopes is not None and envelopes.loader is not None
+    sender = importlib.util.module_from_spec(envelopes)
+    envelopes.loader.exec_module(sender)
+
+    key = Ed25519PrivateKey.generate()
+    did = sender.encode_did(key)
+    job = dict(sender.EXAMPLE_JOB)
+    job["job_id"] = "example-round-trip"
+
+    response = client.post("/v1/jobs", json=sender.sign_job(key, did, job, 1))
+
+    assert response.status_code == 200, response.json()
+    receipt = response.json()["receipt"]
+    assert receipt["requester_did"] == did
+    assert receipt["provider_did"] == node.did
+
+    verifier = importlib.util.spec_from_file_location("verify_receipt", root / "verify_receipt.py")
+    assert verifier is not None and verifier.loader is not None
+    checker = importlib.util.module_from_spec(verifier)
+    verifier.loader.exec_module(checker)
+    assert checker.verify(receipt, node.did) == []
+
+
+def test_a_duplicate_key_is_refused_the_way_the_mailbox_lane_refuses_it(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Two lanes, one parser. A body with no single meaning is not a request.
+
+    Python keeps the last of a duplicate key, so `{"task":"a","task":"b"}` would be
+    hashed as though only `b` were ever written — and a verifier that keeps the first
+    reads the same signed bytes differently. The signature verifies, both parties are
+    satisfied, and they disagree about what was signed. A receipt exists to rule that out,
+    so it is refused at the parse rather than canonicalised into one of its two meanings.
+    """
+    key, did = requester
+    job = _job("dupe-00000000001")
+    envelope = _envelope(key, did, job, 1)
+
+    # Signed over the value Python would keep, so only the parser can catch this.
+    body = json.dumps(envelope).replace(
+        '"task": "canonical_json_sha256"',
+        '"task": "verify_receipt_chain", "task": "canonical_json_sha256"',
+    )
+    response = client.post(
+        "/v1/jobs", content=body.encode(), headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "not_canonical_json"
+
+
+def test_a_job_the_schema_refuses_does_not_spend_a_nonce(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A refusal must not cost the caller a counter they then have to reason about.
+
+    `reply_room: "lobby"` is refused because a public room would make this node a
+    reflector. That is a fault in the request, and the fix is to send a corrected one —
+    which the caller cannot do if the first attempt already advanced their floor.
+    """
+    key, did = requester
+    bad = _job("rejected-0000001", reply_room="lobby")
+
+    refused = client.post("/v1/jobs", json=_envelope(key, did, bad, 7))
+    assert refused.status_code == 400
+
+    assert (
+        client.get("/v1/jobs/signing-payload", params={"did": did}).json()["next_nonce_must_exceed"]
+        == 0
+    )
+    corrected = client.post("/v1/jobs", json=_envelope(key, did, _job("corrected-000001"), 7))
+    assert corrected.status_code == 200
+
+
+def test_a_replay_still_cannot_execute_twice_after_that_reordering(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Validating before the claim must not open a window for the thing the claim stops.
+
+    Validation is pure, so running it twice costs nothing and decides nothing; the claim
+    is still the only gate execution passes, and it is still atomic.
+    """
+    key, did = requester
+    envelope = _envelope(key, did, _job("replay-after-reorder"), 11)
+
+    assert client.post("/v1/jobs", json=envelope).status_code == 200
+    second = client.post("/v1/jobs", json=envelope)
+
+    # Answered from the ledger rather than re-run: same job_id, same requester.
+    assert second.status_code == 200
+    assert second.json()["status"] == "already_completed"
+
+    fresh_job_same_nonce = _envelope(key, did, _job("different-job-01"), 11)
+    assert client.post("/v1/jobs", json=fresh_job_same_nonce).status_code == 409
+
+
+def test_a_completed_job_and_its_receipt_are_one_write(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Work done and receipt held, or neither. Never the first without the second.
+
+    The two were separate statements once, with a return through the caller in between.
+    A crash in that window left a job marked complete — so the duplicate check refused
+    every retry — whose receipt did not exist. The work was done, the `job_id` was spent,
+    and there was nothing to show for it, which for a node whose entire product is a
+    receipt is the worst available outcome.
+
+    Asserted by making the write fail: if it is one transaction, the completion is rolled
+    back with it and the caller can try again.
+    """
+    key, did = requester
+    job = _job("atomic-0000000001")
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", explode)
+        # The client turns an unhandled exception into a 500 rather than re-raising, so
+        # the failure is observed where a caller would observe it.
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    assert node.ledger.get_receipt("atomic-0000000001") is None
+    row = node.ledger.get_job("atomic-0000000001")
+    assert row is not None
+    assert row["status"] not in ("completed", "failed")
+
+
+def test_the_receipt_is_durable_before_the_response_is_written(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A caller that never sees the response can still fetch what it paid for."""
+    key, did = requester
+
+    body = client.post("/v1/jobs", json=_envelope(key, did, _job("durable-00000001"), 1)).json()
+
+    stored = node.ledger.get_receipt("durable-00000001")
+    assert stored is not None
+    assert json.loads(stored["receipt_json"])["receipt_hash"] == body["receipt"]["receipt_hash"]
+
+
+def test_a_job_left_unanswered_by_a_crash_can_be_retried(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """ "Already seen" is not "already answered", and only the second may refuse a retry.
+
+    The completion and the receipt are one transaction, but the job row is inserted before
+    it. So a failure in that write rolls the completion back and leaves the row — and a
+    duplicate check keyed on the row's existence would then refuse every retry of a job
+    that was never answered. The caller's `job_id` is spent, the work is unprovable, and
+    nothing says so.
+    """
+    key, did = requester
+    job = _job("crashed-00000001")
+
+    def explode(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", explode)
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    assert node.ledger.job_requester("crashed-00000001") == did
+    assert node.ledger.get_receipt("crashed-00000001") is None
+
+    retried = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "ok"
+    assert node.ledger.get_receipt("crashed-00000001") is not None
+
+
+def test_an_answered_job_is_still_answered_from_the_ledger(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Resuming the unanswered must not make the answered run twice."""
+    key, did = requester
+    job = _job("answered-00000001")
+
+    first = client.post("/v1/jobs", json=_envelope(key, did, job, 1)).json()
+    again = client.post("/v1/jobs", json=_envelope(key, did, job, 2)).json()
+
+    assert again["status"] == "already_completed"
+    assert again["receipt"]["receipt_hash"] == first["receipt"]["receipt_hash"]
+
+
+def test_a_nonce_sqlite_cannot_hold_is_refused_rather_than_crashing(
+    client: TestClient, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Nineteen digits fits the pattern; not all of them fit a signed 64-bit column.
+
+    A well-signed request with `2**63` reached the bind and became a 500 that recorded
+    neither a rejection nor a nonce — a malformed input escaping the accounting every
+    other malformed input is subject to.
+    """
+    key, did = requester
+    too_big = str(2**63)
+    assert len(too_big) == 19
+
+    response = client.post("/v1/jobs", json=_envelope(key, did, _job("bignonce-0000001"), 2**63))
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "bad_signature"
+    assert client.post("/v1/jobs", json=_envelope(key, did, _job("okn-000000000001"), 2**63 - 1))
+
+
+def test_the_published_api_description_admits_the_write_route(client: TestClient) -> None:
+    """An auditor reading the OpenAPI document must not be told this API is read-only."""
+    spec = client.get("/openapi.json").json()
+
+    assert "read-only" not in spec["info"]["description"].lower().replace(
+        "every endpoint here is read-only except", ""
+    )
+    assert "POST /v1/jobs" in spec["info"]["description"]
+    assert "/v1/jobs" in spec["paths"]
+
+
+async def test_a_resume_is_not_charged_the_rate_limit_twice(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The row the limit counts is the job being recovered.
+
+    Charging it again lets the limit refuse the one retry that exists to recover an
+    answer the requester already paid for — and at a low limit, for as long as the window
+    lasts. The counter reads job rows; a resume creates none.
+    """
+    _, did = requester
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+    text = json.dumps(_job("ratelimited-0001"))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", _explode)
+        with pytest.raises(sqlite3.OperationalError):
+            await node.runner.handle(
+                text=text, requester_did=did, request_room="http", request_seq=None
+            )
+
+    assert node.ledger.get_receipt("ratelimited-0001") is None
+
+    outcome = await node.runner.handle(
+        text=text, requester_did=did, request_room="http", request_seq=None
+    )
+
+    assert outcome is not None
+    assert node.ledger.get_receipt("ratelimited-0001") is not None
+    # The limit still holds for work that is genuinely new.
+    with pytest.raises(RejectedJob) as refused:
+        await node.runner.handle(
+            text=json.dumps(_job("brand-new-000001")),
+            requester_did=did,
+            request_room="http",
+            request_seq=None,
+        )
+    assert refused.value.code == "rate_limited"
+
+
+async def test_abandoning_a_request_does_not_start_the_work_twice(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """A disconnect abandons the waiting, never the work.
+
+    The task runs in a worker thread that no cancellation can stop. Releasing the job's
+    slot when the caller went away let a retry start a second thread for the same job —
+    breaking both single execution and the concurrency ceiling, in the one situation
+    where the requester is least able to see it.
+    """
+    _, did = requester
+    text = json.dumps(_job("abandoned-000001"))
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    runs = 0
+
+    def slow(payload: dict[str, Any], context: Any) -> dict[str, Any]:
+        nonlocal runs
+        runs += 1
+        loop.call_soon_threadsafe(started.set)
+        release.wait(5)
+        return {"canonical": "{}", "sha256": "sha256:" + "0" * 64, "bytes": 2}
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(REGISTRY, "canonical_json_sha256", slow)
+
+        first = asyncio.create_task(
+            node.runner.handle(text=text, requester_did=did, request_room="http", request_seq=None)
+        )
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # The abandoned work is still running, so a retry joins it rather than starting
+        # a second thread.
+        second = asyncio.create_task(
+            node.runner.handle(text=text, requester_did=did, request_room="http", request_seq=None)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        outcome = await second
+
+    assert runs == 1
+    assert outcome is not None
+    assert node.ledger.get_receipt("abandoned-000001") is not None
+
+
+async def test_a_stranger_cannot_join_somebody_elses_running_job(
+    node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """`job_id` is public. Guessing an in-flight one must not hand over its answer.
+
+    Two submissions of one id are made to join rather than run beside each other — which
+    is right, and was keyed on the id alone. The ownership check lives inside the run,
+    and a joining caller never enters it, so a stranger who guessed an id in flight was
+    handed the first requester's result, receipt, reply room and DID.
+    """
+    _, first_did = requester
+    intruder = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    text = json.dumps(_job("guessable-000001"))
+    loop = asyncio.get_running_loop()
+    started, release = asyncio.Event(), threading.Event()
+
+    def slow(payload: dict[str, Any], context: Any) -> dict[str, Any]:
+        loop.call_soon_threadsafe(started.set)
+        release.wait(5)
+        return {"canonical": "{}", "sha256": "sha256:" + "0" * 64, "bytes": 2}
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(REGISTRY, "canonical_json_sha256", slow)
+        first = asyncio.create_task(
+            node.runner.handle(
+                text=text, requester_did=first_did, request_room="http", request_seq=None
+            )
+        )
+        await started.wait()
+
+        with pytest.raises(RejectedJob) as refused:
+            await node.runner.handle(
+                text=text, requester_did=intruder, request_room="http", request_seq=None
+            )
+
+        release.set()
+        outcome = await first
+
+    assert refused.value.code == "job_id_taken"
+    assert outcome is not None
+    assert outcome.receipt is not None
+    assert outcome.receipt["requester_did"] == first_did
+
+
+def test_an_answered_retry_is_not_refused_by_the_rate_limit(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """An answer that already exists costs nothing to hand over again.
+
+    The limit was applied before the route looked for one, so a client retrying after a
+    dropped response was told to slow down instead of being given the receipt it had
+    already earned — and a job left unanswered by a crash could not be resumed at all,
+    because the same check refused it before the runner's resume path was reached.
+    """
+    key, did = requester
+    job = _job("underlimit-00001")
+    assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 200
+
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+
+    retried = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "already_completed"
+
+    # New work is still refused, which is what the limit is for.
+    fresh = client.post("/v1/jobs", json=_envelope(key, did, _job("overlimit-000001"), 3))
+    assert fresh.status_code == 429
+
+
+def test_a_crashed_job_resumes_over_http_even_at_the_limit(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """The runner's resume path is only reachable if the route lets the request through."""
+    key, did = requester
+    job = _job("httpresume-00001")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", _explode)
+        assert client.post("/v1/jobs", json=_envelope(key, did, job, 1)).status_code == 500
+
+    object.__setattr__(node.runner, "requester_jobs_per_hour", 1)
+
+    resumed = client.post("/v1/jobs", json=_envelope(key, did, job, 2))
+
+    assert resumed.status_code == 200
+    assert node.ledger.get_receipt("httpresume-00001") is not None
+
+
+def test_a_dead_lease_closes_the_http_lane_too(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Safety is shared between lanes, and the lease is a safety condition.
+
+    `v0.2.0` separated each lane's switch from the conditions they share; `v0.1.3` made
+    the ownership lease one of those conditions. This is where the two meet: a receipt
+    earned over HTTP is audited in the same room as one earned in a chat room, so a lease
+    that has stopped being renewed makes the HTTP receipt exactly as worthless — and the
+    lane has to refuse for that reason, not merely report it.
+    """
+    key, did = requester
+    assert (
+        client.post("/v1/jobs", json=_envelope(key, did, _job("before-lapse-01"), 1)).status_code
+        == 200
+    )
+
+    stale = (
+        datetime.now(UTC) - timedelta(seconds=Node.OWNERSHIP_LEASE_MAX_AGE_SECONDS + 60)
+    ).isoformat()
+    node.ledger.set_state("owned_room_renewed", stale)
+
+    refused = client.post("/v1/jobs", json=_envelope(key, did, _job("after-lapse-001"), 2))
+
+    assert refused.status_code == 503
+    assert refused.json()["error"] == "not_accepting_jobs"
+    assert "lease" in refused.json()["detail"]
+    # And it is the shared condition, not the lane's own switch, that closed it.
+    assert node.can_accept_third_party_jobs("http") is False
+    assert node.can_accept_third_party_jobs("mailbox") is False
+    assert node.open_lanes() == []
+
+
+def test_a_lapsed_lease_does_not_orphan_a_receipt_already_earned(
+    client: TestClient, node: Node, requester: tuple[Ed25519PrivateKey, str]
+) -> None:
+    """Work already paid for stays retrievable. Refusing new work is not forgetting old.
+
+    The receipt is in the ledger and served from there; what a dead lease stops is the
+    audit copy, which the row records as still owed.
+    """
+    key, did = requester
+    body = client.post("/v1/jobs", json=_envelope(key, did, _job("earned-000000001"), 1)).json()
+
+    node.ledger.set_state("owned_room_renewed", None)
+
+    fetched = client.get("/v1/receipts/earned-000000001")
+    assert fetched.status_code == 200
+    assert fetched.json()["receipt"]["receipt_hash"] == body["receipt"]["receipt_hash"]

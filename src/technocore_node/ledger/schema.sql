@@ -157,6 +157,19 @@ CREATE TABLE IF NOT EXISTS deployment_state (
     updated_at TEXT NOT NULL
 );
 
+-- The high-water nonce each requester has spent over the HTTP lane.
+--
+-- A nonce orders one requester's submissions and lets an old one be rejected, but the
+-- requester chooses it, so on its own it proves nothing. It is half of a pair: this table
+-- refuses a nonce that does not advance, and the signature covers a hash of the body, so
+-- a captured request can be neither replayed nor edited. Per DID, because one requester's
+-- counter is no business of another's.
+CREATE TABLE IF NOT EXISTS http_nonces (
+    requester_did TEXT PRIMARY KEY,
+    last_nonce    INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
 -- Per-room read cursors, so a restart resumes where the poller stopped rather than
 -- reprocessing a room from its oldest retained message.
 CREATE TABLE IF NOT EXISTS cursors (

@@ -34,10 +34,12 @@ import os
 import secrets
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from technocore_node.config import LOOPBACK_HOSTS
 from technocore_node.crypto import didkey
 from technocore_node.jobs.runner import JobRunner, RejectedJob
 from technocore_node.ledger.db import Ledger
@@ -52,8 +54,36 @@ from technocore_node.service.rooms import mailbox_room, result_room
 
 ORIGIN = os.environ.get("TCN_E2E_ORIGIN", "")
 
+
+def _loopback_only(origin: str) -> str:
+    """Refuse to run this suite against anything but a local server.
+
+    These tests make real writes: they open rooms, post signed messages and claim
+    ownership. Pointed at the public instance they would do all of that there, under this
+    node's production identity, to a service somebody else runs — and this project has
+    already lost a room to one write that arrived in the wrong order.
+
+    The docstring below asks for a local instance. An instruction is not a boundary, and
+    the cost of the mistake is unrecoverable, so the boundary is here: a host outside
+    loopback aborts collection rather than skipping, because a silent skip is how a
+    misconfigured run looks exactly like a passing one.
+    """
+    if not origin:
+        return ""
+    host = urlsplit(origin).hostname or ""
+    if host not in LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"TCN_E2E_ORIGIN={origin!r} is not loopback. This suite makes real writes and "
+            "must only ever run against a local instance of the upstream server; see the "
+            "module docstring for the command that starts one."
+        )
+    return origin
+
+
+ORIGIN = _loopback_only(ORIGIN)
+
 pytestmark = pytest.mark.skipif(
-    not ORIGIN, reason="set TCN_E2E_ORIGIN to run the live end-to-end suite"
+    not ORIGIN, reason="set TCN_E2E_ORIGIN to a loopback origin to run the live suite"
 )
 
 
@@ -534,6 +564,7 @@ async def test_24_a_receipt_reaches_the_owned_room_as_well_as_the_reply_room(
         # The loop is never started here — `start_background()` is not called — so this
         # switches the gate on without polling anything.
         mailbox_enabled=True,
+        http_job_intake_enabled=False,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -608,6 +639,7 @@ async def test_25_an_internal_test_receipt_stays_out_of_the_owned_room(
         # The loop is never started here — `start_background()` is not called — so this
         # switches the gate on without polling anything.
         mailbox_enabled=True,
+        http_job_intake_enabled=False,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -667,6 +699,7 @@ async def test_26_a_failed_audit_copy_is_retried_until_it_lands(
         # The loop is never started here — `start_background()` is not called — so this
         # switches the gate on without polling anything.
         mailbox_enabled=True,
+        http_job_intake_enabled=False,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,
@@ -759,6 +792,7 @@ async def test_27_a_copy_that_landed_before_a_crash_is_not_published_twice(
         # The loop is never started here — `start_background()` is not called — so this
         # switches the gate on without polling anything.
         mailbox_enabled=True,
+        http_job_intake_enabled=False,
         watcher_enabled=False,
         max_concurrent_jobs=2,
         job_timeout_seconds=15,

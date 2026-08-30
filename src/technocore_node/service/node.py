@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import httpx2 as httpx
 import jsonschema
@@ -45,6 +45,9 @@ log = get_logger(__name__)
 #: Slack for ordinary clock jitter between writing an observation and reading it back.
 #: Beyond this into the future, a timestamp is treated as unusable rather than recent.
 _CLOCK_TOLERANCE_SECONDS = 60
+
+#: The ways work can arrive. Each is enabled separately and gated identically.
+Lane = Literal["mailbox", "http"]
 
 _RECEIPT_VALIDATOR = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
 
@@ -229,11 +232,11 @@ class Node:
         text = str(message.get("text", ""))
         seq = int(message.get("seq", 0))
 
-        if not internal_test and not self.can_accept_third_party_jobs():
+        if not internal_test and not self.can_accept_third_party_jobs("mailbox"):
             # Checked here as well as in the poll loop. `process_message` is public and
             # is called directly by the self-test and by anything written later; a gate
             # that only exists at one call site protects only that call site.
-            _, reasons = self.safety_state()
+            _, reasons = self.lane_is_open("mailbox")
             log.warning(
                 "refusing to process a third-party job: unsafe state",
                 extra={"fields": {"seq": seq, "reasons": reasons}},
@@ -297,17 +300,10 @@ class Node:
         if outcome is None:
             return True  # a duplicate job_id: already answered, nothing left to do
 
+        # The receipt is already persisted by `handle()`, in the same transaction that
+        # marked the job complete, and before anything is announced anywhere. A crash from
+        # here on costs an unannounced copy, which the row records as owed.
         receipt = outcome.receipt
-        receipt_json = ""
-        if receipt is not None:
-            # Recorded before anything is announced. A crash after this point costs an
-            # unannounced copy, which the row says is owed; a crash before it, with the
-            # job already marked complete, would lose the receipt entirely — the
-            # duplicate check would suppress every retry.
-            receipt_json = json.dumps(
-                receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-            )
-            self.ledger.record_receipt(receipt, receipt_json, outcome.internal_test)
 
         await self.publish(outcome.reply_room, outcome.claim)
         result_seq = await self.publish(outcome.reply_room, outcome.result)
@@ -547,7 +543,7 @@ class Node:
         unread messages out upstream, where no cursor can reach them. That gap is detected
         from `first_seq`, logged at `error` and recorded; it cannot be undone.
         """
-        safe, reasons = self.safety_state()
+        safe, reasons = self.lane_is_open("mailbox")
         since = self.ledger.cursor(self.mailbox)
         data = await self.client.read_room(self.mailbox, since=since, wait=wait)
         messages = data.get("messages", [])
@@ -1025,20 +1021,40 @@ class Node:
         if not self.settings.public_url:
             reasons.append("no public URL is configured, so a requester cannot verify a receipt")
 
-        if not self.settings.mailbox_enabled:
-            # The only intake this version has. With the loop switched off nothing is
-            # polling, so "accepting third-party jobs" would be false however healthy
-            # everything else looked — and a status that ignores whether anyone is
-            # listening is the same mismatch this release exists to remove.
+        return (not reasons, reasons)
+
+    def lane_is_open(self, lane: Lane) -> tuple[bool, list[str]]:
+        """Whether one intake lane will take work, and why not when it will not.
+
+        Safety is shared and enablement is not. Every lane must clear the same conditions
+        — a receipt earned over HTTP is worth exactly what a receipt earned in a room is
+        worth, and both are worth nothing if the room they are audited in is not ours —
+        but each is switched on separately, because opening one is a decision about that
+        one. Folding the two together is how `TCN_MAILBOX_ENABLED=false` came to close a
+        lane it has nothing to do with.
+        """
+        reasons = self.safety_state()[1]
+        if lane == "mailbox" and not self.settings.mailbox_enabled:
             reasons.append(
                 "mailbox intake is disabled (TCN_MAILBOX_ENABLED=false), so no job is being read"
             )
-
+        if lane == "http" and not self.settings.http_job_intake_enabled:
+            reasons.append("HTTP job intake is disabled (TCN_HTTP_JOB_INTAKE_ENABLED=false)")
         return (not reasons, reasons)
 
-    def can_accept_third_party_jobs(self) -> bool:
-        """The single gate every third-party execution path must pass."""
-        return self.safety_state()[0]
+    def open_lanes(self) -> list[Lane]:
+        """The lanes that would take work right now. Empty is the normal state today."""
+        return [lane for lane in ("mailbox", "http") if self.lane_is_open(lane)[0]]
+
+    def can_accept_third_party_jobs(self, lane: Lane | None = None) -> bool:
+        """The single gate every third-party execution path must pass.
+
+        With a lane named, it is that lane's gate. Without one it means "could anybody
+        send this node work by any route", which is the question `/v1/info` answers.
+        """
+        if lane is not None:
+            return self.lane_is_open(lane)[0]
+        return bool(self.open_lanes())
 
     def owns_result_room(self) -> bool:
         """Confirmed ours, from a recent read, and on a lease this node is still keeping.
@@ -1087,7 +1103,19 @@ class Node:
         # failure is worth showing and is shown, but as its own field: folding it in here
         # made `stop_reasons` non-empty while `accepting_third_party_jobs` stayed true,
         # which is the very disagreement these two fields exist to make impossible.
-        safe, blockers = self.safety_state()
+        # Reported per lane, because "is this node accepting work" and "is *this* way in
+        # open" are different questions and a reader given only the first cannot tell
+        # which of two switches to look at.
+        lanes = {lane: self.lane_is_open(lane) for lane in ("mailbox", "http")}
+        safe = any(ok for ok, _ in lanes.values())
+        # `stop_reasons` is empty exactly when the node is accepting. One open lane means
+        # work can arrive, so nothing is stopping the node — that a *second* lane is
+        # switched off is real and is reported under `lanes`, but listing it here would
+        # make `stop_reasons` non-empty beside `accepting_third_party_jobs: true`, which
+        # is the disagreement these two fields exist to make impossible.
+        blockers = (
+            [] if safe else sorted({reason for _, reasons in lanes.values() for reason in reasons})
+        )
 
         # Blockers are about now; a completed job is about the past. A node that once
         # served somebody and is unreachable today is unreachable today.
@@ -1122,6 +1150,9 @@ class Node:
             # disagree the reader should be able to see it, not have to infer it.
             "accepting_third_party_jobs": safe,
             "stop_reasons": blockers,
+            "lanes": {
+                lane: {"open": ok, "stop_reasons": reasons} for lane, (ok, reasons) in lanes.items()
+            },
             "last_publish_error": result_err,
             "third_party_jobs_completed": completed,
             "blockers": blockers,

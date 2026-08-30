@@ -92,6 +92,21 @@ class JobRunner:
         self.requester_jobs_per_hour = requester_jobs_per_hour
         self.source_commit = source_commit[:40]
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        #: The running attempt for each `job_id`, as `(requester, task)`, so a second
+        #: submission of one id joins the first rather than starting beside it — and only
+        #: if it is the same requester. The DID is held here because the ownership check
+        #: lives inside `_run`, which a joining caller never enters: keyed on `job_id`
+        #: alone, a stranger who guessed an in-flight id was handed somebody else's
+        #: result, receipt, reply room and DID.
+        #:
+        #: A lock was not enough. A job whose row exists but whose receipt does not is
+        #: resumable (see `handle`), and the work runs in a worker thread that no
+        #: cancellation can stop: a client that disconnected mid-job released the lock
+        #: while its thread carried on, and the retry then started a second one. Holding
+        #: the *task* and awaiting it through a shield means the disconnect abandons the
+        #: waiting, never the work — and the entry is dropped by the task's own callback,
+        #: when it has actually finished.
+        self._in_flight: dict[str, tuple[str, asyncio.Task[Outcome | None]]] = {}
 
     # ------------------------------------------------------------- validation
 
@@ -196,6 +211,62 @@ class JobRunner:
         reply_room = str(job["reply_room"])
         task = str(job["task"])
 
+        entry = self._in_flight.get(job_id)
+        if entry is not None and entry[0] != requester_did:
+            # The same refusal `_run` would give, given here because the joining caller
+            # never reaches it. `job_id` is globally unique and public; without this, one
+            # requester's in-flight work is readable by anyone who guesses its id.
+            raise RejectedJob(
+                "job_id_taken",
+                "another requester already used this job_id; choose one with a random component",
+            )
+        running = entry[1] if entry is not None else None
+        if running is None:
+            running = asyncio.create_task(
+                self._run(
+                    job=job,
+                    job_id=job_id,
+                    reply_room=reply_room,
+                    task=task,
+                    requester_did=requester_did,
+                    request_room=request_room,
+                    request_seq=request_seq,
+                    internal_test=internal_test,
+                    started=started,
+                )
+            )
+            self._in_flight[job_id] = (requester_did, running)
+            running.add_done_callback(lambda done: self._retire(job_id, done))
+        # Shielded: cancelling the caller must not cancel work that is already underway,
+        # because the thread running it would not stop anyway and the receipt is owed
+        # either way. The task carries its own timeout.
+        return await asyncio.shield(running)
+
+    def _retire(self, job_id: str, done: asyncio.Task[Outcome | None]) -> None:
+        """Drop a finished attempt, and consume its exception so the loop does not shout.
+
+        Every caller that was awaiting it has already seen the exception through the
+        shield; a task nobody is left waiting on — the disconnected client — would
+        otherwise be reported as never retrieved.
+        """
+        self._in_flight.pop(job_id, None)
+        if not done.cancelled():
+            done.exception()
+
+    async def _run(
+        self,
+        *,
+        job: dict[str, Any],
+        job_id: str,
+        reply_room: str,
+        task: str,
+        requester_did: str,
+        request_room: str,
+        request_seq: int | None,
+        internal_test: bool,
+        started: datetime,
+    ) -> Outcome | None:
+        resuming = False
         owner = self.ledger.job_requester(job_id)
         if owner is not None:
             if owner != requester_did:
@@ -208,13 +279,31 @@ class JobRunner:
                     "another requester already used this job_id; choose one with a "
                     "random component",
                 )
-            log.info(
-                "duplicate job ignored",
+            if self.ledger.get_receipt(job_id) is not None:
+                log.info(
+                    "duplicate job ignored",
+                    extra={
+                        "fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}
+                    },
+                )
+                return None
+            # The row exists and the receipt does not: a previous attempt died between
+            # inserting the job and writing its answer. "Already seen" is not "already
+            # answered", and treating it as such spent the caller's `job_id` on work they
+            # can never be shown. The tasks are pure and the row is already theirs, so
+            # this resumes rather than refusing.
+            log.warning(
+                "resuming a job whose previous attempt left no receipt",
                 extra={"fields": {"job_id": job_id, "requester": didkey.abbreviate(requester_did)}},
             )
-            return None
+            resuming = True
 
-        self.check_rate_limit(requester_did)
+        if not resuming:
+            # The rate limit counts jobs, and this job is already counted — its row is
+            # what the counter is reading. Charging again would let the limit refuse the
+            # one retry that exists to recover an answer the requester already paid for,
+            # and at a low limit that refusal lasts until the window rolls over.
+            self.check_rate_limit(requester_did)
 
         request_hash = canonical_hash(job)
         inserted = self.ledger.insert_job(
@@ -231,10 +320,11 @@ class JobRunner:
             internal_test=internal_test,
         )
         if not inserted:
-            # Lost the insert race. The row now exists, so ask whose it is: two different
-            # requesters can both pass the check above before either has written, and the
-            # loser must still be told rather than dropped — otherwise the whole squatting
-            # problem survives inside the race window.
+            # Either the row is ours from an attempt that died — the resume path above —
+            # or we lost the insert race. Two different requesters can both pass the
+            # check above before either has written, and the loser must still be told
+            # rather than dropped, otherwise the whole squatting problem survives inside
+            # the race window.
             winner = self.ledger.job_requester(job_id)
             if winner is not None and winner != requester_did:
                 raise RejectedJob(
@@ -242,7 +332,8 @@ class JobRunner:
                     "another requester already used this job_id; choose one with a "
                     "random component",
                 )
-            return None
+            if winner == requester_did and self.ledger.get_receipt(job_id) is not None:
+                return None
 
         claim = {
             "v": job_schema.PROTOCOL_VERSION,
@@ -321,15 +412,6 @@ class JobRunner:
             provider_signature=result["sig"],
             result_seq=None,
         )
-        self.ledger.update_job(
-            job_id,
-            status="completed" if status == "ok" else "failed",
-            completed_at=utcnow() if status == "ok" else None,
-            failed_at=None if status == "ok" else utcnow(),
-            latency_ms=latency_ms,
-            failure_code=failure_code,
-        )
-
         receipt = build_receipt(
             self._key,
             receipt_id=f"rcpt-{secrets.token_hex(12)}",
@@ -343,6 +425,24 @@ class JobRunner:
             provider_signature=result["sig"],
             request_seq=request_seq,
             internal_test=internal_test,
+        )
+
+        # One transaction, because marking the job finished and holding its receipt are
+        # one fact. Split across two writes, a crash in between leaves a job whose
+        # duplicate check refuses every retry and whose receipt does not exist: the work
+        # done and unprovable, with the `job_id` spent. Done here rather than in each
+        # caller so both intake lanes get it, and a third cannot forget to.
+        self.ledger.record_receipt(
+            receipt,
+            json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+            internal_test,
+            complete_job={
+                "status": "completed" if status == "ok" else "failed",
+                "completed_at": utcnow() if status == "ok" else None,
+                "failed_at": None if status == "ok" else utcnow(),
+                "latency_ms": latency_ms,
+                "failure_code": failure_code,
+            },
         )
 
         return Outcome(
