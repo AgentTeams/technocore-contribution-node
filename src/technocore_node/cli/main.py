@@ -165,12 +165,20 @@ def cmd_claim_room(args: argparse.Namespace) -> int:
     return 0
 
 
-def _existing_attestation(room: dict[str, Any], did: str, profile_hash: str) -> int | None:
-    """The seq of this node's attestation of `profile_hash`, if the room already holds one.
+def _existing_attestation(
+    room: dict[str, Any], did: str, profile_hash: str
+) -> tuple[bool, int | None]:
+    """`(present, seq)` for this node's attestation of `profile_hash` in `room`.
 
     Matched on the signer and the hash together. The signer alone is not enough — this
     node publishes receipts here too — and the hash alone is not enough, because the room
     is world-readable and a stranger's copy of our hash proves nothing.
+
+    Presence and the sequence number are two answers, because the envelope carrying the
+    sequence is untrusted like everything else in the room. A match whose `seq` is a
+    string, missing, or not a positive integer is still a **match**: returning "absent"
+    for it would write a second attestation on the strength of a malformed field, which
+    is the duplicate this guard exists to prevent, reached by a different route.
     """
     for message in room.get("messages", []):
         if message.get("from") != did:
@@ -186,8 +194,9 @@ def _existing_attestation(room: dict[str, Any], did: str, profile_hash: str) -> 
             continue
         if body.get("type") == "profile_attestation" and body.get("profile_sha256") == profile_hash:
             seq = message.get("seq")
-            return int(seq) if isinstance(seq, int) else None
-    return None
+            usable = isinstance(seq, int) and not isinstance(seq, bool) and seq > 0
+            return True, (seq if usable else None)
+    return False, None
 
 
 def cmd_publish_profile(args: argparse.Namespace) -> int:
@@ -255,11 +264,14 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 # safe, which is the case that actually occurred. A duplicate costs
                 # nothing but tidiness: same content, same signature, our own room.
                 already: int | None = None
+                already_found = False
                 read_failed: str | None = None
                 if node.owns_result_room():
                     try:
                         existing = await node.client.read_room(node.result_room)
-                        already = _existing_attestation(existing, node.did, profile_hash)
+                        found, found_seq = _existing_attestation(existing, node.did, profile_hash)
+                        already = found_seq if found else None
+                        already_found = found
                     except TechnocoreError as exc:
                         read_failed = str(exc)[:200]
 
@@ -274,7 +286,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                         "profile note published; attestation deferred, room unreadable",
                         extra={"fields": {"room": node.result_room, "error": read_failed}},
                     )
-                elif already is not None:
+                elif already_found:
                     seq = already
                     verifiable = True
                     already_present = True
@@ -296,7 +308,22 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                     if seq is not None:
                         verifiable = True
-                    if seq is None:
+                    if seq is None and not node.owns_result_room():
+                        # `publish` refused at its own sink rather than writing: ownership
+                        # or the lease stopped being confirmed between the check above and
+                        # the write. Nothing left this machine, so "it may have landed" —
+                        # true of a lost write — would be an unobserved claim here.
+                        attestation_refused = (
+                            f"the attestation was not sent: {node.result_room} stopped "
+                            "being confirmed as this node's between the check and the "
+                            "write. Nothing was written. Re-run once the lease is live."
+                        )
+                        verifiable = False
+                        log.warning(
+                            "profile note published; attestation refused at the sink",
+                            extra={"fields": {"room": node.result_room}},
+                        )
+                    elif seq is None:
                         # Attempted and did not land — an upstream 5xx, a rate limit, a
                         # refusal at the sink. Reporting `null` for both the sequence and
                         # the reason said "nothing happened" about a write that was tried

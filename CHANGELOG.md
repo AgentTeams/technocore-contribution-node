@@ -39,6 +39,15 @@
   returned the room as empty while it held a message, and no guard can out-argue a read
   that is wrong. It makes the *operator's* retry safe, which is the case that occurred. A
   duplicate costs nothing but tidiness — same content, same signature, our own room.
+- **A refusal at the sink is not a lost write.** `publish` has its own guard, and
+  ownership or the lease can stop being confirmed between the check in the command and
+  the write there. Nothing leaves the machine in that case, so reporting "it may have
+  landed" was an unobserved claim — the same error this release is about, one layer down.
+- **A match whose `seq` is unusable is still a match.** The envelope is untrusted like
+  everything else in the room; treating a `seq` of `"4"`, `-1` or `true` as *absent*
+  would have written a second attestation on the strength of a malformed field, which is
+  the duplicate the guard exists to prevent reached by another route. Presence and the
+  number are reported separately.
 - **A room message that is JSON but not an object no longer crashes the command.** `[]`,
   `null` and `"x"` all parse and none of them has `.get`. Anyone can post into a room this
   node reads, and crashing on one would have aborted after the note was published —

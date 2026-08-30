@@ -63,6 +63,11 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
             return None
 
         async def publish(self, room: str, payload: dict[str, Any]) -> int | None:
+            if behaviour.get("sink_refuses"):
+                # What `Node.publish` does when ownership stops being confirmed between
+                # the caller's check and the write: it returns None without sending.
+                self.ledger.set_state("owned_room_owner", None)
+                return None
             captured["payload"] = payload
             if behaviour.get("publish_fails"):
                 self.ledger.set_state(
@@ -262,19 +267,62 @@ def test_a_room_message_that_is_json_but_not_an_object_does_not_crash(
     string a stranger chose, and crashing on one would abort the command after the note
     was published — leaving it unverifiable, with the traceback as the only report.
     """
-    hostile = [
-        {"seq": 1, "from": "did:key:zStranger", "text": "[]"},
-        {"seq": 2, "from": "did:key:zStranger", "text": "null"},
-        {"seq": 3, "from": "did:key:zStranger", "text": '"just a string"'},
-        {"seq": 4, "from": "did:key:zStranger", "text": "not json at all"},
-        {"seq": 5, "from": "did:key:zStranger", "text": "123"},
-    ]
+    bodies = ["[]", "null", '"just a string"', "not json at all", "123", '{"a":' * 40]
 
     def room(did: str, profile_hash: str) -> dict[str, Any]:
-        return _room(*hostile, {"seq": 6, "from": did, "text": "[]"})
+        # Under OUR did as well as a stranger's: a body is only reached after the signer
+        # matches, so stranger-signed junk never exercises the parse at all.
+        ours = [{"seq": i, "from": did, "text": b} for i, b in enumerate(bodies, start=1)]
+        theirs = [
+            {"seq": 20 + i, "from": "did:key:zStranger", "text": b} for i, b in enumerate(bodies)
+        ]
+        return _room(*ours, *theirs, {"seq": 40, "from": did, "text": '{"type":"receipt"}'})
 
     out = _run(monkeypatch, args, room=room)
 
     # It read past all of them and attested normally.
     assert out["attestation_seq"] == 7
     assert out["profile_is_verifiable"] is True
+
+
+def test_a_match_with_an_unusable_seq_is_still_a_match(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """The envelope is untrusted like everything else in the room.
+
+    Treating a match whose `seq` is a string as *absent* would write a second attestation
+    on the strength of a malformed field — the duplicate this guard exists to prevent,
+    reached by another route. Presence and the number are two answers.
+    """
+    for bad in ("4", None, -1, 0, True, 1.5):
+
+        def room(did: str, h: str, bad: Any = bad) -> dict[str, Any]:
+            message = _attestation(did, h)
+            message["seq"] = bad
+            return _room(message)
+
+        out = _run(monkeypatch, args, room=room)
+
+        assert out["attestation_already_present"] is True, bad
+        assert out["profile_is_verifiable"] is True, bad
+        assert out["attestation_seq"] is None, bad
+        assert "payload" not in out["_captured"], bad
+
+
+def test_a_sink_refusal_is_not_reported_as_a_lost_write(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """Nothing left the machine, so "it may have landed" would be an unobserved claim.
+
+    `publish` has its own guard: ownership or the lease can stop being confirmed between
+    the check here and the write there. That is a deliberate local refusal, not a write
+    whose fate is unknown, and collapsing it into the unknown state is the same error
+    this release is about — made one layer down.
+    """
+    out = _run(monkeypatch, args, sink_refuses=True)
+
+    assert out["attestation_seq"] is None
+    assert out["profile_is_verifiable"] is False
+    assert "was not sent" in out["attestation_refused"]
+    assert "may have landed" not in out["attestation_refused"]
+    assert "payload" not in out["_captured"]
