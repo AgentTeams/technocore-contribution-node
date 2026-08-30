@@ -151,7 +151,7 @@ class Node:
         return seq
 
     async def publish_reporting(self, room: str, obj: dict[str, Any]) -> tuple[int | None, str]:
-        """As :meth:`publish`, and also which of four things happened.
+        """As :meth:`publish`, and also what happened.
 
         `published` — the server answered with a sequence.
         `refused_locally` / `too_large` / `bad_room` — nothing was sent.

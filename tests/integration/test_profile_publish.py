@@ -7,13 +7,18 @@ the note namespace is world-writable and anyone can put anything there under any
 So there are three outcomes, and they are not interchangeable:
 
 * published — the note is up and the signed copy in the owned room vouches for it;
-* refused — ownership was not confirmed, so nothing was written to the room on purpose;
-* attempted and lost — the write was made and did not land.
+* refused — nothing was sent, on purpose;
+* unconfirmed — a request was made and whether it landed is not known.
 
-The third was reported as two nulls, which reads like the second read like nothing at all.
-An operator seeing `attestation_seq: null, attestation_refused: null` after a 503 would
-have had no way to tell a deliberate refusal from a silent failure, and the published note
-would sit there unverifiable with nothing saying so.
+The third was reported as two nulls, which is what the second looks like and reads like
+nothing at all. An operator seeing `attestation_seq: null, attestation_refused: null`
+after a 503 had no way to tell a deliberate refusal from an open question, and the
+published note sat there unverifiable with nothing saying so.
+
+The third is *unconfirmed* and not "lost", which took this file several attempts to say
+correctly: `say_signed` POSTs and then reads back, so an error from that read arrives
+after a write that may well have succeeded. On 2026-08-30 one reported as a 503 was in the
+room afterwards, and the retry duplicated it.
 """
 
 from __future__ import annotations

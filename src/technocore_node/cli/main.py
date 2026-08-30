@@ -337,11 +337,11 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                             extra={"fields": {"room": node.result_room, "why": publish_outcome}},
                         )
                     elif seq is None:
-                        # Attempted and did not land — an upstream 5xx, a rate limit, a
-                        # refusal at the sink. Reporting `null` for both the sequence and
-                        # the reason said "nothing happened" about a write that was tried
-                        # and failed, leaving an operator to tell a deliberate refusal
-                        # from a silent loss by looking at neither. `publish` records why.
+                        # A request was made and its outcome is not known. Reporting
+                        # `null` for both the sequence and the reason said "nothing
+                        # happened" about a write that was tried, leaving an operator to
+                        # tell a deliberate refusal from an open question by looking at
+                        # neither. `publish_reporting` says which; the ledger says why.
                         detail, _ = node.ledger.get_state(f"last_publish_error:{node.result_room}")
                         attestation_refused = (
                             "the attestation was attempted and its outcome is NOT confirmed"

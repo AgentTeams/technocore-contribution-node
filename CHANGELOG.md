@@ -4,17 +4,17 @@
 
 ### Fixed
 
-- **`publish-profile` could not say that the attestation was lost.** The note and the
+- **`publish-profile` could not say that the attestation's outcome was unknown.** The note and the
   attestation are two writes with different meanings: the note is the profile, and the
   signed copy in the owned room is the only thing that makes it *this node's* profile,
   because that namespace is world-writable and anyone can put anything there.
 
-  So there are three outcomes — published, refused on purpose, and attempted-and-lost —
-  and the third reported `attestation_seq: null, attestation_refused: null`, which is what
-  the second looks like and reads like nothing having happened. Hit for real: the upstream
-  answered `503` while the profile was being published, the note went up, the attestation
-  did not, and the command said neither. The note sat published and unverifiable with
-  nothing saying so.
+  So there are three outcomes — published, refused on purpose, and *unconfirmed* — and the
+  third reported `attestation_seq: null, attestation_refused: null`, which is what the
+  second looks like and reads like nothing having happened. Hit for real: the upstream
+  answered `503` while the profile was being published, the note went up, and the command
+  said nothing about the attestation either way. The note sat published and, as far as
+  anyone could tell from the output, unverifiable — with nothing saying so.
 
   There are **three** answers, so there are three values. `profile_is_verifiable` is
   `true` when the attestation is confirmed present, `false` when nothing was written on
