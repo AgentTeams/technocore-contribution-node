@@ -16,9 +16,13 @@
   did not, and the command said neither. The note sat published and unverifiable with
   nothing saying so.
 
-  The lost case now says it was attempted, says why it failed, and says what that costs.
-  A `profile_is_verifiable` field states the conclusion rather than leaving it to be
-  inferred from two nulls.
+  There are **three** answers, so there are three values. `profile_is_verifiable` is
+  `true` when the attestation is confirmed present, `false` when nothing was written on
+  purpose, and **`null` when a write was made whose outcome nobody knows** — because "it
+  failed" is as much a false certainty as silence was, and the write that prompted all
+  this had in fact landed. `attestation_already_present` is `null` unless the room was
+  actually read: reporting `false` for "we never looked" asserts an absence nobody
+  observed.
 - **And re-running it no longer attests twice.** Re-running is how an operator recovers a
   failed attestation; it was also how they produced a second one, which is how the room
   came to hold two identical attestations that day — the `503` was reported for a write
@@ -35,6 +39,10 @@
   returned the room as empty while it held a message, and no guard can out-argue a read
   that is wrong. It makes the *operator's* retry safe, which is the case that occurred. A
   duplicate costs nothing but tidiness — same content, same signature, our own room.
+- **A room message that is JSON but not an object no longer crashes the command.** `[]`,
+  `null` and `"x"` all parse and none of them has `.get`. Anyone can post into a room this
+  node reads, and crashing on one would have aborted after the note was published —
+  leaving it unverifiable with a traceback as the only report.
 
 ## v0.2.0 — 2026-08-30
 

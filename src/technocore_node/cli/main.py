@@ -179,6 +179,11 @@ def _existing_attestation(room: dict[str, Any], did: str, profile_hash: str) -> 
             body = json.loads(str(message.get("text", "")))
         except json.JSONDecodeError:
             continue
+        if not isinstance(body, dict):
+            # `[]`, `null` and `"x"` are all valid JSON and none of them has `.get`.
+            # Anyone can post into a room this node reads, so a message that parses is
+            # still only a string a stranger chose.
+            continue
         if body.get("type") == "profile_attestation" and body.get("profile_sha256") == profile_hash:
             seq = message.get("seq")
             return int(seq) if isinstance(seq, int) else None
@@ -209,6 +214,14 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
 
             seq: int | None = None
             attestation_refused: str | None = None
+            #: True when the attestation is confirmed present, False when nothing was
+            #: written on purpose, and None when a write was made whose outcome nobody
+            #: knows. Three states because there are three answers, and collapsing the
+            #: third into the second is the defect this release exists to fix.
+            verifiable: bool | None = False
+            #: None unless the room was actually read. Reporting `false` for "we never
+            #: looked" asserts an absence nobody observed.
+            already_present: bool | None = None
 
             if not args.dry_run:
                 await node.client.set_note(namespace, key, value)
@@ -263,11 +276,14 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                 elif already is not None:
                     seq = already
+                    verifiable = True
+                    already_present = True
                     log.info(
                         "profile already attested; nothing written",
                         extra={"fields": {"room": node.result_room, "seq": already}},
                     )
                 elif node.owns_result_room():
+                    already_present = False
                     seq = await node.publish(
                         node.result_room,
                         {
@@ -278,6 +294,8 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                             "profile_sha256": profile_hash,
                         },
                     )
+                    if seq is not None:
+                        verifiable = True
                     if seq is None:
                         # Attempted and did not land — an upstream 5xx, a rate limit, a
                         # refusal at the sink. Reporting `null` for both the sequence and
@@ -286,15 +304,17 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                         # from a silent loss by looking at neither. `publish` records why.
                         detail, _ = node.ledger.get_state(f"last_publish_error:{node.result_room}")
                         attestation_refused = (
-                            "the attestation was attempted and did not land"
+                            "the attestation was attempted and its outcome is NOT confirmed"
                             + (f": {detail}" if detail else "")
-                            + ". The profile note is published but unverifiable until it "
-                            "does — that namespace is world-writable. Re-run this command."
+                            + ". It may have landed: on 2026-08-30 a write reported as a "
+                            "503 was in the room afterwards. Re-run this command — it "
+                            "reads the room first and will not write a second one."
                         )
                         log.warning(
-                            "profile note published; attestation did not land",
+                            "profile note published; attestation outcome unconfirmed",
                             extra={"fields": {"room": node.result_room, "error": detail}},
                         )
+                        verifiable = None
                 else:
                     owner, _ = node.ledger.get_state("owned_room_owner")
                     attestation_refused = (
@@ -317,8 +337,8 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 # Stated rather than left to be inferred from two nulls. The note on its
                 # own proves nothing: anyone can write to that namespace, and only the
                 # signed copy in the owned room says which note is this node's.
-                "profile_is_verifiable": seq is not None,
-                "attestation_already_present": already is not None if not args.dry_run else None,
+                "profile_is_verifiable": verifiable,
+                "attestation_already_present": already_present,
                 "profile": profile,
             }
         finally:

@@ -51,15 +51,16 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
                 self.ledger.set_state("owned_room_observed", "1")
                 self.ledger.set_state("owned_room_error", None)
                 self.ledger.set_state("owned_room_renewed", utcnow())
+            else:
+                # Cleared explicitly. Runs in one test share a state directory, so
+                # "did not set it" is not the same as "it is not set" — and a test that
+                # passes on leftovers from the run before it is not testing this one.
+                self.ledger.set_state("owned_room_owner", None)
+                self.ledger.set_state("owned_room_observed", None)
+                self.ledger.set_state("owned_room_renewed", None)
 
         async def observe_reachability(self) -> None:
             return None
-
-        async def read_room_stub(self, room: str, **kw: Any) -> dict[str, Any]:
-            if behaviour.get("room_fails"):
-                raise cli.TechnocoreError(behaviour["room_fails"])
-            build = behaviour.get("room")
-            return build(self.did, captured["hash"]) if build else _room()
 
         async def publish(self, room: str, payload: dict[str, Any]) -> int | None:
             captured["payload"] = payload
@@ -106,19 +107,39 @@ def test_a_landed_attestation_is_reported_as_verifiable(
     assert out["_captured"]["payload"]["profile_sha256"] == out["profile_sha256"]
 
 
-def test_an_attestation_that_did_not_land_says_so_and_says_why(
+def test_an_unconfirmed_attestation_is_not_reported_as_a_failed_one(
     monkeypatch: pytest.MonkeyPatch, args: Any
 ) -> None:
-    """The case that read as two nulls. It is the one an operator most needs to see."""
+    """The case that read as two nulls — and the trap in fixing it.
+
+    "It failed" is as much a false certainty as silence was. The write may have landed:
+    on 2026-08-30 one reported as a 503 was in the room afterwards. So the third state is
+    *unknown*, and `profile_is_verifiable` is None rather than False, because False is a
+    claim about the room that nobody made.
+    """
     out = _run(monkeypatch, args, publish_fails=True, error="HTTP 503: Service Unavailable")
 
     assert out["attestation_seq"] is None
-    assert out["profile_is_verifiable"] is False
+    assert out["profile_is_verifiable"] is None
     assert out["attestation_refused"] is not None
-    assert "did not land" in out["attestation_refused"]
+    assert "NOT confirmed" in out["attestation_refused"]
     assert "503" in out["attestation_refused"]
-    # And it says what that costs, rather than leaving the reader to work it out.
-    assert "unverifiable" in out["attestation_refused"]
+    assert "may have landed" in out["attestation_refused"]
+    # And it says the safe way out, rather than leaving the reader to invent one.
+    assert "re-run" in out["attestation_refused"].lower()
+
+
+def test_the_three_states_are_three_different_values(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """Confirmed, deliberately not written, and unknown. None may collapse into another."""
+    landed = _run(monkeypatch, args)
+    refused = _run(monkeypatch, args, owned=False)
+    unknown = _run(monkeypatch, args, publish_fails=True)
+
+    assert landed["profile_is_verifiable"] is True
+    assert refused["profile_is_verifiable"] is False
+    assert unknown["profile_is_verifiable"] is None
 
 
 def test_a_deliberate_refusal_is_still_distinguishable(
@@ -129,8 +150,9 @@ def test_a_deliberate_refusal_is_still_distinguishable(
 
     assert out["attestation_seq"] is None
     assert out["profile_is_verifiable"] is False
+    assert out["attestation_already_present"] is None  # the room was never read
     assert "not confirmed as owned" in out["attestation_refused"]
-    assert "did not land" not in out["attestation_refused"]
+    assert "NOT confirmed" not in out["attestation_refused"]
     # Nothing was sent to the room at all.
     assert "payload" not in out["_captured"]
 
@@ -221,8 +243,38 @@ def test_an_unreadable_room_defers_rather_than_writing_blind(
     out = _run(monkeypatch, args, room_fails="HTTP 503: Service Unavailable")
 
     assert out["attestation_seq"] is None
+    # Nothing was written, so this one really is False rather than unknown.
     assert out["profile_is_verifiable"] is False
+    # But no absence was observed, so the guard reports None rather than claiming one.
+    assert out["attestation_already_present"] is None
     assert "could not be read" in out["attestation_refused"]
     assert "503" in out["attestation_refused"]
     assert "re-run" in out["attestation_refused"]
     assert "payload" not in out["_captured"]
+
+
+def test_a_room_message_that_is_json_but_not_an_object_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """`[]`, `null` and `"x"` are all valid JSON and none of them has `.get`.
+
+    Anyone can post into a room this node reads. A message that parses is still only a
+    string a stranger chose, and crashing on one would abort the command after the note
+    was published — leaving it unverifiable, with the traceback as the only report.
+    """
+    hostile = [
+        {"seq": 1, "from": "did:key:zStranger", "text": "[]"},
+        {"seq": 2, "from": "did:key:zStranger", "text": "null"},
+        {"seq": 3, "from": "did:key:zStranger", "text": '"just a string"'},
+        {"seq": 4, "from": "did:key:zStranger", "text": "not json at all"},
+        {"seq": 5, "from": "did:key:zStranger", "text": "123"},
+    ]
+
+    def room(did: str, profile_hash: str) -> dict[str, Any]:
+        return _room(*hostile, {"seq": 6, "from": did, "text": "[]"})
+
+    out = _run(monkeypatch, args, room=room)
+
+    # It read past all of them and attested normally.
+    assert out["attestation_seq"] == 7
+    assert out["profile_is_verifiable"] is True
