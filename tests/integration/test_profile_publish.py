@@ -62,19 +62,27 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
         async def observe_reachability(self) -> None:
             return None
 
-        async def publish(self, room: str, payload: dict[str, Any]) -> int | None:
+        async def publish_reporting(
+            self, room: str, payload: dict[str, Any]
+        ) -> tuple[int | None, str]:
             if behaviour.get("sink_refuses"):
-                # What `Node.publish` does when ownership stops being confirmed between
-                # the caller's check and the write: it returns None without sending.
-                self.ledger.set_state("owned_room_owner", None)
-                return None
+                # What `Node.publish_reporting` does when ownership stops being confirmed
+                # between the caller's check and the write: nothing is sent, and it says
+                # so rather than leaving the caller to infer it.
+                if not behaviour.get("recovers_after"):
+                    self.ledger.set_state("owned_room_owner", None)
+                return None, "refused_locally"
             captured["payload"] = payload
             if behaviour.get("publish_fails"):
                 self.ledger.set_state(
                     f"last_publish_error:{room}", behaviour.get("error", "HTTP 503")
                 )
-                return None
-            return 7
+                if behaviour.get("lapses_after"):
+                    # The lease dies after the request went out. That is a separate fact
+                    # from the request's fate, and must not rewrite it.
+                    self.ledger.set_state("owned_room_owner", None)
+                return None, "unconfirmed"
+            return 7, "published"
 
     async def set_note(self: Any, ns: str, key: str, value: str) -> None:
         captured["note"] = value
@@ -326,3 +334,34 @@ def test_a_sink_refusal_is_not_reported_as_a_lost_write(
     assert "was not sent" in out["attestation_refused"]
     assert "may have landed" not in out["attestation_refused"]
     assert "payload" not in out["_captured"]
+    # And it did not have to read mutable state back to know that.
+    assert "stopped being confirmed" in out["attestation_refused"]
+
+
+def test_the_reason_comes_from_the_write_not_from_reading_state_back(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """Ownership recovering after a real refusal must not turn it into "may have landed".
+
+    Inferring the reason by re-reading `owns_result_room()` after the fact is a guess, and
+    it can be wrong in both directions — ownership can lapse between a real send and the
+    re-read, or recover between a local refusal and it. `publish_reporting` knows which
+    happened at the point it happens, so this asserts the report survives the state moving
+    afterwards.
+    """
+    out = _run(monkeypatch, args, sink_refuses=True, recovers_after=True)
+
+    assert out["profile_is_verifiable"] is False
+    assert "was not sent" in out["attestation_refused"]
+    assert "may have landed" not in out["attestation_refused"]
+
+
+def test_an_unconfirmed_write_stays_unconfirmed_even_if_ownership_lapses_after(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """The other direction. The request went out; losing the lease afterwards is separate."""
+    out = _run(monkeypatch, args, publish_fails=True, lapses_after=True)
+
+    assert out["profile_is_verifiable"] is None
+    assert "NOT confirmed" in out["attestation_refused"]
+    assert "may have landed" in out["attestation_refused"]

@@ -265,6 +265,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 # nothing but tidiness: same content, same signature, our own room.
                 already: int | None = None
                 already_found = False
+                publish_outcome = ""
                 read_failed: str | None = None
                 if node.owns_result_room():
                     try:
@@ -296,7 +297,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                 elif node.owns_result_room():
                     already_present = False
-                    seq = await node.publish(
+                    seq, publish_outcome = await node.publish_reporting(
                         node.result_room,
                         {
                             "v": "1",
@@ -308,20 +309,24 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                     if seq is not None:
                         verifiable = True
-                    if seq is None and not node.owns_result_room():
-                        # `publish` refused at its own sink rather than writing: ownership
-                        # or the lease stopped being confirmed between the check above and
-                        # the write. Nothing left this machine, so "it may have landed" —
-                        # true of a lost write — would be an unobserved claim here.
+                    if publish_outcome in ("refused_locally", "too_large"):
+                        # Nothing left this machine. `publish_reporting` says so rather
+                        # than this reading mutable state back and guessing, which can be
+                        # wrong in both directions: ownership can lapse between a real
+                        # send and the re-read, or recover between a refusal and it.
+                        reason = (
+                            f"{node.result_room} stopped being confirmed as this node's "
+                            "between the check and the write"
+                            if publish_outcome == "refused_locally"
+                            else "the attestation exceeded the single-message limit"
+                        )
                         attestation_refused = (
-                            f"the attestation was not sent: {node.result_room} stopped "
-                            "being confirmed as this node's between the check and the "
-                            "write. Nothing was written. Re-run once the lease is live."
+                            f"the attestation was not sent: {reason}. Nothing was written."
                         )
                         verifiable = False
                         log.warning(
-                            "profile note published; attestation refused at the sink",
-                            extra={"fields": {"room": node.result_room}},
+                            "profile note published; attestation not sent",
+                            extra={"fields": {"room": node.result_room, "why": publish_outcome}},
                         )
                     elif seq is None:
                         # Attempted and did not land — an upstream 5xx, a rate limit, a

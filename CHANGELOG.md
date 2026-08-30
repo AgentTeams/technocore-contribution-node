@@ -39,10 +39,18 @@
   returned the room as empty while it held a message, and no guard can out-argue a read
   that is wrong. It makes the *operator's* retry safe, which is the case that occurred. A
   duplicate costs nothing but tidiness — same content, same signature, our own room.
-- **A refusal at the sink is not a lost write.** `publish` has its own guard, and
-  ownership or the lease can stop being confirmed between the check in the command and
-  the write there. Nothing leaves the machine in that case, so reporting "it may have
-  landed" was an unobserved claim — the same error this release is about, one layer down.
+- **A refusal at the sink is not a lost write, and the difference is returned rather than
+  guessed.** `publish` has its own guard, and ownership or the lease can stop being
+  confirmed between the check in the command and the write there. Nothing leaves the
+  machine in that case, so reporting "it may have landed" was an unobserved claim — the
+  same error this release is about, one layer down.
+
+  The first attempt at fixing it re-read `owns_result_room()` afterwards and inferred
+  which had happened. That is a guess, and it is wrong in both directions: ownership can
+  lapse between a real send and the re-read, or recover between a refusal and it. So
+  `Node.publish_reporting` returns the outcome — `published`, `refused_locally`,
+  `too_large`, `unconfirmed` — from the point where it is known. `publish` keeps its
+  signature and its six callers; only the one that needs the reason asks for it.
 - **A match whose `seq` is unusable is still a match.** The envelope is untrusted like
   everything else in the room; treating a `seq` of `"4"`, `-1` or `true` as *absent*
   would have written a second attestation on the strength of a malformed field, which is

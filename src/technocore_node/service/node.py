@@ -142,7 +142,27 @@ class Node:
     # ------------------------------------------------------------ publication
 
     async def publish(self, room: str, obj: dict[str, Any]) -> int | None:
-        """Post one protocol object as a single compact line, and record the outcome.
+        """Post one protocol object as a single compact line. The sequence, or None.
+
+        Most callers only need to know whether it landed. One needs to know *why* it did
+        not, and `None` cannot say — see :meth:`publish_reporting`.
+        """
+        seq, _ = await self.publish_reporting(room, obj)
+        return seq
+
+    async def publish_reporting(self, room: str, obj: dict[str, Any]) -> tuple[int | None, str]:
+        """As :meth:`publish`, and also which of four things happened.
+
+        `refused_locally` and `too_large` mean nothing was sent. `unconfirmed` means a
+        request went out and its fate is unknown — the upstream returned an error, or the
+        read-back failed, and it may still be in the room. `published` means the server
+        answered with a sequence.
+
+        Three of those collapse into `None`, and a caller that has to distinguish them
+        was inferring which by re-reading mutable state afterwards. That is a guess, and
+        it can be wrong in both directions: ownership can lapse between a real send and
+        the re-read, or recover between a local refusal and it. The distinction is known
+        here, at the point where it happens, so it is returned rather than reconstructed.
 
         `ensure_ascii=True` is not cosmetic: it guarantees the payload is already stable
         under the server's single-line sweep, so the bytes signed and the bytes stored are
@@ -165,7 +185,7 @@ class Node:
                 "refusing to write to the result room: ownership is not confirmed",
                 extra={"fields": {"room": room, "type": obj.get("type")}},
             )
-            return None
+            return None, "refused_locally"
 
         text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         if len(text) > MAX_TEXT_CHARS:
@@ -173,7 +193,7 @@ class Node:
                 "refusing to publish an oversized message",
                 extra={"fields": {"room": room, "chars": len(text), "type": obj.get("type")}},
             )
-            return None
+            return None, "too_large"
         try:
             confirmation = await self.client.say_signed(room, text)
         except (RateLimited, DuplicateRefused, TechnocoreError) as exc:
@@ -198,7 +218,10 @@ class Node:
                     "fields": {"room": room, "type": obj.get("type"), "error": type(exc).__name__}
                 },
             )
-            return None
+            # The request was made. Whether it landed is not known from here: `say_signed`
+            # raises both for a refusal and for a reply that never arrived, and on
+            # 2026-08-30 a write reported as a 503 was in the room afterwards.
+            return None, "unconfirmed"
 
         if room in (self.result_room, self.mailbox):
             self.ledger.set_state(f"last_publish_error:{room}", None)
@@ -215,7 +238,7 @@ class Node:
             status="confirmed",
             confirmed_at=utcnow(),
         )
-        return confirmation.seq
+        return confirmation.seq, "published"
 
     # ------------------------------------------------------------ mailbox loop
 
