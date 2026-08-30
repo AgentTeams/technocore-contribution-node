@@ -27,6 +27,16 @@ the pieces are assembled and running.
   any single sleep.
 - A test asserts the observation interval leaves the freshness limit real room. A loop
   that looks exactly as often as the gate expires is decorative.
+- **The renewal deadline is read from a clock, not counted down.** Subtracting the sleep
+  that was *asked for* is not the same as subtracting the time that *passed*: a
+  `sleep(300)` returning six days late — a blocked event loop — still cost the counter
+  300, so it went on believing hours remained while the lease expired underneath it.
+- **And a second clock, because neither sees everything.** The loop's monotonic deadline
+  drives the ordinary cadence and survives a stalled loop; it does not advance while a
+  Linux host is suspended, so the recorded renewal timestamp — wall clock, and the same
+  value the gate reads — is consulted too. Either being due is enough, and an absent or
+  unreadable timestamp counts as due: renewing sooner than necessary costs one request,
+  and not renewing costs the room.
 
 ### Unchanged
 
