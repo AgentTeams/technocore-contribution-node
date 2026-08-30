@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.1.4 — 2026-08-30
+
+One clock was doing two jobs.
+
+### The gap
+
+`v0.1.3` renews the ownership lease every six hours, which is right against a seven-day
+expiry. It observed ownership on the same cycle — and an observation expires in fifteen
+minutes (`OWNERSHIP_MAX_AGE_SECONDS`). So for five and three-quarter hours out of every
+six, the gate read `the result room ownership check is stale`.
+
+Harmless as deployed, because the mailbox loop observes every cycle and intake is off
+either way. Not harmless for any intake that runs without such a loop behind it: it would
+refuse nearly every request, fail-closed and for no reason a caller could act on — enabled
+and useless.
+
+Found by reading production after `v0.1.3` went out, not by review. It appears only when
+the pieces are assembled and running.
+
+### Fixed
+
+- **Ownership is observed every 5 minutes**, well inside the freshness limit, while
+  renewal keeps its six-hour schedule and its failure backoff. Sleeps are
+  observation-sized, so the tests assert the gap between renewal *attempts* rather than
+  any single sleep.
+- A test asserts the observation interval leaves the freshness limit real room. A loop
+  that looks exactly as often as the gate expires is decorative.
+
+### Unchanged
+
+Intake is still disabled on the mailbox lane, third-party usage is still zero, and no
+affiliation, endorsement or reward is claimed.
+
 ## v0.1.3 — 2026-08-30
 
 A claim is a lease. Nothing was renewing it.
