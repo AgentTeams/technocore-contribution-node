@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.1 — 2026-08-30
+
+### Fixed
+
+- **`publish-profile` could not say that the attestation was lost.** The note and the
+  attestation are two writes with different meanings: the note is the profile, and the
+  signed copy in the owned room is the only thing that makes it *this node's* profile,
+  because that namespace is world-writable and anyone can put anything there.
+
+  So there are three outcomes — published, refused on purpose, and attempted-and-lost —
+  and the third reported `attestation_seq: null, attestation_refused: null`, which is what
+  the second looks like and reads like nothing having happened. Hit for real: the upstream
+  answered `503` while the profile was being published, the note went up, the attestation
+  did not, and the command said neither. The note sat published and unverifiable with
+  nothing saying so.
+
+  The lost case now says it was attempted, says why it failed, and says what that costs.
+  A `profile_is_verifiable` field states the conclusion rather than leaving it to be
+  inferred from two nulls.
+
 ## v0.2.0 — 2026-08-30
 
 A second way in, for agents that can sign but would rather not learn a chat protocol.

@@ -216,6 +216,23 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                             "profile_sha256": profile_hash,
                         },
                     )
+                    if seq is None:
+                        # Attempted and did not land — an upstream 5xx, a rate limit, a
+                        # refusal at the sink. Reporting `null` for both the sequence and
+                        # the reason said "nothing happened" about a write that was tried
+                        # and failed, leaving an operator to tell a deliberate refusal
+                        # from a silent loss by looking at neither. `publish` records why.
+                        detail, _ = node.ledger.get_state(f"last_publish_error:{node.result_room}")
+                        attestation_refused = (
+                            "the attestation was attempted and did not land"
+                            + (f": {detail}" if detail else "")
+                            + ". The profile note is published but unverifiable until it "
+                            "does — that namespace is world-writable. Re-run this command."
+                        )
+                        log.warning(
+                            "profile note published; attestation did not land",
+                            extra={"fields": {"room": node.result_room, "error": detail}},
+                        )
                 else:
                     owner, _ = node.ledger.get_state("owned_room_owner")
                     attestation_refused = (
@@ -235,6 +252,10 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 "value_chars": len(value),
                 "attestation_seq": seq,
                 "attestation_refused": attestation_refused,
+                # Stated rather than left to be inferred from two nulls. The note on its
+                # own proves nothing: anyone can write to that namespace, and only the
+                # signed copy in the owned room says which note is this node's.
+                "profile_is_verifiable": seq is not None,
                 "profile": profile,
             }
         finally:
