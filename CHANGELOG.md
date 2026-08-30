@@ -49,17 +49,16 @@ which is true. **Third-party usage of this node remains zero.**
   this node came to publish somebody else's number about itself. A resumed job takes the
   classification from its own row.
 
-  A declaration whose job never arrives — the write failed, the command died before
-  sending — is swept after a day, from the ownership loop, which runs whether or not intake
-  is enabled. **Only while the mailbox lane is open**, though: with the gate shut the
-  cursor holds and a declared job sits in the room unprocessed, so a declaration dropped on
-  a timer would be dropped out from under a job that is still coming — and the node would
-  run its own test as a stranger's and publish the receipt as third-party work. The
-  cleanup must not be able to cause the accident it cleans up after.
+  **Nothing expires a declaration**, and that is deliberate. Three attempts at a timer to
+  drop the ones whose job never arrived each reintroduced the accident this release exists
+  to prevent: the job was still coming — the gate was shut, the poll was failing, the
+  cursor was behind — and the declaration went first, so the node would have run its own
+  test as a stranger's and published the receipt as third-party work. No amount of elapsed
+  time is evidence that a message will not arrive.
 
-  So with intake disabled nothing is swept. Growth is then bounded by how often an operator
-  runs `selftest` and it fails before its job lands, which is not a rate anything else here
-  is measured against.
+  So they are kept. One is a short row, written only when an operator runs `selftest`, and
+  only by the runs whose job never landed. Rebuilding the same fault a fourth time is more
+  expensive than the rows.
 
   It does not exempt the job from anything else. A declared test still meets the same
   execution gate and the same rate limit as any other work, in both lanes, and an orphan

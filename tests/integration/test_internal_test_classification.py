@@ -16,7 +16,6 @@ the `job_id` is known, rather than passed in by the caller who happens to win th
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -217,18 +216,6 @@ async def test_the_declaration_is_spent_by_the_insert_and_not_before(node: Node)
     assert node.ledger.is_expected_internal_test(did, "selftest-0000000000000006") is False
 
 
-async def test_a_declaration_whose_job_never_arrives_is_swept(node: Node) -> None:
-    """The write failed, or the command died before sending. Nothing will ever spend it."""
-    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
-    node.ledger.expect_internal_test(did, "selftest-000000000000000a")
-
-    assert node.ledger.sweep_expected_internal_tests(older_than_seconds=3600) == 0
-    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000a") is True
-
-    assert node.ledger.sweep_expected_internal_tests(older_than_seconds=-1) == 1
-    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000a") is False
-
-
 async def test_a_resumed_job_keeps_the_classification_its_row_already_has(node: Node) -> None:
     """The declaration is spent by the first attempt; the row is what survives.
 
@@ -255,89 +242,44 @@ async def test_a_resumed_job_keeps_the_classification_its_row_already_has(node: 
     assert node.ledger.metrics()["total_jobs"] == 0
 
 
-def _own_and_open(node: Node) -> None:
-    from technocore_node.ledger.db import utcnow
+def test_nothing_expires_a_declaration(node: Node) -> None:
+    """Deliberate, and hard-won.
 
-    node.ledger.set_state("owned_room_owner", node.did)
-    node.ledger.set_state("owned_room_observed", "1")
-    node.ledger.set_state("owned_room_error", None)
-    node.ledger.set_state("owned_room_renewed", utcnow())
-    object.__setattr__(node.settings, "mailbox_enabled", True)
-    object.__setattr__(node.settings, "public_url", "https://example.invalid")
+    Three attempts at a timer that drops declarations whose job never arrived each
+    reintroduced the accident this exists to prevent — the job was still coming (the gate
+    was shut, the poll was failing, the cursor was behind) and the declaration went first,
+    so the node ran its own test as a stranger's. No amount of elapsed time is evidence
+    that a message will not arrive.
 
-
-def test_a_declaration_is_not_swept_while_its_job_may_still_be_waiting(node: Node) -> None:
-    """The cleanup must not be able to cause the accident it cleans up after.
-
-    With the gate shut the cursor holds and the message sits in the room unprocessed. A
-    declaration dropped on a timer would be dropped out from under a job that is still
-    coming — and the node would then run its own test as a stranger's and publish the
-    receipt as third-party work.
+    So they are kept. One is a short row, written only when an operator runs `selftest`,
+    and only by the runs whose job never landed. This asserts the absence of the cleanup,
+    because the next person to notice the rows will want to add one back.
     """
+    assert not hasattr(node.ledger, "sweep_expected_internal_tests")
+    assert not hasattr(node, "_sweep_stale_declarations")
+
     did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
     node.ledger.expect_internal_test(did, "selftest-000000000000000b")
-    object.__setattr__(node.settings, "mailbox_enabled", False)
-
-    node.DECLARATION_MAX_AGE_SECONDS = -1  # type: ignore[misc]
-    node._sweep_stale_declarations()
 
     assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000b") is True
 
 
-def test_it_is_swept_once_the_lane_that_would_consume_it_is_open(node: Node) -> None:
-    """Then a waiting job is actually being read, and one this old is not coming."""
+async def test_a_declaration_survives_a_closed_gate_and_still_classifies(node: Node) -> None:
+    """The sequence that broke all three timers, end to end.
+
+    The job is declared, the gate is shut so nothing reads it, time passes, and the gate
+    opens. The classification has to survive all of that — it is the only thing standing
+    between this node's own test and a public claim that somebody used it.
+    """
     did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
     node.ledger.expect_internal_test(did, "selftest-000000000000000c")
-    _own_and_open(node)
-    assert node.lane_is_open("mailbox")[0] is True
+    object.__setattr__(node.settings, "mailbox_enabled", False)
 
-    node.DECLARATION_MAX_AGE_SECONDS = -1  # type: ignore[misc]
-    node._sweep_stale_declarations()
+    # However long it is shut. There is no longer anything that could remove the
+    # declaration in the meantime, which is the property being asserted.
+    object.__setattr__(node.settings, "mailbox_enabled", True)
+    outcome = await _run(node, did, "selftest-000000000000000c")
 
-    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000c") is False
-
-
-def test_a_fresh_declaration_survives_a_sweep(node: Node) -> None:
-    """The window is a day against the seconds the self-test takes to post."""
-    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
-    node.ledger.expect_internal_test(did, "selftest-000000000000000d")
-    _own_and_open(node)
-
-    node._sweep_stale_declarations()
-
-    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000d") is True
-    assert Node.DECLARATION_MAX_AGE_SECONDS >= 24 * 3600
-
-
-async def test_the_sweep_runs_from_the_loop_that_always_runs(
-    node: Node, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Not from the mailbox loop, which does not start when intake is disabled.
-
-    That is the production default, and a cleanup that never runs there is not a cleanup.
-    """
-    swept = 0
-
-    def count() -> None:
-        nonlocal swept
-        swept += 1
-
-    async def stop(seconds: float) -> None:
-        raise asyncio.CancelledError
-
-    async def renew() -> str:
-        return "renewed"
-
-    monkeypatch.setattr(node, "_sweep_stale_declarations", count)
-    monkeypatch.setattr(node, "maintain_result_room_ownership", renew)
-
-    async def nothing() -> None:
-        return None
-
-    monkeypatch.setattr(node, "observe_reachability", nothing)
-    monkeypatch.setattr(asyncio, "sleep", stop)
-
-    with pytest.raises(asyncio.CancelledError):
-        await node.run_ownership_lease()
-
-    assert swept == 1
+    assert outcome is not None
+    assert outcome.internal_test is True
+    assert node.ledger.metrics()["total_jobs"] == 0

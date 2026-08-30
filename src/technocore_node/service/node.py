@@ -852,35 +852,6 @@ class Node:
         )
         return "unclaimable"
 
-    #: How long a declaration of an internal test is kept when its job never arrives.
-    #: Generous against the seconds the self-test takes between declaring and posting,
-    #: because the cost of keeping one too long is a row and the cost of dropping one too
-    #: early is this node counting its own test as somebody else's.
-    DECLARATION_MAX_AGE_SECONDS = 24 * 3600
-
-    def _sweep_stale_declarations(self) -> None:
-        """Drop internal-test declarations whose job will never arrive — carefully.
-
-        Only while the mailbox lane is open, because that is the condition under which a
-        waiting job is actually being consumed. With the gate shut the cursor holds, the
-        message sits in the room unprocessed, and a declaration removed on a timer would
-        be removed out from under a job that is still coming: the node would then run its
-        own test as a stranger's and publish the receipt as third-party work. That is the
-        accident this release exists to prevent, arriving by way of the cleanup for it.
-
-        So with intake disabled nothing is swept. Growth is bounded by how often an
-        operator runs `selftest` and it fails before its job lands, which is not a rate
-        anything else in this system is measured against.
-        """
-        if not self.lane_is_open("mailbox")[0]:
-            return
-        dropped = self.ledger.sweep_expected_internal_tests(self.DECLARATION_MAX_AGE_SECONDS)
-        if dropped:
-            log.info(
-                "dropped internal-test declarations whose job never arrived",
-                extra={"fields": {"count": dropped}},
-            )
-
     async def run_ownership_lease(self) -> None:
         """Renew the lease forever, whatever else this node is or is not doing.
 
@@ -947,7 +918,6 @@ class Node:
                 # The gate reads an observation that expires in minutes; the renewal
                 # writes on a schedule measured in hours.
                 await self.observe_reachability()
-                self._sweep_stale_declarations()
             except asyncio.CancelledError:
                 raise
             except Exception:

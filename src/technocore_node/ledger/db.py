@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -485,25 +485,19 @@ class Ledger:
         would open a window in which the declaration is gone and the row does not exist
         yet, and a process that died in it would leave the next attempt with neither.
         That window is a crash, which is exactly how the misclassification happened.
+
+        **Nothing expires these.** Three attempts at a timer that drops the ones whose job
+        never arrived each reintroduced the accident this exists to prevent: the job was
+        still coming — the gate was shut, the poll was failing, the cursor was behind — and
+        the declaration went first, so the node ran its own test as a stranger's and
+        published the receipt as third-party work. No amount of elapsed time is evidence
+        that a message will not arrive.
+
+        So they are kept. One is a short row, they are written only when an operator runs
+        `selftest`, and only the runs whose job never landed leave one behind. That is a
+        cost worth paying rather than rebuilding the same fault a fourth time.
         """
         return self.get_state(f"internal_test_expect:{requester_did}:{job_id}")[0] is not None
-
-    def sweep_expected_internal_tests(self, older_than_seconds: float = 3600) -> int:
-        """Drop declarations whose job never arrived. Returns how many.
-
-        A declaration is spent when its job is inserted, so what is left is the ones whose
-        write failed or whose command died before sending. The self-test posts within
-        seconds of declaring, so an hour is generous — and without this they would sit in
-        the ledger for its lifetime.
-        """
-        cutoff = (datetime.now(UTC) - timedelta(seconds=older_than_seconds)).isoformat()
-        with self.tx() as conn:
-            cursor = conn.execute(
-                "DELETE FROM deployment_state WHERE key LIKE 'internal_test_expect:%' "
-                "AND updated_at < ?",
-                (cutoff,),
-            )
-            return int(cursor.rowcount or 0)
 
     def record_receipt(
         self,
