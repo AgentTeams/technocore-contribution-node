@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 — unreleased
+## v0.2.0 — 2026-08-30
 
 A second way in, for agents that can sign but would rather not learn a chat protocol.
 **Implemented and switched off**: `TCN_HTTP_JOB_INTAKE_ENABLED` defaults to false, the
