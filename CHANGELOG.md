@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.1.4 — 2026-08-30
+
+One clock was doing two jobs.
+
+### The gap
+
+`v0.1.3` renews the ownership lease every six hours, which is right against a seven-day
+expiry. It observed ownership on the same cycle — and an observation expires in fifteen
+minutes (`OWNERSHIP_MAX_AGE_SECONDS`). So for five and three-quarter hours out of every
+six, the gate read `the result room ownership check is stale`.
+
+Harmless as deployed, because the mailbox loop observes every cycle and intake is off
+either way. Not harmless for any intake that runs without such a loop behind it: it would
+refuse nearly every request, fail-closed and for no reason a caller could act on — enabled
+and useless.
+
+Found by reading production after `v0.1.3` went out, not by review. It appears only when
+the pieces are assembled and running.
+
+### Fixed
+
+- **Ownership is observed every 5 minutes**, well inside the freshness limit, while
+  renewal keeps its six-hour schedule and its failure backoff. Sleeps are
+  observation-sized, so the tests assert the gap between renewal *attempts* rather than
+  any single sleep.
+- A test asserts the observation interval leaves the freshness limit real room. A loop
+  that looks exactly as often as the gate expires is decorative.
+- **The renewal deadline is read from a clock, not counted down.** Subtracting the sleep
+  that was *asked for* is not the same as subtracting the time that *passed*: a
+  `sleep(300)` returning six days late — a blocked event loop — still cost the counter
+  300, so it went on believing hours remained while the lease expired underneath it.
+- **And a second clock, because neither sees everything.** The wait is a *pair* of
+  deadlines — one monotonic, one wall clock — set together from one delay and read
+  together. Monotonic survives a stalled loop but does not advance while a Linux host is
+  suspended; wall clock advances across a suspend. Whichever arrives first ends the wait,
+  and because both were set from the same delay neither can shorten a wait chosen
+  deliberately.
+
+  That last part was learned the hard way. Deriving the wall-clock deadline from the
+  *recorded renewal time* instead meant a state the loop had chosen to wait out —
+  `unclaimable`, where only the upstream can change anything, and which by definition
+  records no renewal — looked overdue on every cycle, so the node would have written to
+  somebody else's server every five minutes rather than every six hours.
+- **The wait ends on whichever deadline is nearer**, which is what the pair is for. The
+  sleep read only the monotonic one, so the wall-clock arm was noticed at the top of the
+  next cycle instead — within an observation interval, harmless at this cadence, and
+  still not what the docstring said. A docstring that overstates a safety property is how
+  the next person comes to rely on one that is not there.
+- **The backoff counter stops at its ceiling.** Past that point another doubling changes
+  no behaviour, and a number that only goes up is one nobody can reason about a week into
+  an outage.
+- **The renewal and the observation have a `try` each.** They had one between them, and
+  a failed look pushed out a renewal it has nothing to do with. Worse, the handler
+  re-read the ledger that had just raised, which raised again out of the handler and
+  ended the loop — killing the renewal and the observation, silently, in the task whose
+  whole job is to keep the room.
+
+### Unchanged
+
+Intake is still disabled on the mailbox lane, third-party usage is still zero, and no
+affiliation, endorsement or reward is claimed.
+
 ## v0.1.3 — 2026-08-30
 
 A claim is a lease. Nothing was renewing it.
