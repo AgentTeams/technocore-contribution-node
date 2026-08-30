@@ -50,8 +50,16 @@ which is true. **Third-party usage of this node remains zero.**
   classification from its own row.
 
   A declaration whose job never arrives — the write failed, the command died before
-  sending — is swept after an hour by the mailbox loop. The self-test posts within seconds
-  of declaring, so an hour is generous, and without it the table only grows.
+  sending — is swept after a day, from the ownership loop, which runs whether or not intake
+  is enabled. **Only while the mailbox lane is open**, though: with the gate shut the
+  cursor holds and a declared job sits in the room unprocessed, so a declaration dropped on
+  a timer would be dropped out from under a job that is still coming — and the node would
+  run its own test as a stranger's and publish the receipt as third-party work. The
+  cleanup must not be able to cause the accident it cleans up after.
+
+  So with intake disabled nothing is swept. Growth is then bounded by how often an operator
+  runs `selftest` and it fails before its job lands, which is not a rate anything else here
+  is measured against.
 
   It does not exempt the job from anything else. A declared test still meets the same
   execution gate and the same rate limit as any other work, in both lanes, and an orphan
