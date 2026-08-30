@@ -64,6 +64,10 @@ which is true. **Third-party usage of this node remains zero.**
   execution gate and the same rate limit as any other work, in both lanes, and an orphan
   that arrives while the gate is shut waits with the cursor rather than being processed.
   Deferred, not lost, and not privileged.
+- **An internal receipt is no longer advertised as publicly auditable.** Its row reads
+  `audit_state: published` so the reconciler leaves it alone — a queue marker, not a
+  statement about the room — and `/v1/receipts` read that alone. A reader was told they
+  could check a receipt against a room it is deliberately absent from.
 - **The HTTP lane kept internal receipts out of the owned room too.** The mailbox lane
   always suppressed that publication — the owned room is a public claim about work done for
   other people — and the HTTP lane did not. This release, which exists to stop exactly that

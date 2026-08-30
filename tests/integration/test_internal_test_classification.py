@@ -283,3 +283,40 @@ async def test_a_declaration_survives_a_closed_gate_and_still_classifies(node: N
     assert outcome is not None
     assert outcome.internal_test is True
     assert node.ledger.metrics()["total_jobs"] == 0
+
+
+async def test_an_internal_receipt_is_not_advertised_as_publicly_auditable(
+    node: Node, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is deliberately absent from the room a reader would check it against.
+
+    `audit_state` reads `published` for an internal test so the reconciler leaves it
+    alone — it is a queue marker, not a statement about the room. Reporting it as
+    `publicly_auditable` told a reader they could verify something they cannot find.
+    """
+    from fastapi.testclient import TestClient
+
+    from technocore_node.api import create_app
+
+    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    node.ledger.expect_internal_test(did, "selftest-000000000000000e")
+    await _run(node, did, "selftest-000000000000000e")
+
+    other = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    await _run(node, other, "ordinary-00000001")
+    node.ledger.set_audit_seq("ordinary-00000001", 9)
+
+    client = TestClient(create_app(node), raise_server_exceptions=False)
+
+    internal = client.get("/v1/receipts/selftest-000000000000000e").json()
+    assert internal["receipt"]["internal_test"] is True
+    assert internal["publicly_auditable"] is False
+
+    ordinary = client.get("/v1/receipts/ordinary-00000001").json()
+    assert ordinary["publicly_auditable"] is True
+
+    listed = {
+        r["job_id"]: r["publicly_auditable"] for r in client.get("/v1/receipts").json()["receipts"]
+    }
+    assert listed["selftest-000000000000000e"] is False
+    assert listed["ordinary-00000001"] is True
