@@ -90,7 +90,10 @@ to it makes it permanently unclaimable. That is the 2026-08-28 accident again wi
 seven-day fuse, and it would have fired while the node sat switched off *because* of the
 first one.
 
-`run_ownership_lease` renews every six hours and is started **unconditionally** —
+`run_ownership_lease` observes ownership every five minutes and renews every six hours —
+two jobs on two clocks, because a renewal is a write against a seven-day expiry while an
+observation expires in fifteen minutes, and a loop that only looked when it wrote left the
+gate reading `stale` for the rest of the interval. It is started **unconditionally** —
 independently of `TCN_MAILBOX_ENABLED`, because the calendar does not pause while intake
 is off. Eight renewals fit inside the expiry window, so the lease survives a day of
 outages rather than depending on the next attempt working.
