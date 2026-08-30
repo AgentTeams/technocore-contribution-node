@@ -36,7 +36,7 @@ from ..protocol.client import (
     TechnocoreClient,
     TechnocoreError,
 )
-from ..protocol.sweep import MAX_TEXT_CHARS
+from ..protocol.sweep import MAX_TEXT_CHARS, valid_name
 from .rooms import mailbox_room, result_room
 from .watcher import ProtocolWatcher
 
@@ -142,7 +142,39 @@ class Node:
     # ------------------------------------------------------------ publication
 
     async def publish(self, room: str, obj: dict[str, Any]) -> int | None:
-        """Post one protocol object as a single compact line, and record the outcome.
+        """Post one protocol object as a single compact line. The sequence, or None.
+
+        Most callers only need to know whether it landed. One needs to know *why* it did
+        not, and `None` cannot say — see :meth:`publish_reporting`.
+        """
+        seq, _ = await self.publish_reporting(room, obj)
+        return seq
+
+    async def publish_reporting(self, room: str, obj: dict[str, Any]) -> tuple[int | None, str]:
+        """As :meth:`publish`, and also what happened.
+
+        `published` — the server answered with a sequence.
+        `refused_locally` / `too_large` / `bad_room` — nothing was sent.
+        `unconfirmed` — a request went out and its fate is not known.
+
+        Three states, because three is what this can actually tell apart. A version of
+        this returned `refused_duplicate` and `rate_limited` as well, on the reasoning
+        that the upstream's own refusals are answers rather than silences. They are not,
+        from here: `say_signed` POSTs and *then* reads the message back, so a 429 — or
+        anything else — raised by that read arrives after a write that may well have
+        succeeded. Reporting "the server declined to store it" would have described a
+        message that was stored.
+
+        A duplicate refusal was worse. It says an identical *text* was accepted recently,
+        counted by text and not by sender, so a stranger posting the same JSON produces
+        it — and it says nothing about whether this node's signed copy is in the room now.
+        Treating it as proof of presence made a claim anyone could arrange.
+
+        Three of those collapse into `None`, and a caller that has to distinguish them
+        was inferring which by re-reading mutable state afterwards. That is a guess, and
+        it can be wrong in both directions: ownership can lapse between a real send and
+        the re-read, or recover between a local refusal and it. The distinction is known
+        here, at the point where it happens, so it is returned rather than reconstructed.
 
         `ensure_ascii=True` is not cosmetic: it guarantees the payload is already stable
         under the server's single-line sweep, so the bytes signed and the bytes stored are
@@ -165,7 +197,13 @@ class Node:
                 "refusing to write to the result room: ownership is not confirmed",
                 extra={"fields": {"room": room, "type": obj.get("type")}},
             )
-            return None
+            return None, "refused_locally"
+
+        if not valid_name(room):
+            # `say_signed` would raise for this *before* sending, which is a refusal and
+            # not an unknown. Checked here so the outcome says which.
+            log.error("refusing to publish to an invalid room name", extra={"fields": {}})
+            return None, "bad_room"
 
         text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         if len(text) > MAX_TEXT_CHARS:
@@ -173,7 +211,7 @@ class Node:
                 "refusing to publish an oversized message",
                 extra={"fields": {"room": room, "chars": len(text), "type": obj.get("type")}},
             )
-            return None
+            return None, "too_large"
         try:
             confirmation = await self.client.say_signed(room, text)
         except (RateLimited, DuplicateRefused, TechnocoreError) as exc:
@@ -198,7 +236,11 @@ class Node:
                     "fields": {"room": room, "type": obj.get("type"), "error": type(exc).__name__}
                 },
             )
-            return None
+            # The request was made and whether it landed is not known from here. The POST
+            # is at the top of `say_signed` and the read-back is under it, so every error
+            # from this point on is ambiguous — and on 2026-08-30 a write reported as a
+            # 503 was in the room afterwards.
+            return None, "unconfirmed"
 
         if room in (self.result_room, self.mailbox):
             self.ledger.set_state(f"last_publish_error:{room}", None)
@@ -215,7 +257,7 @@ class Node:
             status="confirmed",
             confirmed_at=utcnow(),
         )
-        return confirmation.seq
+        return confirmation.seq, "published"
 
     # ------------------------------------------------------------ mailbox loop
 

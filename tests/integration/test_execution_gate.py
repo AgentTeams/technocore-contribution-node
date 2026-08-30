@@ -31,7 +31,12 @@ from technocore_node.api import create_app
 from technocore_node.config import load_settings
 from technocore_node.crypto import keystore
 from technocore_node.ledger.db import utcnow
-from technocore_node.protocol.client import Confirmation, TechnocoreError
+from technocore_node.protocol.client import (
+    Confirmation,
+    DuplicateRefused,
+    RateLimited,
+    TechnocoreError,
+)
 from technocore_node.service.node import Node
 
 from ..conftest import job_line
@@ -814,3 +819,67 @@ def test_a_past_publish_error_is_shown_without_closing_the_gate(node: Node) -> N
     assert availability["accepting_third_party_jobs"] is True
     assert availability["stop_reasons"] == []
     assert availability["blockers"] == []
+
+
+# ------------------------------------------------ what publish says happened
+
+
+async def _publish_raising(node: Node, exc: Exception) -> tuple[int | None, str]:
+    """Run `publish_reporting` against a client whose write raises `exc`."""
+
+    async def boom(room: str, text: str) -> Any:
+        raise exc
+
+    object.__setattr__(node.client, "say_signed", boom)
+    return await node.publish_reporting("p-somewhere", {"type": "note"})
+
+
+async def test_every_error_after_the_post_is_unconfirmed_whatever_its_kind(node: Node) -> None:
+    """The upstream's refusals are not answers from here, because of where they arrive.
+
+    `say_signed` POSTs and *then* reads the message back, so a 429 raised by that read
+    comes after a write that may well have succeeded. An earlier version reported those
+    as `rate_limited`, meaning "not stored" — about a message that was stored.
+
+    A duplicate refusal was worse: it says an identical *text* was accepted recently,
+    counted by text and not by sender, so a stranger posting the same JSON produces it.
+    Reporting it as proof the attestation is present made a claim anyone could arrange.
+    """
+    for exc in (
+        DuplicateRefused("422 duplicate"),
+        RateLimited(1.0, "429"),
+        TechnocoreError("HTTP 503: Service Unavailable"),
+    ):
+        assert await _publish_raising(node, exc) == (None, "unconfirmed"), exc
+
+
+async def test_a_room_name_the_client_would_reject_is_refused_before_sending(
+    node: Node,
+) -> None:
+    """`say_signed` raises for this before the request. That is a refusal, not a loss."""
+    sent = False
+
+    async def record(room: str, text: str) -> Any:
+        nonlocal sent
+        sent = True
+        raise TechnocoreError("should not get here")
+
+    object.__setattr__(node.client, "say_signed", record)
+
+    seq, outcome = await node.publish_reporting("Not A Room", {"type": "note"})
+
+    assert (seq, outcome) == (None, "bad_room")
+    assert sent is False
+
+
+async def test_publish_still_returns_just_the_sequence_for_its_other_callers(
+    node: Node,
+) -> None:
+    """The split must not change what six existing call sites see."""
+
+    async def refuse(room: str, text: str) -> Any:
+        raise TechnocoreError("HTTP 503")
+
+    object.__setattr__(node.client, "say_signed", refuse)
+
+    assert await node.publish("p-somewhere", {"type": "note"}) is None

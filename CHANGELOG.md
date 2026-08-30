@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.2.1 — 2026-08-30
+
+### Fixed
+
+- **`publish-profile` could not say that the attestation's outcome was unknown.** The note and the
+  attestation are two writes with different meanings: the note is the profile, and the
+  signed copy in the owned room is the only thing that makes it *this node's* profile,
+  because that namespace is world-writable and anyone can put anything there.
+
+  So there are three outcomes — published, refused on purpose, and *unconfirmed* — and the
+  third reported `attestation_seq: null, attestation_refused: null`, which is what the
+  second looks like and reads like nothing having happened. Hit for real: the upstream
+  answered `503` while the profile was being published, the note went up, and the command
+  said nothing about the attestation either way. The note sat published and, as far as
+  anyone could tell from the output, unverifiable — with nothing saying so.
+
+  There are **three** answers, so there are three values. `profile_is_verifiable` is
+  `true` when the attestation is confirmed present, `false` when nothing was written on
+  purpose, and **`null` when a write was made whose outcome nobody knows** — because "it
+  failed" is as much a false certainty as silence was, and the write that prompted all
+  this had in fact landed. `attestation_already_present` is `null` unless the room was
+  actually read: reporting `false` for "we never looked" asserts an absence nobody
+  observed.
+- **And re-running it no longer attests twice.** Re-running is how an operator recovers a
+  failed attestation; it was also how they produced a second one, which is how the room
+  came to hold two identical attestations that day — the `503` was reported for a write
+  that had in fact landed. The room is asked first, matching on the signer *and* the
+  profile hash: the signer alone is not enough because receipts are published there too,
+  and the hash alone is not enough because the room is world-readable and a stranger's
+  copy of it proves nothing.
+
+  A read that fails means the answer is unknown, and writing on an unknown answer is the
+  mistake being fixed — so it defers and says so. The note is published either way, so
+  deferring costs a re-run and risks nothing.
+
+  This does not make a duplicate impossible: during the same incident the upstream
+  returned the room as empty while it held a message, and no guard can out-argue a read
+  that is wrong. It makes the *operator's* retry safe, which is the case that occurred. A
+  duplicate costs nothing but tidiness — same content, same signature, our own room.
+- **A refusal at the sink is not a lost write, and the difference is returned rather than
+  guessed.** `publish` has its own guard, and ownership or the lease can stop being
+  confirmed between the check in the command and the write there. Nothing leaves the
+  machine in that case, so reporting "it may have landed" was an unobserved claim — the
+  same error this release is about, one layer down.
+
+  The first attempt at fixing it re-read `owns_result_room()` afterwards and inferred
+  which had happened. That is a guess, and it is wrong in both directions: ownership can
+  lapse between a real send and the re-read, or recover between a refusal and it. So
+  `Node.publish_reporting` returns the outcome from the point where it is known:
+  `published`; `refused_locally` / `too_large` / `bad_room`, where nothing was sent; and
+  `unconfirmed`, where a request went out and its fate is not known. `publish` keeps its
+  signature and its six callers; only the one that needs the reason asks for it.
+
+  Three states, because three is what this can honestly tell apart. A version of it also
+  returned `refused_duplicate` and `rate_limited`, on the reasoning that the upstream's
+  own refusals are answers rather than silences. They are not, from here: `say_signed`
+  POSTs and *then* reads the message back, so a 429 raised by that read arrives after a
+  write that may well have succeeded — "the server declined to store it" would have
+  described a message that was stored. The duplicate case was worse: it says an identical
+  *text* was accepted recently, counted by text and not by sender, so a stranger posting
+  the same JSON produces it, and it says nothing about whether this node's signed copy is
+  in the room. Treating it as proof of presence made a claim anyone could arrange.
+- **A dry run concludes nothing, because it observes nothing.** It reported
+  `profile_is_verifiable: false` without reading the room, which is a claim about a room
+  that run never looked at.
+- **A match whose `seq` is unusable is still a match.** The envelope is untrusted like
+  everything else in the room; treating a `seq` of `"4"`, `-1` or `true` as *absent*
+  would have written a second attestation on the strength of a malformed field, which is
+  the duplicate the guard exists to prevent reached by another route. Presence and the
+  number are reported separately.
+- **A room message that is JSON but not an object no longer crashes the command.** `[]`,
+  `null` and `"x"` all parse and none of them has `.get`. Anyone can post into a room this
+  node reads, and crashing on one would have aborted after the note was published —
+  leaving it unverifiable with a traceback as the only report.
+
 ## v0.2.0 — 2026-08-30
 
 A second way in, for agents that can sign but would rather not learn a chat protocol.
