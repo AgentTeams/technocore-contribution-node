@@ -122,3 +122,105 @@ async def test_an_internal_receipt_is_not_owed_to_the_public_room(node: Node) ->
     assert row["internal_test"] == 1
     # `owed` is what the reconciler publishes. An internal test is never owed.
     assert row["audit_state"] == "published"
+
+
+async def test_the_http_lane_also_keeps_internal_receipts_out_of_the_public_room(
+    env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mailbox lane always had this check. The HTTP lane did not.
+
+    The owned room is a public claim about work done for other people. Publishing one of
+    this node's own tests there is what happened on 2026-08-30 — and this release, which
+    exists to stop it, left the second lane able to do it again.
+    """
+    import hashlib
+    from base64 import urlsafe_b64encode
+
+    from fastapi.testclient import TestClient
+
+    from technocore_node.api import create_app
+    from technocore_node.protocol.canonical import canonical_bytes
+    from technocore_node.protocol.http_envelope import HTTP_JOB_DOMAIN
+
+    monkeypatch.setenv("TCN_HTTP_JOB_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("TCN_PUBLIC_URL", "https://example.invalid")
+    keystore.generate(Path(env["TCN_IDENTITY_PATH"]), PASSPHRASE)
+    node = Node(load_settings())
+    for key, value in (
+        ("owned_room_owner", node.did),
+        ("owned_room_observed", "1"),
+        ("owned_room_error", None),
+        ("owned_room_renewed", __import__("technocore_node.ledger.db", fromlist=["x"]).utcnow()),
+    ):
+        node.ledger.set_state(key, value)
+
+    published: list[str] = []
+
+    async def record(room: str, payload: Any) -> int | None:
+        published.append(room)
+        return 1
+
+    monkeypatch.setattr(node, "publish", record)
+
+    key = Ed25519PrivateKey.generate()
+    did = didkey.encode_did(key.public_key())
+    job = {
+        "v": "1",
+        "type": "job",
+        "job_id": "selftest-00000000000000ff",
+        "task": "canonical_json_sha256",
+        "reply_room": "p-tcn-selftest-0011223344556677",
+        "input": {"value": {"a": 1}},
+    }
+    node.ledger.expect_internal_test(did, "selftest-00000000000000ff")
+
+    digest = hashlib.sha256(canonical_bytes(job)).hexdigest()
+    payload = f"{HTTP_JOB_DOMAIN}|{did}|1|sha256:{digest}"
+    sig = urlsafe_b64encode(key.sign(payload.encode())).decode().rstrip("=")
+
+    client = TestClient(create_app(node), raise_server_exceptions=False)
+    response = client.post("/v1/jobs", json={"did": did, "sig": sig, "nonce": "1", "job": job})
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["receipt"]["internal_test"] is True
+    # Nothing went to the owned room.
+    assert published == []
+
+
+async def test_a_declaration_is_consumed_so_they_do_not_pile_up(node: Node) -> None:
+    """A declaration is about one job. A store of them that only grows is a leak.
+
+    One whose job never arrives — the write failed, the command died before sending — would
+    otherwise sit in the ledger for its lifetime.
+    """
+    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    node.ledger.expect_internal_test(did, "selftest-0000000000000006")
+
+    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000006") is True
+    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000006") is False
+
+
+async def test_a_resumed_job_keeps_the_classification_its_row_already_has(node: Node) -> None:
+    """The declaration is spent by the first attempt; the row is what survives.
+
+    Re-deriving it would make a job that crashed mid-flight come back as somebody else's —
+    reintroducing the misclassification through the recovery path.
+    """
+    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    node.ledger.expect_internal_test(did, "selftest-0000000000000007")
+
+    def explode(*a: Any, **k: Any) -> None:
+        raise RuntimeError("crash after the row exists")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "record_receipt", explode)
+        with pytest.raises(RuntimeError):
+            await _run(node, did, "selftest-0000000000000007")
+
+    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000007") is False
+
+    outcome = await _run(node, did, "selftest-0000000000000007")
+
+    assert outcome is not None
+    assert outcome.internal_test is True
+    assert node.ledger.metrics()["total_jobs"] == 0

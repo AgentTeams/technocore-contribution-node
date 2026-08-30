@@ -209,9 +209,14 @@ def register(router: APIRouter, node: Node) -> None:
             )
 
         receipt = outcome.receipt
-        if receipt is not None:
+        if receipt is not None and not outcome.internal_test:
             # Already persisted, atomically with the job's completion, inside `handle()`.
             # The auditable copy goes to the owned room, guarded there as everywhere else.
+            #
+            # Not for an internal test. The owned room is a public claim about work done
+            # for other people, and on 2026-08-30 one of this node's own tests was
+            # published there as third-party work because a lane forgot this check. The
+            # mailbox lane has always had it; this one did not.
             await node.publish_audit_copy(outcome.job_id, receipt)
 
         log.info(

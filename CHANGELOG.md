@@ -38,9 +38,23 @@ which is true. **Third-party usage of this node remains zero.**
 ### Fixed
 
 - **A self-test is declared before it is sent.** `Ledger.expect_internal_test(did, job_id)`
-  records the classification ahead of the write, and `Runner.handle` applies it once, after
-  the `job_id` is known — so it no longer depends on which code path wins a race, and
-  survives the command dying between posting and processing.
+  records the classification ahead of the write, and `Runner.handle` applies it after the
+  `job_id` is known — so it no longer depends on which code path wins a race, and survives
+  the command dying between posting and processing.
+
+  The declaration is **consumed** when applied: it is about one job, and a store that only
+  grows is one nobody can reason about. A resumed job takes the classification from its own
+  row instead, which is settled when the row is made — re-deriving it from a spent
+  declaration would bring the misclassification back through the recovery path.
+
+  It does not exempt the job from anything else. A declared test still meets the same
+  execution gate and the same rate limit as any other work, in both lanes, and an orphan
+  that arrives while the gate is shut waits with the cursor rather than being processed.
+  Deferred, not lost, and not privileged.
+- **The HTTP lane kept internal receipts out of the owned room too.** The mailbox lane
+  always suppressed that publication — the owned room is a public claim about work done for
+  other people — and the HTTP lane did not. This release, which exists to stop exactly that
+  from happening, had left the second lane able to do it again.
 - **Bound to the requester DID as well as the id**, so a stranger cannot be classified as
   this node's test by guessing an identifier. They would gain nothing — the effect is to
   *undercount* this node's usage — but a guessable exemption is still an exemption.

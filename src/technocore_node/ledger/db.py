@@ -466,9 +466,22 @@ class Ledger:
         """
         self.set_state(f"internal_test_expect:{requester_did}:{job_id}", utcnow())
 
-    def is_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
-        """Whether this exact job was declared as this node's own before it was sent."""
-        return self.get_state(f"internal_test_expect:{requester_did}:{job_id}")[0] is not None
+    def take_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
+        """Whether this exact job was declared as this node's own — and consume it.
+
+        Consumed rather than left, because a declaration is about one job and a store of
+        them that only grows is a store nobody can reason about. A declaration whose job
+        never arrives — the write failed, the command died before sending — is a row that
+        would otherwise sit there for the life of the ledger.
+
+        The job row keeps the classification once the job exists, so a resumed job does
+        not need the declaration a second time.
+        """
+        key = f"internal_test_expect:{requester_did}:{job_id}"
+        if self.get_state(key)[0] is None:
+            return False
+        self.set_state(key, None)
+        return True
 
     def record_receipt(
         self,
