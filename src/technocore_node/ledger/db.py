@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -320,11 +320,17 @@ class Ledger:
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return _row(self.conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone())
 
-    def insert_job(self, **fields: Any) -> bool:
+    def insert_job(self, *, spend_declaration: bool = False, **fields: Any) -> bool:
         """Insert a job, returning False when this `job_id` was already seen.
 
         The uniqueness of `job_id` is what makes the whole pipeline idempotent: a replayed
         or re-delivered request lands here and stops.
+
+        `spend_declaration` consumes the internal-test declaration for this job **in the
+        same transaction** as the insert. The two are one fact: the classification is
+        settled by the row, and a declaration removed before the row existed would leave a
+        crash in between with neither — which is how the misclassification this guards
+        against happened in the first place.
         """
         columns = (
             "job_id",
@@ -351,6 +357,11 @@ class Ledger:
                     f"VALUES ({', '.join('?' for _ in columns)})",
                     tuple(row[c] for c in columns),
                 )
+                if spend_declaration:
+                    conn.execute(
+                        "DELETE FROM deployment_state WHERE key = ?",
+                        (f"internal_test_expect:{row['requester_did']}:{row['job_id']}",),
+                    )
         except sqlite3.IntegrityError:
             return False
         return True
@@ -466,22 +477,33 @@ class Ledger:
         """
         self.set_state(f"internal_test_expect:{requester_did}:{job_id}", utcnow())
 
-    def take_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
-        """Whether this exact job was declared as this node's own — and consume it.
+    def is_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
+        """Whether this exact job was declared as this node's own before it was sent.
 
-        Consumed rather than left, because a declaration is about one job and a store of
-        them that only grows is a store nobody can reason about. A declaration whose job
-        never arrives — the write failed, the command died before sending — is a row that
-        would otherwise sit there for the life of the ledger.
-
-        The job row keeps the classification once the job exists, so a resumed job does
-        not need the declaration a second time.
+        Reads only. The declaration is spent by :meth:`insert_job`, in the same
+        transaction that writes the classification onto the job row — consuming it here
+        would open a window in which the declaration is gone and the row does not exist
+        yet, and a process that died in it would leave the next attempt with neither.
+        That window is a crash, which is exactly how the misclassification happened.
         """
-        key = f"internal_test_expect:{requester_did}:{job_id}"
-        if self.get_state(key)[0] is None:
-            return False
-        self.set_state(key, None)
-        return True
+        return self.get_state(f"internal_test_expect:{requester_did}:{job_id}")[0] is not None
+
+    def sweep_expected_internal_tests(self, older_than_seconds: float = 3600) -> int:
+        """Drop declarations whose job never arrived. Returns how many.
+
+        A declaration is spent when its job is inserted, so what is left is the ones whose
+        write failed or whose command died before sending. The self-test posts within
+        seconds of declaring, so an hour is generous — and without this they would sit in
+        the ledger for its lifetime.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(seconds=older_than_seconds)).isoformat()
+        with self.tx() as conn:
+            cursor = conn.execute(
+                "DELETE FROM deployment_state WHERE key LIKE 'internal_test_expect:%' "
+                "AND updated_at < ?",
+                (cutoff,),
+            )
+            return int(cursor.rowcount or 0)
 
     def record_receipt(
         self,

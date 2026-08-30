@@ -187,17 +187,45 @@ async def test_the_http_lane_also_keeps_internal_receipts_out_of_the_public_room
     assert published == []
 
 
-async def test_a_declaration_is_consumed_so_they_do_not_pile_up(node: Node) -> None:
-    """A declaration is about one job. A store of them that only grows is a leak.
+async def test_the_declaration_is_spent_by_the_insert_and_not_before(node: Node) -> None:
+    """One transaction, because the row and the declaration are one fact.
 
-    One whose job never arrives — the write failed, the command died before sending — would
-    otherwise sit in the ledger for its lifetime.
+    Spending it first opens a window in which the declaration is gone and the row does not
+    exist — and a process that dies there leaves the next attempt with neither, which
+    classifies this node's own test as somebody else's. That window is a crash, which is
+    exactly how the misclassification happened.
     """
     did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
     node.ledger.expect_internal_test(did, "selftest-0000000000000006")
 
-    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000006") is True
-    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000006") is False
+    def explode(*a: Any, **k: Any) -> None:
+        raise RuntimeError("crash before the row is written")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(node.ledger, "insert_job", explode)
+        with pytest.raises(RuntimeError):
+            await _run(node, did, "selftest-0000000000000006")
+
+    # The declaration survived, so the retry still knows whose job this is.
+    assert node.ledger.is_expected_internal_test(did, "selftest-0000000000000006") is True
+
+    outcome = await _run(node, did, "selftest-0000000000000006")
+
+    assert outcome is not None and outcome.internal_test is True
+    # And now it is spent, by the insert that recorded the classification.
+    assert node.ledger.is_expected_internal_test(did, "selftest-0000000000000006") is False
+
+
+async def test_a_declaration_whose_job_never_arrives_is_swept(node: Node) -> None:
+    """The write failed, or the command died before sending. Nothing will ever spend it."""
+    did = didkey.encode_did(Ed25519PrivateKey.generate().public_key())
+    node.ledger.expect_internal_test(did, "selftest-000000000000000a")
+
+    assert node.ledger.sweep_expected_internal_tests(older_than_seconds=3600) == 0
+    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000a") is True
+
+    assert node.ledger.sweep_expected_internal_tests(older_than_seconds=-1) == 1
+    assert node.ledger.is_expected_internal_test(did, "selftest-000000000000000a") is False
 
 
 async def test_a_resumed_job_keeps_the_classification_its_row_already_has(node: Node) -> None:
@@ -217,7 +245,7 @@ async def test_a_resumed_job_keeps_the_classification_its_row_already_has(node: 
         with pytest.raises(RuntimeError):
             await _run(node, did, "selftest-0000000000000007")
 
-    assert node.ledger.take_expected_internal_test(did, "selftest-0000000000000007") is False
+    assert node.ledger.is_expected_internal_test(did, "selftest-0000000000000007") is False
 
     outcome = await _run(node, did, "selftest-0000000000000007")
 

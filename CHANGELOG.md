@@ -42,10 +42,16 @@ which is true. **Third-party usage of this node remains zero.**
   `job_id` is known — so it no longer depends on which code path wins a race, and survives
   the command dying between posting and processing.
 
-  The declaration is **consumed** when applied: it is about one job, and a store that only
-  grows is one nobody can reason about. A resumed job takes the classification from its own
-  row instead, which is settled when the row is made — re-deriving it from a spent
-  declaration would bring the misclassification back through the recovery path.
+  The declaration is spent **in the same transaction as the insert that records the
+  classification**, because the row and the declaration are one fact. Spending it first
+  opens a window in which the declaration is gone and the row does not exist yet — and a
+  process that dies there leaves the next attempt with neither, which is precisely how
+  this node came to publish somebody else's number about itself. A resumed job takes the
+  classification from its own row.
+
+  A declaration whose job never arrives — the write failed, the command died before
+  sending — is swept after an hour by the mailbox loop. The self-test posts within seconds
+  of declaring, so an hour is generous, and without it the table only grows.
 
   It does not exempt the job from anything else. A declared test still meets the same
   execution gate and the same rate limit as any other work, in both lanes, and an orphan

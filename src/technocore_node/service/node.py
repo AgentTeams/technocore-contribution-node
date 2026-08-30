@@ -951,6 +951,9 @@ class Node:
                 await self.observe_reachability()
                 await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
+                # Declarations whose job never arrived. Cheap, and the alternative is a
+                # table that only grows.
+                self.ledger.sweep_expected_internal_tests()
                 backoff = 1.0
             except RateLimited as exc:
                 log.warning(

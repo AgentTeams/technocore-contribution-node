@@ -266,7 +266,8 @@ class JobRunner:
         internal_test: bool,
         started: datetime,
     ) -> Outcome | None:
-        if not internal_test and self.ledger.take_expected_internal_test(requester_did, job_id):
+        declared = self.ledger.is_expected_internal_test(requester_did, job_id)
+        if not internal_test and declared:
             # Declared as this node's own before it was sent. Decided here, once, after
             # the job_id is known — not by whichever caller happens to run it, which is
             # what let a self-test be published as third-party use.
@@ -331,6 +332,10 @@ class JobRunner:
             task_type=task,
             status="validated",
             internal_test=internal_test,
+            # Spent with the insert, not before it: the row is what settles the
+            # classification, and removing the declaration first would leave a crash in
+            # between with neither.
+            spend_declaration=declared,
         )
         if not inserted:
             # Either the row is ours from an attempt that died — the resume path above —
