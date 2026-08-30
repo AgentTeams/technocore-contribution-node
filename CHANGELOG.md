@@ -19,6 +19,22 @@
   The lost case now says it was attempted, says why it failed, and says what that costs.
   A `profile_is_verifiable` field states the conclusion rather than leaving it to be
   inferred from two nulls.
+- **And re-running it no longer attests twice.** Re-running is how an operator recovers a
+  failed attestation; it was also how they produced a second one, which is how the room
+  came to hold two identical attestations that day — the `503` was reported for a write
+  that had in fact landed. The room is asked first, matching on the signer *and* the
+  profile hash: the signer alone is not enough because receipts are published there too,
+  and the hash alone is not enough because the room is world-readable and a stranger's
+  copy of it proves nothing.
+
+  A read that fails means the answer is unknown, and writing on an unknown answer is the
+  mistake being fixed — so it defers and says so. The note is published either way, so
+  deferring costs a re-run and risks nothing.
+
+  This does not make a duplicate impossible: during the same incident the upstream
+  returned the room as empty while it held a message, and no guard can out-argue a read
+  that is wrong. It makes the *operator's* retry safe, which is the case that occurred. A
+  duplicate costs nothing but tidiness — same content, same signature, our own room.
 
 ## v0.2.0 — 2026-08-30
 

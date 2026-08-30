@@ -165,6 +165,26 @@ def cmd_claim_room(args: argparse.Namespace) -> int:
     return 0
 
 
+def _existing_attestation(room: dict[str, Any], did: str, profile_hash: str) -> int | None:
+    """The seq of this node's attestation of `profile_hash`, if the room already holds one.
+
+    Matched on the signer and the hash together. The signer alone is not enough — this
+    node publishes receipts here too — and the hash alone is not enough, because the room
+    is world-readable and a stranger's copy of our hash proves nothing.
+    """
+    for message in room.get("messages", []):
+        if message.get("from") != did:
+            continue
+        try:
+            body = json.loads(str(message.get("text", "")))
+        except json.JSONDecodeError:
+            continue
+        if body.get("type") == "profile_attestation" and body.get("profile_sha256") == profile_hash:
+            seq = message.get("seq")
+            return int(seq) if isinstance(seq, int) else None
+    return None
+
+
 def cmd_publish_profile(args: argparse.Namespace) -> int:
     """Publish the DID profile note, and mirror its hash into the owned result room.
 
@@ -205,7 +225,49 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 # So ownership is confirmed by a read before anything is written there.
                 # Not "we claimed it earlier and assume it stuck": read it now.
                 await node.observe_reachability()
+
+                # Has this exact profile already been attested? Ask the room before
+                # writing to it. Re-running this command is the ordinary way an operator
+                # recovers from a failed attestation, and without this it is also the way
+                # they produce a second one — which is how the room came to hold two
+                # identical attestations on 2026-08-30.
+                #
+                # A read that fails means the answer is unknown, and writing on an unknown
+                # answer is the mistake being fixed. It refuses instead, and says so; the
+                # note is already published and the command can be re-run.
+                #
+                # This does not make a duplicate impossible. The upstream returned a room
+                # as empty while it held a message during the same incident, and no guard
+                # here can out-argue a read that is wrong. It makes the *operator's* retry
+                # safe, which is the case that actually occurred. A duplicate costs
+                # nothing but tidiness: same content, same signature, our own room.
+                already: int | None = None
+                read_failed: str | None = None
                 if node.owns_result_room():
+                    try:
+                        existing = await node.client.read_room(node.result_room)
+                        already = _existing_attestation(existing, node.did, profile_hash)
+                    except TechnocoreError as exc:
+                        read_failed = str(exc)[:200]
+
+                if read_failed is not None:
+                    attestation_refused = (
+                        f"the result room could not be read ({read_failed}), so whether "
+                        "this profile is already attested is unknown. Refusing to write "
+                        "on an unknown answer; the note is published, so re-run this "
+                        "command when the room is readable."
+                    )
+                    log.warning(
+                        "profile note published; attestation deferred, room unreadable",
+                        extra={"fields": {"room": node.result_room, "error": read_failed}},
+                    )
+                elif already is not None:
+                    seq = already
+                    log.info(
+                        "profile already attested; nothing written",
+                        extra={"fields": {"room": node.result_room, "seq": already}},
+                    )
+                elif node.owns_result_room():
                     seq = await node.publish(
                         node.result_room,
                         {
@@ -256,6 +318,7 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                 # own proves nothing: anyone can write to that namespace, and only the
                 # signed copy in the owned room says which note is this node's.
                 "profile_is_verifiable": seq is not None,
+                "attestation_already_present": already is not None if not args.dry_run else None,
                 "profile": profile,
             }
         finally:

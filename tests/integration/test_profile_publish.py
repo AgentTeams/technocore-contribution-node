@@ -18,6 +18,7 @@ would sit there unverifiable with nothing saying so.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,12 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
         async def observe_reachability(self) -> None:
             return None
 
+        async def read_room_stub(self, room: str, **kw: Any) -> dict[str, Any]:
+            if behaviour.get("room_fails"):
+                raise cli.TechnocoreError(behaviour["room_fails"])
+            build = behaviour.get("room")
+            return build(self.did, captured["hash"]) if build else _room()
+
         async def publish(self, room: str, payload: dict[str, Any]) -> int | None:
             captured["payload"] = payload
             if behaviour.get("publish_fails"):
@@ -65,9 +72,19 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
 
     async def set_note(self: Any, ns: str, key: str, value: str) -> None:
         captured["note"] = value
+        loaded = json.loads(value)
+        captured["did"] = loaded["did"]
+        captured["hash"] = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    async def read_room(self: Any, room: str, **kw: Any) -> dict[str, Any]:
+        if behaviour.get("room_fails"):
+            raise cli.TechnocoreError(behaviour["room_fails"])
+        build = behaviour.get("room")
+        return build(captured["did"], captured["hash"]) if build else _room()
 
     monkeypatch.setattr(cli, "Node", Node)
     monkeypatch.setattr("technocore_node.protocol.client.TechnocoreClient.set_note", set_note)
+    monkeypatch.setattr("technocore_node.protocol.client.TechnocoreClient.read_room", read_room)
 
     printed: list[Any] = []
     monkeypatch.setattr(cli, "_emit", printed.append)
@@ -123,3 +140,89 @@ def test_the_note_is_published_in_every_case(monkeypatch: pytest.MonkeyPatch, ar
     for behaviour in ({}, {"publish_fails": True}, {"owned": False}):
         out = _run(monkeypatch, args, **behaviour)
         assert json.loads(out["_captured"]["note"])["did"] == out["profile"]["did"]
+
+
+# ------------------------------------------------ not twice, if it can help it
+
+
+def _room(*messages: dict[str, Any]) -> dict[str, Any]:
+    return {"messages": list(messages), "count": len(messages), "last_seq": len(messages)}
+
+
+def _attestation(did: str, profile_hash: str, seq: int = 1) -> dict[str, Any]:
+    return {
+        "seq": seq,
+        "from": did,
+        "text": json.dumps(
+            {
+                "v": "1",
+                "type": "profile_attestation",
+                "did": did,
+                "note": "/kv/did-xx/yyy",
+                "profile_sha256": profile_hash,
+            }
+        ),
+    }
+
+
+def test_an_already_attested_profile_is_not_attested_again(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """Re-running is how an operator recovers a failed attestation. It must be safe.
+
+    Without this it is also how they produce a second one — which is how the room came to
+    hold two identical attestations on 2026-08-30, after a `503` was reported for a write
+    that had in fact landed.
+    """
+    out = _run(monkeypatch, args, room=lambda did, h: _room(_attestation(did, h, seq=4)))
+
+    assert out["attestation_seq"] == 4
+    assert out["profile_is_verifiable"] is True
+    assert out["attestation_already_present"] is True
+    # Nothing was written to the room.
+    assert "payload" not in out["_captured"]
+
+
+def test_a_different_profile_is_attested_even_if_an_older_one_is_there(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """The guard is per profile hash. A changed profile needs its own attestation."""
+    out = _run(
+        monkeypatch, args, room=lambda did, h: _room(_attestation(did, "sha256:" + "0" * 64))
+    )
+
+    assert out["attestation_already_present"] is False
+    assert out["_captured"]["payload"]["profile_sha256"] == out["profile_sha256"]
+
+
+def test_a_strangers_copy_of_our_hash_does_not_count(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """The room is world-readable. Anyone can repeat our hash; only our key can sign it.
+
+    Matching on the hash alone would let a stranger's message suppress the attestation
+    that makes the profile verifiable — a denial of exactly the thing being published.
+    """
+    other = "did:key:z6MkfyqMqvC4QGbyMAzpL4haXspn1f1ZGUwhdPearjqPpnnc"
+    out = _run(monkeypatch, args, room=lambda did, h: _room(_attestation(other, h, seq=3)))
+
+    assert out["attestation_already_present"] is False
+    assert out["_captured"]["payload"]["type"] == "profile_attestation"
+
+
+def test_an_unreadable_room_defers_rather_than_writing_blind(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """Writing on an unknown answer is the mistake this exists to stop.
+
+    A failed read means "already attested?" has no answer. The note is published either
+    way, so deferring costs a re-run and risks nothing; writing risks the duplicate.
+    """
+    out = _run(monkeypatch, args, room_fails="HTTP 503: Service Unavailable")
+
+    assert out["attestation_seq"] is None
+    assert out["profile_is_verifiable"] is False
+    assert "could not be read" in out["attestation_refused"]
+    assert "503" in out["attestation_refused"]
+    assert "re-run" in out["attestation_refused"]
+    assert "payload" not in out["_captured"]
