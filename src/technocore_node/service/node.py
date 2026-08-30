@@ -36,7 +36,7 @@ from ..protocol.client import (
     TechnocoreClient,
     TechnocoreError,
 )
-from ..protocol.sweep import MAX_TEXT_CHARS
+from ..protocol.sweep import MAX_TEXT_CHARS, valid_name
 from .rooms import mailbox_room, result_room
 from .watcher import ProtocolWatcher
 
@@ -153,10 +153,16 @@ class Node:
     async def publish_reporting(self, room: str, obj: dict[str, Any]) -> tuple[int | None, str]:
         """As :meth:`publish`, and also which of four things happened.
 
-        `refused_locally` and `too_large` mean nothing was sent. `unconfirmed` means a
-        request went out and its fate is unknown — the upstream returned an error, or the
-        read-back failed, and it may still be in the room. `published` means the server
-        answered with a sequence.
+        `published` — the server answered with a sequence.
+        `refused_locally` / `too_large` / `bad_room` — nothing was sent.
+        `refused_duplicate` — the upstream says this exact text is already in the room.
+        `rate_limited` — the upstream refused it outright; it was not stored.
+        `unconfirmed` — a request went out and its fate is genuinely unknown.
+
+        The refusals are separated from `unconfirmed` because they are *not* unknown. An
+        earlier version folded them together, and a caller reporting "it may have landed"
+        would then have said so about a request that never left, or one the server
+        explicitly rejected.
 
         Three of those collapse into `None`, and a caller that has to distinguish them
         was inferring which by re-reading mutable state afterwards. That is a guess, and
@@ -187,6 +193,12 @@ class Node:
             )
             return None, "refused_locally"
 
+        if not valid_name(room):
+            # `say_signed` would raise for this *before* sending, which is a refusal and
+            # not an unknown. Checked here so the outcome says which.
+            log.error("refusing to publish to an invalid room name", extra={"fields": {}})
+            return None, "bad_room"
+
         text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         if len(text) > MAX_TEXT_CHARS:
             log.error(
@@ -197,6 +209,16 @@ class Node:
         try:
             confirmation = await self.client.say_signed(room, text)
         except (RateLimited, DuplicateRefused, TechnocoreError) as exc:
+            # The upstream's own refusals are answers, not silences: a duplicate means it
+            # says this exact text is already there, and a rate limit means it declined to
+            # store it. Only an error that leaves the request's fate open is `unconfirmed`.
+            outcome = (
+                "refused_duplicate"
+                if isinstance(exc, DuplicateRefused)
+                else "rate_limited"
+                if isinstance(exc, RateLimited)
+                else "unconfirmed"
+            )
             # Keep the server's own words. When the reason a receipt cannot be published
             # is upstream capacity, that sentence is the most useful thing this node can
             # hand a reader asking whether it works — and it is observed rather than
@@ -218,10 +240,10 @@ class Node:
                     "fields": {"room": room, "type": obj.get("type"), "error": type(exc).__name__}
                 },
             )
-            # The request was made. Whether it landed is not known from here: `say_signed`
-            # raises both for a refusal and for a reply that never arrived, and on
-            # 2026-08-30 a write reported as a 503 was in the room afterwards.
-            return None, "unconfirmed"
+            # For `unconfirmed`, the request was made and whether it landed is not known
+            # from here: on 2026-08-30 a write reported as a 503 was in the room
+            # afterwards.
+            return None, outcome
 
         if room in (self.result_room, self.mailbox):
             self.ledger.set_state(f"last_publish_error:{room}", None)

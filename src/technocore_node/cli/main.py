@@ -232,6 +232,12 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
             #: looked" asserts an absence nobody observed.
             already_present: bool | None = None
 
+            if args.dry_run:
+                # Nothing was read and nothing was written, so there is no conclusion to
+                # report. `false` here would be a claim about a room this run never looked
+                # at — the unobserved assertion this release exists to remove.
+                verifiable = None
+
             if not args.dry_run:
                 await node.client.set_note(namespace, key, value)
 
@@ -309,7 +315,18 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                     )
                     if seq is not None:
                         verifiable = True
-                    if publish_outcome in ("refused_locally", "too_large"):
+                    if publish_outcome == "refused_duplicate":
+                        # The upstream says this exact attestation is already in the room.
+                        # That is a presence, not a failure — and the only reason the read
+                        # above did not see it is that the read and the write disagree,
+                        # which is what happened on 2026-08-30.
+                        already_present = True
+                        verifiable = True
+                        log.info(
+                            "attestation already present; upstream refused the duplicate",
+                            extra={"fields": {"room": node.result_room}},
+                        )
+                    elif publish_outcome in ("refused_locally", "too_large", "bad_room"):
                         # Nothing left this machine. `publish_reporting` says so rather
                         # than this reading mutable state back and guessing, which can be
                         # wrong in both directions: ownership can lapse between a real
@@ -319,6 +336,8 @@ def cmd_publish_profile(args: argparse.Namespace) -> int:
                             "between the check and the write"
                             if publish_outcome == "refused_locally"
                             else "the attestation exceeded the single-message limit"
+                            if publish_outcome == "too_large"
+                            else f"{node.result_room} is not a valid room name"
                         )
                         attestation_refused = (
                             f"the attestation was not sent: {reason}. Nothing was written."

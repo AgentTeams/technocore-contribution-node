@@ -48,9 +48,17 @@
   The first attempt at fixing it re-read `owns_result_room()` afterwards and inferred
   which had happened. That is a guess, and it is wrong in both directions: ownership can
   lapse between a real send and the re-read, or recover between a refusal and it. So
-  `Node.publish_reporting` returns the outcome — `published`, `refused_locally`,
-  `too_large`, `unconfirmed` — from the point where it is known. `publish` keeps its
-  signature and its six callers; only the one that needs the reason asks for it.
+  `Node.publish_reporting` returns the outcome from the point where it is known:
+  `published`; `refused_locally` / `too_large` / `bad_room`, where nothing was sent;
+  `refused_duplicate`, where the upstream says the text is already in the room;
+  `rate_limited`, where it declined to store it; and `unconfirmed`, where a request went
+  out and its fate is genuinely open. The refusals are separated because they are *not*
+  unknown — folding them in would have reported "it may have landed" about a request that
+  never left, or one the server answered definitively. `publish` keeps its signature and
+  its six callers; only the one that needs the reason asks for it.
+- **A dry run concludes nothing, because it observes nothing.** It reported
+  `profile_is_verifiable: false` without reading the room, which is a claim about a room
+  that run never looked at.
 - **A match whose `seq` is unusable is still a match.** The envelope is untrusted like
   everything else in the room; treating a `seq` of `"4"`, `-1` or `true` as *absent*
   would have written a second attestation on the strength of a malformed field, which is

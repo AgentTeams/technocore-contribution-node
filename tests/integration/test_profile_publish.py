@@ -73,6 +73,12 @@ def _run(monkeypatch: pytest.MonkeyPatch, args: Any, **behaviour: Any) -> dict[s
                     self.ledger.set_state("owned_room_owner", None)
                 return None, "refused_locally"
             captured["payload"] = payload
+            forced = behaviour.get("publish_outcome")
+            if forced:
+                self.ledger.set_state(
+                    f"last_publish_error:{room}", behaviour.get("error", "upstream said no")
+                )
+                return None, forced
             if behaviour.get("publish_fails"):
                 self.ledger.set_state(
                     f"last_publish_error:{room}", behaviour.get("error", "HTTP 503")
@@ -365,3 +371,55 @@ def test_an_unconfirmed_write_stays_unconfirmed_even_if_ownership_lapses_after(
     assert out["profile_is_verifiable"] is None
     assert "NOT confirmed" in out["attestation_refused"]
     assert "may have landed" in out["attestation_refused"]
+
+
+def test_a_dry_run_concludes_nothing_because_it_observed_nothing(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """`false` would be a claim about a room this run never looked at."""
+    args.dry_run = True
+    out = _run(monkeypatch, args)
+
+    assert out["dry_run"] is True
+    assert out["profile_is_verifiable"] is None
+    assert out["attestation_already_present"] is None
+    assert out["attestation_seq"] is None
+    assert "note" not in out["_captured"]
+    assert "payload" not in out["_captured"]
+
+
+def test_an_upstream_refusal_is_not_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """A duplicate refusal is the server saying the text is already there.
+
+    Folding it into `unconfirmed` would report "it may have landed" about a request the
+    server answered definitively — and in this case the answer is that the attestation is
+    present, which is the opposite of what "unconfirmed" leads a reader to do.
+    """
+    out = _run(monkeypatch, args, publish_outcome="refused_duplicate")
+
+    assert out["profile_is_verifiable"] is True
+    assert out["attestation_already_present"] is True
+    assert out["attestation_refused"] is None
+
+
+def test_a_rate_limit_is_a_refusal_not_a_silence(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """The server declined to store it. That is an answer."""
+    out = _run(monkeypatch, args, publish_outcome="rate_limited", error="HTTP 429")
+
+    assert out["profile_is_verifiable"] is None
+    assert "NOT confirmed" in out["attestation_refused"]
+
+
+def test_an_invalid_room_name_is_refused_before_anything_is_sent(
+    monkeypatch: pytest.MonkeyPatch, args: Any
+) -> None:
+    """`say_signed` would raise for this before sending, which is a refusal, not a loss."""
+    out = _run(monkeypatch, args, publish_outcome="bad_room")
+
+    assert out["profile_is_verifiable"] is False
+    assert "was not sent" in out["attestation_refused"]
+    assert "may have landed" not in out["attestation_refused"]
