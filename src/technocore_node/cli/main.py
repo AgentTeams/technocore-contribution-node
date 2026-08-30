@@ -579,6 +579,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
                 "input": {"value": {"b": 1, "a": [1, 2, 3]}},
             }
             text = json.dumps(job, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+            # Declared BEFORE the write. If this command dies between posting and
+            # processing — a timeout, a 503, a kill — the mailbox loop finds the job and
+            # runs it, and without this it counts as somebody else's.
+            node.ledger.expect_internal_test(temp_did, job_id)
+
             confirmation = await requester.say_signed(node.mailbox, text)
             steps.append({"step": "submit", "ok": True, "seq": confirmation.seq})
 

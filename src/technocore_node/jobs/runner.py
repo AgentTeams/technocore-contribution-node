@@ -266,8 +266,22 @@ class JobRunner:
         internal_test: bool,
         started: datetime,
     ) -> Outcome | None:
+        declared = self.ledger.is_expected_internal_test(requester_did, job_id)
+        if not internal_test and declared:
+            # Declared as this node's own before it was sent. Decided here, once, after
+            # the job_id is known — not by whichever caller happens to run it, which is
+            # what let a self-test be published as third-party use.
+            internal_test = True
+
         resuming = False
         owner = self.ledger.job_requester(job_id)
+        if owner == requester_did:
+            # A row already exists, so the classification was settled when it was made.
+            # Re-deriving it would depend on a declaration this run has already consumed,
+            # and a resumed job would come back as somebody else's.
+            existing_row = self.ledger.get_job(job_id)
+            if existing_row is not None:
+                internal_test = bool(existing_row["internal_test"])
         if owner is not None:
             if owner != requester_did:
                 # `job_id` is globally unique because it is also the public receipt
@@ -318,6 +332,10 @@ class JobRunner:
             task_type=task,
             status="validated",
             internal_test=internal_test,
+            # Spent with the insert, not before it: the row is what settles the
+            # classification, and removing the declaration first would leave a crash in
+            # between with neither.
+            spend_declaration=declared,
         )
         if not inserted:
             # Either the row is ours from an attempt that died — the resume path above —

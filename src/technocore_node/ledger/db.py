@@ -320,11 +320,17 @@ class Ledger:
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return _row(self.conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone())
 
-    def insert_job(self, **fields: Any) -> bool:
+    def insert_job(self, *, spend_declaration: bool = False, **fields: Any) -> bool:
         """Insert a job, returning False when this `job_id` was already seen.
 
         The uniqueness of `job_id` is what makes the whole pipeline idempotent: a replayed
         or re-delivered request lands here and stops.
+
+        `spend_declaration` consumes the internal-test declaration for this job **in the
+        same transaction** as the insert. The two are one fact: the classification is
+        settled by the row, and a declaration removed before the row existed would leave a
+        crash in between with neither — which is how the misclassification this guards
+        against happened in the first place.
         """
         columns = (
             "job_id",
@@ -351,6 +357,11 @@ class Ledger:
                     f"VALUES ({', '.join('?' for _ in columns)})",
                     tuple(row[c] for c in columns),
                 )
+                if spend_declaration:
+                    conn.execute(
+                        "DELETE FROM deployment_state WHERE key = ?",
+                        (f"internal_test_expect:{row['requester_did']}:{row['job_id']}",),
+                    )
         except sqlite3.IntegrityError:
             return False
         return True
@@ -448,6 +459,45 @@ class Ledger:
             )
 
     # --------------------------------------------------------------- receipts
+
+    def expect_internal_test(self, requester_did: str, job_id: str) -> None:
+        """Declare, before it is sent, that a job about to arrive is this node's own test.
+
+        The self-test posts a real job into the production mailbox, signed by a throwaway
+        key, and it is indistinguishable at intake from a stranger's. Which code path
+        happens to pick it up decided whether it counted as third-party use — and on
+        2026-08-30 the command timed out after the write landed, the mailbox loop found
+        the orphan, and this node published `third_party: 1 job, 1 requester` about
+        itself.
+
+        Keyed on the requester DID as well as the `job_id` so that a stranger cannot have
+        their job classified as ours by guessing an identifier. They would gain nothing by
+        it — the effect is to *undercount* this node's usage — but a guessable exemption
+        is still an exemption.
+        """
+        self.set_state(f"internal_test_expect:{requester_did}:{job_id}", utcnow())
+
+    def is_expected_internal_test(self, requester_did: str, job_id: str) -> bool:
+        """Whether this exact job was declared as this node's own before it was sent.
+
+        Reads only. The declaration is spent by :meth:`insert_job`, in the same
+        transaction that writes the classification onto the job row — consuming it here
+        would open a window in which the declaration is gone and the row does not exist
+        yet, and a process that died in it would leave the next attempt with neither.
+        That window is a crash, which is exactly how the misclassification happened.
+
+        **Nothing expires these.** Three attempts at a timer that drops the ones whose job
+        never arrived each reintroduced the accident this exists to prevent: the job was
+        still coming — the gate was shut, the poll was failing, the cursor was behind — and
+        the declaration went first, so the node ran its own test as a stranger's and
+        published the receipt as third-party work. No amount of elapsed time is evidence
+        that a message will not arrive.
+
+        So they are kept. One is a short row, they are written only when an operator runs
+        `selftest`, and only the runs whose job never landed leave one behind. That is a
+        cost worth paying rather than rebuilding the same fault a fourth time.
+        """
+        return self.get_state(f"internal_test_expect:{requester_did}:{job_id}")[0] is not None
 
     def record_receipt(
         self,

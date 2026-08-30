@@ -32,6 +32,16 @@ log = get_logger(__name__)
 REPO_URL = "https://github.com/AgentTeams/technocore-contribution-node"
 
 
+def _publicly_auditable(row: Any) -> bool:
+    """Whether a third party could actually check this receipt against the owned room.
+
+    `audit_state` alone is not that. An internal test is stored as `published` so the
+    reconciler leaves it alone, and it is never written to the room — so a reader was told
+    a receipt was checkable against a room it is deliberately absent from.
+    """
+    return not bool(row["internal_test"]) and row["audit_state"] == "published"
+
+
 def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
     app = FastAPI(
         title="Technocore Contribution Node",
@@ -215,7 +225,12 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                 # Stated rather than implied: until the copy in the owned room lands,
                 # this receipt is one only the requester can see, and a third party has
                 # nothing to check it against.
-                "publicly_auditable": row["audit_state"] == "published",
+                #
+                # An internal test is never in that room, and its row is marked
+                # `published` only to keep it out of the queue that would put it there.
+                # Reading the state alone therefore claimed a receipt was checkable
+                # against a room it is deliberately absent from.
+                "publicly_auditable": _publicly_auditable(row),
                 "audit_state": row["audit_state"],
                 "result_room": node.result_room,
                 "receipt": json.loads(row["receipt_json"]),
@@ -245,7 +260,7 @@ def create_app(node: Node, *, source_commit: str = "") -> FastAPI:
                     "receipt_id": r["receipt_id"],
                     "receipt_hash": r["receipt_hash"],
                     "internal_test": bool(r["internal_test"]),
-                    "publicly_auditable": r["audit_state"] == "published",
+                    "publicly_auditable": _publicly_auditable(r),
                     "created_at": r["created_at"],
                 }
                 for r in rows

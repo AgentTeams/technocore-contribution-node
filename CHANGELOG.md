@@ -1,5 +1,81 @@
 # Changelog
 
+## v0.2.2 — 2026-08-31
+
+**This node published a false usage figure for about three minutes on 2026-08-30, and
+this release is the correction and the fix.** For a project whose argument is that its
+numbers can be checked, that is the worst thing it has done so far, and it is recorded
+here rather than quietly repaired.
+
+### What happened
+
+`selftest` posts a real job into the production mailbox, signed by a throwaway key, and
+then processes it itself with `internal_test=True`. At intake the job is indistinguishable
+from a stranger's — the flag came from whichever caller ran it.
+
+The upstream was unstable. The command's write **landed** and the command then died on a
+read timeout before it could process the job. The node's own mailbox loop found the orphan
+and ran it as an ordinary job. `/v1/metrics` began reporting
+`third_party: 1 job, 1 requester` about this node's own test.
+
+Two further things followed from it, and neither can be undone:
+
+* The receipt was published into the owned audit room as third-party work — internal tests
+  are never published there. **`d-tc-contrib-06e9de34` seq 3 is a receipt signed by this
+  node's production key carrying `internal_test: false`, and that is wrong.** A signature
+  cannot be withdrawn; the record stands and is corrected beside it, not erased.
+* A check made during the incident read the mailbox as empty while it held that job, which
+  is why the retry happened at all. The upstream returned an unreliable read twice that
+  day; the first cost a duplicate attestation (see `v0.2.1`).
+
+### Corrected
+
+The ledger rows for `selftest-66744150c1102b49` were changed to `internal_test = 1` in
+both `jobs` and `receipts`, after confirming the job carried both markers only
+`cmd_selftest` produces. `/v1/metrics` reports `third_party: 0 jobs, 0 requesters` again,
+which is true. **Third-party usage of this node remains zero.**
+
+### Fixed
+
+- **A self-test is declared before it is sent.** `Ledger.expect_internal_test(did, job_id)`
+  records the classification ahead of the write, and `Runner.handle` applies it after the
+  `job_id` is known — so it no longer depends on which code path wins a race, and survives
+  the command dying between posting and processing.
+
+  The declaration is spent **in the same transaction as the insert that records the
+  classification**, because the row and the declaration are one fact. Spending it first
+  opens a window in which the declaration is gone and the row does not exist yet — and a
+  process that dies there leaves the next attempt with neither, which is precisely how
+  this node came to publish somebody else's number about itself. A resumed job takes the
+  classification from its own row.
+
+  **Nothing expires a declaration**, and that is deliberate. Three attempts at a timer to
+  drop the ones whose job never arrived each reintroduced the accident this release exists
+  to prevent: the job was still coming — the gate was shut, the poll was failing, the
+  cursor was behind — and the declaration went first, so the node would have run its own
+  test as a stranger's and published the receipt as third-party work. No amount of elapsed
+  time is evidence that a message will not arrive.
+
+  So they are kept. One is a short row, written only when an operator runs `selftest`, and
+  only by the runs whose job never landed. Rebuilding the same fault a fourth time is more
+  expensive than the rows.
+
+  It does not exempt the job from anything else. A declared test still meets the same
+  execution gate and the same rate limit as any other work, in both lanes, and an orphan
+  that arrives while the gate is shut waits with the cursor rather than being processed.
+  Deferred, not lost, and not privileged.
+- **An internal receipt is no longer advertised as publicly auditable.** Its row reads
+  `audit_state: published` so the reconciler leaves it alone — a queue marker, not a
+  statement about the room — and `/v1/receipts` read that alone. A reader was told they
+  could check a receipt against a room it is deliberately absent from.
+- **The HTTP lane kept internal receipts out of the owned room too.** The mailbox lane
+  always suppressed that publication — the owned room is a public claim about work done for
+  other people — and the HTTP lane did not. This release, which exists to stop exactly that
+  from happening, had left the second lane able to do it again.
+- **Bound to the requester DID as well as the id**, so a stranger cannot be classified as
+  this node's test by guessing an identifier. They would gain nothing — the effect is to
+  *undercount* this node's usage — but a guessable exemption is still an exemption.
+
 ## v0.2.1 — 2026-08-30
 
 ### Fixed
