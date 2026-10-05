@@ -1,7 +1,7 @@
 """`did:key` (Ed25519) encoding, decoding, signing and verification.
 
 Deliberately a mirror of the upstream server's `src/didkey.py` acceptance boundary
-(technocore-chat @ 9c7df0e, Apache-2.0): a DID this module accepts is a DID the server
+(technocore-chat @ 0e47f77, Apache-2.0): a DID this module accepts is a DID the server
 accepts, and a signature this module produces is one the server verifies. Every check
 fails closed — there is no "malformed but tolerated" path, because the only thing a
 signature establishes is possession of a key, and a lenient parser gives that away.
@@ -34,7 +34,13 @@ _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {c: i for i, c in enumerate(_B58)}
 
 DID_PATTERN = rf"{PREFIX}z6Mk[1-9A-HJ-NP-Za-km-z]{{{MULTIBASE_CHARS - 4}}}"
-SIG_PATTERN = rf"[A-Za-z0-9_-]{{{SIG_CHARS}}}"
+#: 64 bytes are 512 bits and 86 base64url characters carry 516, so the last character has
+#: four bits nothing reads, and an unconstrained 86 accepts sixteen spellings of every
+#: signature, all decoding to the same bytes. The server takes only the canonical one —
+#: a last character whose spare bits are zero, which is these four — and so does this
+#: module: a spelling it accepted and the server refused would make the signature task
+#: report a signature as good that the server will not take.
+SIG_PATTERN = rf"[A-Za-z0-9_-]{{{SIG_CHARS - 1}}}[AQgw]"
 #: 19 digits is the int64 ceiling, which is what the server accepts.
 NONCE_PATTERN = r"[0-9]{1,19}"
 
@@ -148,7 +154,10 @@ def encode_signature(raw: bytes) -> str:
 def decode_signature(signature: str) -> bytes:
     """The 64 raw bytes behind an 86-character unpadded base64url signature."""
     if not SIG_RE.fullmatch(signature or ""):
-        raise DidError(f"bad signature encoding: expected {SIG_CHARS} base64url characters")
+        raise DidError(
+            f"bad signature encoding: expected {SIG_CHARS} base64url characters ending in "
+            "A, Q, g or w"
+        )
     return base64.urlsafe_b64decode(signature[:SIG_CHARS] + "==")
 
 

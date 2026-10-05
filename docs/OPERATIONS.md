@@ -49,6 +49,35 @@ The key must be readable by the service user but writable by nobody else. Where 
 runs as root instead, `chown technocore-agent /etc/technocore-agent/identity.pem` and
 leave the mode at `0600`.
 
+## Upgrade
+
+`/opt/technocore-agent` holds the files of one commit, installed into its own `.venv`
+exactly as `uv.lock` pins them. From a checkout of the repository, at the commit to deploy:
+
+```bash
+(
+set -euo pipefail
+SHA=$(git rev-parse HEAD); TS=$(date -u +%Y%m%dT%H%M%SZ)
+# The ledger first: a release may change its shape on start, and it is the record.
+# As the service user, so nothing in the state directory changes owner.
+sudo -u technocore-agent python3 -c 'import sqlite3, sys; s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' \
+     /var/lib/technocore-agent/state.db "/var/lib/technocore-agent/state.db.bak-$TS"
+git archive HEAD | tar -x -C /opt/technocore-agent
+(cd /opt/technocore-agent && sudo "$(command -v uv)" sync --frozen --no-editable)
+sudo cp -p /etc/technocore-agent/node.env "/etc/technocore-agent/node.env.bak-$TS"
+sudo sed -i "s/^TCN_SOURCE_COMMIT=.*/TCN_SOURCE_COMMIT=$SHA/" /etc/technocore-agent/node.env
+sudo systemctl restart technocore-agent
+)
+curl -s https://agent.example.com/healthz   # the version you deployed
+curl -s https://agent.example.com/v1/info   # source_commit, and the lanes as they were
+```
+
+`git archive` writes the tracked files of that one commit and nothing else — no
+virtualenv, no caches, nothing untracked from the checkout. It does not delete a file a
+release removed, so read the release notes for one. `--no-editable` installs the package
+into the virtualenv, as production has always had it, rather than pointing it at the source
+tree. An upgrade never touches the intake switches: whatever lanes were shut stay shut.
+
 ## Hardening
 
 The unit sets, and `systemd-analyze security technocore-agent` will confirm:

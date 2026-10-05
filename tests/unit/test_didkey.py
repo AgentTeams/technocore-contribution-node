@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import string
+
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -60,11 +63,34 @@ def test_malformed_dids_are_refused(bad: str) -> None:
         didkey.public_key_bytes(bad)
 
 
-@pytest.mark.parametrize("bad", ["", "short", "a" * 85, "a" * 87, "!" * 86, "a" * 86 + "="])
+@pytest.mark.parametrize(
+    "bad", ["", "short", "a" * 85, "a" * 87, "!" * 86, "a" * 86 + "=", "a" * 86]
+)
 def test_malformed_signatures_are_refused(did: str, bad: str) -> None:
     with pytest.raises(didkey.DidError):
         didkey.decode_signature(bad)
     assert not didkey.verify_ok(did, bad, "x")
+
+
+def test_only_the_canonical_spelling_of_a_signature_is_accepted(
+    key: Ed25519PrivateKey, did: str
+) -> None:
+    """86 base64url characters carry four bits more than 64 bytes need, so sixteen spellings
+    decode to the same signature. Upstream accepts only the one whose spare bits are zero
+    (technocore-chat @ 0e47f77 `src/didkey.py`), and a spelling this module took that the
+    server refused would have the signature task call a signature good that is not."""
+    message = "lobby|7|hi"
+    sig = didkey.sign(key, message)
+    assert sig[-1] in "AQgw", "what this node signs is always the canonical spelling"
+
+    alphabet = string.ascii_letters + string.digits + "-_"
+    raw = base64.urlsafe_b64decode(sig + "==")
+    spellings = [
+        sig[:-1] + c for c in alphabet if base64.urlsafe_b64decode(sig[:-1] + c + "==") == raw
+    ]
+    assert len(spellings) == 16
+    accepted = [s for s in spellings if didkey.verify_ok(did, s, message)]
+    assert accepted == [sig]
 
 
 def test_fingerprint_is_16_lowercase_hex(did: str) -> None:

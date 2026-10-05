@@ -20,6 +20,7 @@ outbound request. There is no method here that fetches a caller-supplied URL.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -42,7 +43,7 @@ MAX_WAIT_SECONDS = 10
 #: The server prefixes every note read with this warning and a blank line. It is the
 #: server's own framing, not part of the value — a reader that keeps it will fail to
 #: parse a counter and will compare an owner DID against a string that can never match.
-#: Verified against technocore-chat @ 9c7df0e `src/app.py:BANNER`.
+#: Verified against technocore-chat @ 0e47f77 `src/app.py:BANNER`.
 UNTRUSTED_BANNER_PREFIX = "!! UNTRUSTED CONTENT"
 #: The upstream refuses a repeated text with 422, and says so explicitly: resending the
 #: same bytes is refused again. Retrying it would be a pointless write against our budget.
@@ -287,6 +288,28 @@ class TechnocoreClient:
         response = await self._request("GET", f"/r/{quote(room, safe='')}", params=params)
         data: dict[str, Any] = response.json()
         return data
+
+    async def export_room(self, room: str) -> list[dict[str, Any]]:
+        """Every record the room still holds, oldest first.
+
+        A read returns the *newest* records after a cursor — at most 200, and at most a
+        megabyte of them — so a backlog longer than that cannot be read from its start any
+        other way. The export is the room's stored file, one JSON record per line: the same
+        records the read view returns. Lines that are not JSON objects are dropped, since
+        the content is a stranger's, and a room that does not exist exports as empty.
+        """
+        if not valid_name(room):
+            raise TechnocoreError(f"invalid room name: {room!r}")
+        response = await self._request("GET", f"/r/{quote(room, safe='')}/export")
+        records: list[dict[str, Any]] = []
+        for line in response.text.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
 
     async def read_note(self, namespace: str, key: str) -> str | None:
         """A note's value, or None when it does not exist.

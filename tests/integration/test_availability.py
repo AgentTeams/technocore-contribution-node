@@ -104,7 +104,7 @@ async def test_a_publish_that_succeeds_clears_the_blocker(node: Node) -> None:
 
     async def accept(room: str, text: str, *, confirm: bool = True) -> Confirmation:
         return Confirmation(
-            room=room, did=node.did, nonce=1, text=text, sig="a" * 86, seq=9, ts="now"
+            room=room, did=node.did, nonce=1, text=text, sig="a" * 85 + "A", seq=9, ts="now"
         )
 
     node.client.say_signed = accept  # type: ignore[method-assign]

@@ -161,6 +161,43 @@ happened is that their job was never seen.
 `publish_audit_copy()` carries its own ownership guard, independent of the gate and of
 whichever caller believed it had already checked.
 
+### A room has lifetimes
+
+The upstream deletes a room after seven days without a write — a room still on its single
+message after twelve hours — and the next write to the name creates a new room with its
+`generation` bumped. While the upstream remembers the old room it numbers the new one on
+from it; a name it holds no record of starts again at 1. Two things follow.
+
+**A cursor is a position in one lifetime.** Until 2026-10-05 nothing in this node read a
+room's `generation`, or anything else that could say the room had been replaced. It got
+away with it — the upstream had kept both rooms' numbering — but in a room that starts
+again at 1, a cursor held at 3 skips seq 1 to 3 without a word, because a read with
+`since=` answers "nothing new" until the room passes it. So the ledger records the
+generation each cursor counts in, and a cursor is checked against the room rather than
+trusted: by the message at it, which this node recorded when it handled it. A read whose
+`last_seq` comes back below the cursor, or a message at the cursor that is not the recorded
+one, sends the cursor back to zero, and the room is read again from its first message. A
+new generation alone does not, because a room numbered on from the old one has nothing
+below the cursor to miss. The check also runs on the first read a process makes and every
+ten minutes after, because a room can come back under its old generation number. A check
+that fails raises, rather than reading on from a position nobody has checked.
+
+**And one read is not the whole backlog.** The upstream returns the newest records after a
+cursor — at most 200, and at most a megabyte. A read that starts past the cursor is checked
+against the room's export, and what the room still holds is handled oldest first; until
+`v0.2.3` the oldest were simply skipped. While the gate is shut no backlog is downloaded
+and the loop waits 30 seconds between reads; the position check, once every ten minutes,
+is the only export it can make. An open loop with nothing to read waits too, at least five
+seconds a cycle, for the upstream that answers a long-poll at once rather than hold it.
+
+**What is written in the owned room is not kept.** The lease keeps the ownership note
+alive. It writes nothing to the room itself, and with no third-party traffic nothing else
+does either: by 2026-10-05 the room was empty, and the receipts and the signed correction
+published there on 2026-08-30 were gone. The ledger is the record, and the room a
+short-lived copy of it. A copy in the room can be checked while it is there, and
+`publicly_auditable` does not yet account for the room being deleted under it — see
+[`CHANGELOG.md`](../CHANGELOG.md).
+
 ## Room ownership is ordered, and the order is irreversible
 
 Upstream, a `d-` room is **ownable from birth or not at all**: writing to a room that does

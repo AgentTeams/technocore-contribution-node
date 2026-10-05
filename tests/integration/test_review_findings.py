@@ -91,7 +91,7 @@ async def test_no_request_or_result_text_is_ever_persisted(
         did=REQUESTER,
         nonce=1,
         normalized_text_sha256="sha256:" + "0" * 64,
-        signature="a" * 86,
+        signature="a" * 85 + "A",
         status="confirmed",
     )
 
@@ -183,7 +183,7 @@ def test_an_older_database_gains_the_columns_the_code_now_writes(tmp_path: Path)
         result_hash="sha256:" + "1" * 64,
         status="ok",
         summary_bytes=42,
-        provider_signature="c" * 86,
+        provider_signature="c" * 85 + "A",
         result_seq=3,
     )
     stored = reopened.conn.execute(
@@ -551,7 +551,7 @@ def test_the_reserved_network_fields_are_declared_not_merely_described(tmp_path:
         "internal_test": False,
         "created_at": "2026-08-28T00:00:00Z",
         "receipt_hash": "sha256:" + "2" * 64,
-        "sig": "a" * 86,
+        "sig": "a" * 85 + "A",
     }
     validator = jsonschema.Draft202012Validator(RECEIPT_SCHEMA)
     assert not list(validator.iter_errors(receipt))
@@ -587,7 +587,7 @@ def test_the_technocore_adapter_produces_a_valid_receipt(tmp_path: Path) -> None
         "internal_test": False,
         "created_at": "2026-08-28T00:00:00Z",
         "receipt_hash": "sha256:" + "2" * 64,
-        "sig": "a" * 86,
+        "sig": "a" * 85 + "A",
     }
     annotated = TechnocoreAdapter.annotate_receipt(object.__new__(TechnocoreAdapter), receipt)
     assert annotated["network"] == "technocore"
@@ -692,9 +692,9 @@ def test_a_receipt_already_in_the_owned_room_is_not_published_again(ledger: Ledg
         "provider_did": OTHER,
         "request_hash": "sha256:" + "0" * 64,
         "result_hash": "sha256:" + "1" * 64,
-        "provider_signature": "b" * 86,
+        "provider_signature": "b" * 85 + "A",
         "receipt_hash": "sha256:" + "2" * 64,
-        "sig": "a" * 86,
+        "sig": "a" * 85 + "A",
         "created_at": "2026-08-28T00:00:00Z",
     }
     ledger.insert_job(
@@ -751,9 +751,9 @@ def test_a_receipt_that_never_publishes_is_quarantined_not_left_blocking(
             "provider_did": OTHER,
             "request_hash": "sha256:" + "0" * 64,
             "result_hash": "sha256:" + "1" * 64,
-            "provider_signature": "b" * 86,
+            "provider_signature": "b" * 85 + "A",
             "receipt_hash": "sha256:" + "2" * 64,
-            "sig": "a" * 86,
+            "sig": "a" * 85 + "A",
             "created_at": f"2026-08-28T00:00:0{i}Z",
         }
         ledger.record_receipt(receipt, json.dumps(receipt), internal_test=False)
@@ -793,9 +793,9 @@ def test_the_queue_tries_the_least_failed_receipt_first(ledger: Ledger) -> None:
                 "provider_did": OTHER,
                 "request_hash": "sha256:" + "0" * 64,
                 "result_hash": "sha256:" + "1" * 64,
-                "provider_signature": "b" * 86,
+                "provider_signature": "b" * 85 + "A",
                 "receipt_hash": "sha256:" + "2" * 64,
-                "sig": "a" * 86,
+                "sig": "a" * 85 + "A",
                 "created_at": f"2026-08-28T00:00:0{i}Z",
             },
             "{}",
@@ -822,10 +822,10 @@ def _receipt(job_id: str, receipt_hash: str = "sha256:" + "2" * 64) -> dict[str,
         "provider_did": OTHER,
         "request_hash": "sha256:" + "0" * 64,
         "result_hash": "sha256:" + "1" * 64,
-        "provider_signature": "b" * 86,
+        "provider_signature": "b" * 85 + "A",
         "internal_test": False,
         "receipt_hash": receipt_hash,
-        "sig": "a" * 86,
+        "sig": "a" * 85 + "A",
         "created_at": "2026-08-28T00:00:00Z",
     }
 

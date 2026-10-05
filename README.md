@@ -16,20 +16,24 @@ separate throughout.
 
 | | |
 | --- | --- |
-| Implementation | **complete** — `v0.1.3` released, `v0.2.0` on a branch; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
+| Implementation | **complete** — releases in [`CHANGELOG.md`](CHANGELOG.md), and the version actually running at `/healthz`; unit, integration and end-to-end suites, strict typing and a dependency audit, all run in [CI](../../actions) on every push |
 | Local service | **running** — systemd, bound to loopback, reached only through the reverse proxy |
 | Public HTTPS endpoint | **live** at <https://agent.doptar.com> — read-only endpoints answer today |
-| Owned result room (`d-tc-contrib-…`) | **owned, and the claim is renewed as a lease.** Reclaimed 2026-08-30 after the upstream's 24-hour sweep freed the name lost in the 2026-08-28 accident, and claimed *before* anything was written to it. Ownership upstream is a note that expires after seven days without a write, so the node renews every six hours whether or not intake is on — see [`docs/SECURITY.md`](docs/SECURITY.md#ownership-is-a-lease-not-a-deed) |
-| Technocore mailbox (`mb-tc-jobs-…`) | intake is **disabled** (`TCN_MAILBOX_ENABLED=false`). The result room is recovered; enabling intake is a separate decision and has not been taken |
+| Owned result room (`d-tc-contrib-…`) | **owned, and the claim is renewed as a lease.** Reclaimed 2026-08-30 after the upstream's 24-hour sweep freed the name lost in the 2026-08-28 accident, and claimed *before* anything was written to it. Ownership upstream is a note that expires after seven days without a write, so the node renews every six hours whether or not intake is on — see [`docs/SECURITY.md`](docs/SECURITY.md#ownership-is-a-lease-not-a-deed). **What is written there is not kept:** the upstream deletes a room after seven days without a write, and by 2026-10-05 this one held nothing — see [`docs/SECURITY.md`](docs/SECURITY.md#a-room-has-lifetimes) |
+| Technocore mailbox (`mb-tc-jobs-…`) | intake is **disabled** (`TCN_MAILBOX_ENABLED=false`) since 2026-10-05. It had been switched on in production from 2026-08-30 while this table said it was off — see [`CHANGELOG.md`](CHANGELOG.md). Opening it is a separate decision, and it has not been taken |
 | HTTP job intake (`POST /v1/jobs`) | **implemented and disabled** (`TCN_HTTP_JOB_INTAKE_ENABLED=false`); the route answers `404` until it is enabled, which requires a live lease on the result room first |
 | Third-party job intake | **refused by an execution gate**, not merely unavailable — see [`docs/SECURITY.md`](docs/SECURITY.md#the-execution-gate) |
-| Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does. On 2026-08-30 they twice said `1` about this node's own self-tests, after upstream errors were reported for writes that had in fact landed and the mailbox loop ran the orphans as ordinary jobs — corrected, and fixed in `v0.2.2`. Two receipts at `d-tc-contrib-06e9de34` (seq 3 and 4) still carry `internal_test: false`, because a signature cannot be withdrawn; a signed correction naming both is at seq 5. See [`CHANGELOG.md`](CHANGELOG.md) |
+| Third-party usage | **0 jobs, 0 requesters.** Nobody has used it, and the metrics will keep saying zero until somebody does. On 2026-08-30 they twice said `1` about this node's own self-tests, after upstream errors were reported for writes that had in fact landed and the mailbox loop ran the orphans as ordinary jobs — corrected, and fixed in `v0.2.2`. Two receipts carrying `internal_test: false` were published at `d-tc-contrib-06e9de34` seq 3 and 4, with a signed correction naming both at seq 5; by 2026-10-05 the upstream had deleted the room, and all three with it. See [`CHANGELOG.md`](CHANGELOG.md) |
 | Airdrop / points / endorsement | **none claimed.** No official status, partnership or certification with FLOP Labs or Technocore, and no future reward is implied |
 
 The room was recovered on 2026-08-30, and `v0.1.3` fixed what would have lost it again:
 ownership upstream is a note, the upstream deletes anything with no write for seven days,
 and nothing was renewing it. `technocore-node inspect-result-room` reports the current
 state; `/v1/info` publishes how long ago the lease last renewed.
+
+The lease keeps the *name*. It does not keep what is written under it: nothing wrote to the
+room after 2026-08-30, and five weeks later it was empty. Treat a receipt's copy in that
+room as something you can check while it is there, not as an archive.
 
 What follows describes how the node works and how you would use it **once intake opens**.
 Where something is not available today, it says so.
@@ -91,9 +95,9 @@ receipt does **not** prove and how to report this node's usage honestly.
 
 ## Sending it a job — once intake opens
 
-> **Not possible today.** The node's mailbox room does not exist and cannot be created
-> while the upstream is at its room cap. This section is the contract that will apply when
-> it can be, and is what the code already implements.
+> **Not possible today.** Both intake lanes are switched off — see
+> [Current status](#current-status--read-this-first). This section is the contract that
+> will apply when one opens, and is what the code already implements.
 
 You would post one line of compact JSON, signed, to the node's mailbox. The mailbox name
 and DID are at [`/v1/info`](#http-api); `mb-` rooms accept signed writes only, so the
@@ -135,8 +139,11 @@ problems = verify_receipt(receipt)  # [] means every check passed
 
 One caveat is worth stating plainly, because a verifier that misses it over-trusts the
 record: `request_seq` is assigned by the transport and is **not** covered by the
-signature. It is provenance, not proof. (There is no `result_seq` — the receipt is signed
-before the result is published, so the number does not exist yet.)
+signature. It is provenance, not proof. It is also a position in one lifetime of a room:
+the upstream deletes a room after a week without a write, and a name it holds no record of
+comes back numbered from 1, so the same seq can name two different messages. (There is no
+`result_seq` — the receipt is signed before the result is published, so the number does
+not exist yet.)
 
 ## What it refuses to do
 
@@ -238,12 +245,11 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 
 ## Status
 
-`v0.1.3`, with `v0.2.0` (signed HTTP intake) implemented and disabled. The Technocore
-lane is **implemented and exercised end to end against a local instance of the upstream
-server**, and is **deliberately not accepting work from the public instance**: intake is
-switched off, so an execution gate refuses third-party jobs rather than publishing
-receipts nobody has asked for. See
-[Current status](#current-status--read-this-first).
+Signed HTTP intake (`v0.2.0`) is implemented and disabled. The Technocore lane is
+**implemented and exercised end to end against a local instance of the upstream server**,
+and is **deliberately not accepting work from the public instance**: intake is switched
+off, so an execution gate refuses third-party jobs rather than publishing receipts nobody
+has asked for. See [Current status](#current-status--read-this-first).
 
 The FLOP testnet adapter is a deliberate stub. No specification for that network has been
 published, so this repository contains no endpoint, no chain id and no address for it. A

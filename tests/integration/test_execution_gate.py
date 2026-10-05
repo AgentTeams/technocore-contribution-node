@@ -85,7 +85,7 @@ class _Recorder:
     async def say_signed(self, room: str, text: str, *, confirm: bool = True) -> Confirmation:
         self.writes.append((room, text))
         return Confirmation(
-            room=room, did=self._node.did, nonce=1, text=text, sig="a" * 86, seq=1, ts="now"
+            room=room, did=self._node.did, nonce=1, text=text, sig="a" * 85 + "A", seq=1, ts="now"
         )
 
     def rooms(self) -> set[str]:
@@ -265,6 +265,12 @@ async def test_the_held_jobs_are_processed_after_recovery(node: Node) -> None:
         }
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     assert await node.poll_mailbox_once(wait=0) == 0
     assert node.ledger.get_job("deferred-00001") is None
 
@@ -362,7 +368,7 @@ async def test_inspect_reports_the_unclaimable_state_without_writing(node: Node)
     state = await node.inspect_result_room()
     assert state["verdict"] == "unclaimable"
     assert "WAIT" in state["next_action"]
-    assert "24 hours" in state["next_action"]
+    assert "12 hours" in state["next_action"]
     assert recorder.writes == [], "inspection never writes"
 
 
@@ -545,6 +551,12 @@ async def test_a_message_that_raises_still_advances_the_cursor(node: Node) -> No
         raise RuntimeError("handler exploded")
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     node.process_message = boom  # type: ignore[method-assign]
 
     await node.poll_mailbox_once(wait=0)
@@ -560,10 +572,23 @@ async def test_a_ring_gap_is_detected_and_recorded(node: Node) -> None:
     _own_the_room(node)
     node.ledger.set_cursor(node.mailbox, 10)
 
+    # The upstream's `first_seq` is the first message it returned, so the gap is what lies
+    # between the cursor and the oldest message the room still holds.
+    surviving = [
+        {"seq": seq, "ts": "now", "from": REQUESTER, "nonce": seq, "text": f"line {seq}"}
+        for seq in range(25, 31)
+    ]
+
     async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
-        return {"room": room, "count": 0, "first_seq": 25, "last_seq": 30, "messages": []}
+        return {"room": room, "count": 6, "first_seq": 25, "last_seq": 30, "messages": surviving}
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     await node.poll_mailbox_once(wait=0)
 
     gap, _ = node.ledger.get_state("mailbox_gap")

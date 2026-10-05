@@ -102,6 +102,8 @@ class Ledger:
         ("receipts", "audit_state", "TEXT NOT NULL DEFAULT 'owed'"),
         ("receipts", "audit_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("receipts", "audit_error", "TEXT"),
+        ("cursors", "generation", "INTEGER"),
+        ("cursors", "restarts", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _columns(self, table: str) -> set[str]:
@@ -231,6 +233,22 @@ class Ledger:
                 tuple(row[c] for c in columns),
             )
 
+    def recorded_message_at(self, room: str, seq: int) -> sqlite3.Row | None:
+        """The newest message this node recorded at `seq` in `room`, in or out.
+
+        What a cursor position is checked against: a room the upstream renumbered can hold
+        a different message at the same seq, under the same generation, and only the
+        message itself can say whether it is the one this node handled there.
+        """
+        return _row(
+            self.conn.execute(
+                "SELECT did, normalized_text_sha256, direction FROM messages "
+                "WHERE room = ? AND technocore_seq = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (room, seq),
+            ).fetchone()
+        )
+
     def last_nonce(self, did: str, room: str) -> int:
         row = self.conn.execute(
             "SELECT MAX(nonce) AS n FROM messages WHERE did = ? AND room = ? AND direction = 'out'",
@@ -300,6 +318,44 @@ class Ledger:
                 "ON CONFLICT (room) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq), "
                 "updated_at = excluded.updated_at",
                 (room, last_seq, utcnow()),
+            )
+
+    def cursor_epoch(self, room: str) -> int | None:
+        """The lifetime of `room` the stored cursor counts in, or None if never recorded."""
+        row = self.conn.execute("SELECT generation FROM cursors WHERE room = ?", (room,)).fetchone()
+        return int(row["generation"]) if row and row["generation"] is not None else None
+
+    def cursor_restarts(self, room: str) -> int:
+        """How many times this node has found `room` replaced and read it from the start."""
+        row = self.conn.execute("SELECT restarts FROM cursors WHERE room = ?", (room,)).fetchone()
+        return int(row["restarts"]) if row else 0
+
+    def adopt_cursor_epoch(self, room: str, generation: int) -> None:
+        """Record which lifetime of `room` the cursor counts in, leaving the cursor alone."""
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO cursors (room, last_seq, generation, updated_at) "
+                "VALUES (?, 0, ?, ?) ON CONFLICT (room) DO UPDATE SET "
+                "generation = excluded.generation, updated_at = excluded.updated_at",
+                (room, generation, utcnow()),
+            )
+
+    def restart_cursor(self, room: str, generation: int | None) -> None:
+        """Read `room` from its first message again: it is a new lifetime of the name.
+
+        The one write that moves a cursor backwards, and only ever to zero. `set_cursor`
+        refuses to go back on purpose — within one lifetime, a lower number is a stale
+        write losing a race — but a room the upstream deleted can come back numbered from
+        1, and a cursor held at the old position would skip everything posted there until
+        the new room caught up with it.
+        """
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO cursors (room, last_seq, generation, restarts, updated_at) "
+                "VALUES (?, 0, ?, 1, ?) ON CONFLICT (room) DO UPDATE SET last_seq = 0, "
+                "generation = excluded.generation, restarts = restarts + 1, "
+                "updated_at = excluded.updated_at",
+                (room, generation, utcnow()),
             )
 
     # ------------------------------------------------------------------- jobs

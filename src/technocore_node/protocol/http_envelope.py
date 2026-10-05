@@ -76,7 +76,9 @@ def verify_http_job(did: str, signature: str, nonce: str, body: object) -> None:
     if not NONCE_RE.fullmatch(nonce) or int(nonce) > MAX_NONCE:
         raise HttpEnvelopeError("nonce must be 1-19 digits")
     if not didkey.SIG_RE.fullmatch(signature or ""):
-        raise HttpEnvelopeError("sig must be 86 unpadded base64url characters")
+        raise HttpEnvelopeError(
+            "sig must be 86 unpadded base64url characters, the last of them A, Q, g or w"
+        )
     if not didkey.verify_ok(did, signature, http_job_payload(did, nonce, body)):
         raise HttpEnvelopeError(
             "signature does not cover this request. It must sign "
