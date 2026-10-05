@@ -59,8 +59,9 @@ exactly as `uv.lock` pins them. From a checkout of the repository, at the commit
 set -euo pipefail
 SHA=$(git rev-parse HEAD); TS=$(date -u +%Y%m%dT%H%M%SZ)
 # The ledger first: a release may change its shape on start, and it is the record.
-# As the service user, so nothing in the state directory changes owner.
-sudo -u technocore-agent python3 -c 'import sqlite3, sys; s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' \
+# As the service user, so nothing in the state directory changes owner, and 0600 like the
+# ledger itself: sudo's umask is not the service's.
+sudo -u technocore-agent python3 -c 'import os, sqlite3, sys; os.umask(0o077); s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' \
      /var/lib/technocore-agent/state.db "/var/lib/technocore-agent/state.db.bak-$TS"
 git archive HEAD | tar -x -C /opt/technocore-agent
 (cd /opt/technocore-agent && sudo "$(command -v uv)" sync --frozen --no-editable)
