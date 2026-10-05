@@ -172,8 +172,15 @@ CREATE TABLE IF NOT EXISTS http_nonces (
 
 -- Per-room read cursors, so a restart resumes where the poller stopped rather than
 -- reprocessing a room from its oldest retained message.
+--
+-- A cursor is a position in one lifetime of a room. The upstream deletes a room after a
+-- week without a write, and the next write recreates it with `generation` bumped —
+-- numbered on from the old room while the upstream remembers it, and from 1 when it does
+-- not — so `last_seq` means nothing without the generation it counts in. NULL means the
+-- lifetime was never recorded (a ledger from before this column existed).
 CREATE TABLE IF NOT EXISTS cursors (
     room       TEXT PRIMARY KEY,
     last_seq   INTEGER NOT NULL,
+    generation INTEGER,
     updated_at TEXT NOT NULL
 );

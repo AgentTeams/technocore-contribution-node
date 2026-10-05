@@ -6,7 +6,7 @@ it actually stores. Signing the text you typed instead of the text that survives
 a signature that will not verify, so every outbound path in this node sweeps first and
 signs second.
 
-Mirrors technocore-chat @ 9c7df0e `src/store.py:clean_text`.
+Mirrors technocore-chat @ 0e47f77 `src/store.py:clean_text` (unchanged since 9c7df0e).
 """
 
 from __future__ import annotations

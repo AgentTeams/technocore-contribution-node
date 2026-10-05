@@ -85,7 +85,7 @@ class _Recorder:
     async def say_signed(self, room: str, text: str, *, confirm: bool = True) -> Confirmation:
         self.writes.append((room, text))
         return Confirmation(
-            room=room, did=self._node.did, nonce=1, text=text, sig="a" * 86, seq=1, ts="now"
+            room=room, did=self._node.did, nonce=1, text=text, sig="a" * 85 + "A", seq=1, ts="now"
         )
 
     def rooms(self) -> set[str]:
@@ -362,7 +362,7 @@ async def test_inspect_reports_the_unclaimable_state_without_writing(node: Node)
     state = await node.inspect_result_room()
     assert state["verdict"] == "unclaimable"
     assert "WAIT" in state["next_action"]
-    assert "24 hours" in state["next_action"]
+    assert "12 hours" in state["next_action"]
     assert recorder.writes == [], "inspection never writes"
 
 

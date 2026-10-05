@@ -42,7 +42,7 @@ MAX_WAIT_SECONDS = 10
 #: The server prefixes every note read with this warning and a blank line. It is the
 #: server's own framing, not part of the value — a reader that keeps it will fail to
 #: parse a counter and will compare an owner DID against a string that can never match.
-#: Verified against technocore-chat @ 9c7df0e `src/app.py:BANNER`.
+#: Verified against technocore-chat @ 0e47f77 `src/app.py:BANNER`.
 UNTRUSTED_BANNER_PREFIX = "!! UNTRUSTED CONTENT"
 #: The upstream refuses a repeated text with 422, and says so explicitly: resending the
 #: same bytes is refused again. Retrying it would be a pointless write against our budget.

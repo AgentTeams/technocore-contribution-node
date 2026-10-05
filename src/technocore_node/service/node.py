@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -99,6 +100,10 @@ class Node:
         self.context = NodeContext(self.ledger)
         self.started_at = utcnow()
         self._tasks: list[asyncio.Task[None]] = []
+        #: When each room's tail was last read without a cursor, on the monotonic clock.
+        #: In memory on purpose: a restart is exactly when a room may have been replaced
+        #: unseen, so a fresh process checks before it trusts a stored position.
+        self._epoch_probed: dict[str, float] = {}
 
         self.ledger.record_identity(
             self.did, self.fingerprint, self.identity.public_key_hash, label="production"
@@ -262,13 +267,22 @@ class Node:
     # ------------------------------------------------------------ mailbox loop
 
     async def process_message(
-        self, message: dict[str, Any], *, internal_test: bool = False
+        self,
+        message: dict[str, Any],
+        *,
+        internal_test: bool = False,
+        generation: int | None = None,
     ) -> bool:
         """Handle one inbound mailbox line, start to finish.
 
         Returns True when the message was dealt with — executed, refused, or recognised
         as a duplicate — and False when it was left untouched because the node is not in
         a safe state. The caller uses that to decide whether the cursor may move past it.
+
+        `generation` is the lifetime of the mailbox the line was read from. A recreated
+        room can number from 1 again, so a seq alone may name a different message in each
+        lifetime, and the record of an earlier one must not be overwritten by a later one
+        that happens to share its number.
         """
         sender = str(message.get("from", ""))
         text = str(message.get("text", ""))
@@ -299,7 +313,13 @@ class Node:
             return True  # seen and refused on its own merits
 
         self.ledger.record_message(
-            local_event_id=f"in-{self.mailbox}-{seq}",
+            # Unqualified when no lifetime was reported — None, or the 0 the upstream gives
+            # a name that never existed. Those are the ids existing ledgers already hold.
+            local_event_id=(
+                f"in-{self.mailbox}-g{generation}-{seq}"
+                if generation
+                else f"in-{self.mailbox}-{seq}"
+            ),
             direction="in",
             room=self.mailbox,
             did=sender,
@@ -442,7 +462,8 @@ class Node:
                 "unclaimable",
                 "WAIT: the room holds messages, and upstream allows a claim only from "
                 "birth. Write nothing to it. A room still on its single message is "
-                "reclaimed after 24 hours idle; then claim it before anything else.",
+                "reclaimed after 12 hours idle (a week, once it holds more); then claim it "
+                "before anything else.",
             )
         else:
             verdict, action = "claimable", "claim it now, before writing anything to it"
@@ -496,9 +517,17 @@ class Node:
         if not self.owns_result_room():
             return 0
 
-        since = self.ledger.cursor(self.result_room)
         try:
+            since = await self._cursor_for(self.result_room)
             data = await self.client.read_room(self.result_room, since=since)
+            if self._settle_read(self.result_room, since, data):
+                # Replaced since the last look. Read the new room from its first message
+                # now rather than on the next pass: the reconciler publishes straight after
+                # this, and a copy that already landed in the new room must be recognised
+                # before anything is posted there again.
+                since = 0
+                data = await self.client.read_room(self.result_room, since=0)
+                self._settle_epoch(self.result_room, 0, _count(data.get("generation")))
         except TechnocoreError:
             # The owned room may not exist yet, or the upstream may be refusing reads.
             # Neither is a reason to fail a job; the next pass tries again.
@@ -572,6 +601,109 @@ class Node:
                 landed += 1
         return landed
 
+    # --------------------------------------------------------- room lifetimes
+
+    #: How often a room's tail is read without a cursor. Every ordinary read already
+    #: carries two signals (see :meth:`_settle_read`); this is the third, for an upstream
+    #: that echoes the cursor back whatever the room holds, which is how `/interop.md`
+    #: describes it — and the check that guide prescribes. One extra read per room per
+    #: interval.
+    ROOM_EPOCH_PROBE_SECONDS = 600
+
+    def _probe_due(self, room: str, since: int) -> bool:
+        if since == 0:
+            # A cursor at the start of the room cannot skip anything.
+            return False
+        last = self._epoch_probed.get(room)
+        return last is None or time.monotonic() - last >= self.ROOM_EPOCH_PROBE_SECONDS
+
+    async def _cursor_for(self, room: str) -> int:
+        """Where to read `room` from, once it is established the cursor still applies.
+
+        The upstream deletes a room after a week without a write, and the next write
+        creates a new room under the same name with its `generation` bumped. While the
+        upstream remembers the old room it numbers the new one on from it, so an old cursor
+        keeps working; when it has no record — `generation: 0`, which is how both of this
+        node's rooms read on 2026-10-05 — the new room starts again at 1. A read with
+        `since=` cannot tell the two apart: when nothing is newer it echoes the cursor back
+        as `last_seq`, so a node holding seq 3 hears "nothing new" until the new room
+        passes 3, having skipped everything before it. That is the state this node was
+        found in: both rooms gone, the mailbox cursor at 3, and `/v1/info` reporting it
+        accepting work.
+
+        This is the check `/interop.md` prescribes: read the tail without a cursor, and
+        when it is behind the cursor, or belongs to another generation, the room is a new
+        one. Done on the first read a process makes — a restart is exactly when a room may
+        have been replaced unseen — and every :attr:`ROOM_EPOCH_PROBE_SECONDS` after that.
+        Upstream 0.14.5 also shows both signals in an ordinary read, which
+        :meth:`_settle_read` checks on every one.
+
+        A failed probe raises rather than reading on from a position nobody has checked.
+        """
+        since = self.ledger.cursor(room)
+        if not self._probe_due(room, since):
+            return since
+        tail = await self.client.read_room(room, limit=1)
+        if not isinstance(tail, dict):
+            raise TechnocoreError(f"room read returned a {type(tail).__name__}, not an object")
+        self._epoch_probed[room] = time.monotonic()
+        last_seq = _count(tail.get("last_seq"))
+        generation = _count(tail.get("generation"))
+        if last_seq is not None and last_seq < since:
+            self._restart_cursor(room, generation, since, f"the room ends at seq {last_seq}")
+            return 0
+        if self._settle_epoch(room, since, generation):
+            return 0
+        return since
+
+    def _settle_read(self, room: str, since: int, data: dict[str, Any]) -> bool:
+        """Check a read of `room` against the cursor it was made from. True: read it again.
+
+        Two signals, both in the read itself. A different `generation` is a different room.
+        And with nothing newer the upstream answers `last_seq` as the lower of the cursor and
+        the room's head (`src/store.py`), so a `last_seq` below the cursor is a room that no
+        longer reaches it — deleted, and come back without its numbering.
+        """
+        last_seq = _count(data.get("last_seq"))
+        generation = _count(data.get("generation"))
+        if since and last_seq is not None and last_seq < since and not data.get("messages"):
+            self._restart_cursor(room, generation, since, f"the room ends at seq {last_seq}")
+            return True
+        return self._settle_epoch(room, since, generation)
+
+    def _settle_epoch(self, room: str, since: int, generation: int | None) -> bool:
+        """Record the lifetime a read of `room` came from. True if it must be read again.
+
+        The first lifetime seen is adopted. A ledger from before lifetimes were recorded
+        has a cursor and no generation, and :meth:`_cursor_for` has already checked that
+        cursor against the room's tail. From then on, a different generation is a
+        different room, whatever its numbers say.
+        """
+        if generation is None:
+            return False
+        known = self.ledger.cursor_epoch(room)
+        if known is None:
+            self.ledger.adopt_cursor_epoch(room, generation)
+            return False
+        if generation == known:
+            return False
+        self._restart_cursor(room, generation, since, f"generation {known} became {generation}")
+        return since > 0
+
+    def _restart_cursor(self, room: str, generation: int | None, previous: int, why: str) -> None:
+        fields = {"room": room, "previous_cursor": previous, "generation": generation, "why": why}
+        if previous:
+            # A warning, because it means the upstream deleted this room — and anything in
+            # it that was never read went with it.
+            log.warning(
+                "room was replaced upstream; reading it from its first message",
+                extra={"fields": fields},
+            )
+            self.ledger.set_state(f"room_restarted:{room}", f"cursor {previous} -> 0: {why}")
+        else:
+            log.info("room has a new lifetime", extra={"fields": fields})
+        self.ledger.restart_cursor(room, generation)
+
     async def poll_mailbox_once(self, *, wait: int = 10) -> int:
         """One long-poll cycle. Returns how many messages were processed.
 
@@ -584,10 +716,24 @@ class Node:
         deferred is not preserved. The mailbox is a ring, so a long enough closure ages
         unread messages out upstream, where no cursor can reach them. That gap is detected
         from `first_seq`, logged at `error` and recorded; it cannot be undone.
+
+        A cursor is also a position in one *lifetime* of the room. The upstream deletes a
+        room after a week without a write, and a name it no longer has a record of comes
+        back numbered from 1 — and a read with `since=` cannot show it, because it echoes
+        the cursor back as `last_seq` when nothing is newer. A cursor left at the old
+        position skips every job posted to the new room until the room catches up with it,
+        and says nothing. See :meth:`_cursor_for`.
         """
         safe, reasons = self.lane_is_open("mailbox")
-        since = self.ledger.cursor(self.mailbox)
+        since = await self._cursor_for(self.mailbox)
         data = await self.client.read_room(self.mailbox, since=since, wait=wait)
+        generation = _count(data.get("generation"))
+        if self._settle_read(self.mailbox, since, data):
+            # Replaced since the last look — between probes, or inside this ten-second
+            # long-poll. What came back is the tail of a new room read from an old
+            # position, so it is left for the next cycle, which reads the new room from its
+            # first message. Handling it now would answer that room out of order.
+            return 0
         messages = data.get("messages", [])
 
         first_seq = data.get("first_seq")
@@ -629,7 +775,7 @@ class Node:
         for message in messages:
             handled = False
             try:
-                handled = await self.process_message(message)
+                handled = await self.process_message(message, generation=generation)
             except Exception:
                 # One malformed or hostile message must never end the loop. It counts as
                 # handled: it was seen, it failed on its own merits, and re-reading it
@@ -1257,6 +1403,17 @@ def _unpublishable(receipt_json: Any, job_id: str, receipt_hash: str) -> str | N
     if errors:
         return f"stored receipt fails its own schema: {errors[0].message}"[:200]
     return None
+
+
+def _count(value: Any) -> int | None:
+    """A sequence number or generation read off the wire, or None when it is not one.
+
+    The envelope is untrusted like everything else in a room. `True` is an `int` to
+    Python and is not a count, and a negative number is not a position.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _sha(text: str) -> str:

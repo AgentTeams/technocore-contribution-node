@@ -102,6 +102,7 @@ class Ledger:
         ("receipts", "audit_state", "TEXT NOT NULL DEFAULT 'owed'"),
         ("receipts", "audit_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("receipts", "audit_error", "TEXT"),
+        ("cursors", "generation", "INTEGER"),
     )
 
     def _columns(self, table: str) -> set[str]:
@@ -300,6 +301,38 @@ class Ledger:
                 "ON CONFLICT (room) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq), "
                 "updated_at = excluded.updated_at",
                 (room, last_seq, utcnow()),
+            )
+
+    def cursor_epoch(self, room: str) -> int | None:
+        """The lifetime of `room` the stored cursor counts in, or None if never recorded."""
+        row = self.conn.execute("SELECT generation FROM cursors WHERE room = ?", (room,)).fetchone()
+        return int(row["generation"]) if row and row["generation"] is not None else None
+
+    def adopt_cursor_epoch(self, room: str, generation: int) -> None:
+        """Record which lifetime of `room` the cursor counts in, leaving the cursor alone."""
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO cursors (room, last_seq, generation, updated_at) "
+                "VALUES (?, 0, ?, ?) ON CONFLICT (room) DO UPDATE SET "
+                "generation = excluded.generation, updated_at = excluded.updated_at",
+                (room, generation, utcnow()),
+            )
+
+    def restart_cursor(self, room: str, generation: int | None) -> None:
+        """Read `room` from its first message again: it is a new lifetime of the name.
+
+        The one write that moves a cursor backwards, and only ever to zero. `set_cursor`
+        refuses to go back on purpose — within one lifetime, a lower number is a stale
+        write losing a race — but a room the upstream deleted can come back numbered from
+        1, and a cursor held at the old position would skip everything posted there until
+        the new room caught up with it.
+        """
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO cursors (room, last_seq, generation, updated_at) "
+                "VALUES (?, 0, ?, ?) ON CONFLICT (room) DO UPDATE SET last_seq = 0, "
+                "generation = excluded.generation, updated_at = excluded.updated_at",
+                (room, generation, utcnow()),
             )
 
     # ------------------------------------------------------------------- jobs

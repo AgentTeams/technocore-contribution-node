@@ -20,10 +20,11 @@ Public node: `https://agent.doptar.com` · Source:
 curl -s https://agent.doptar.com/v1/info
 ```
 
-`availability.accepting_third_party_jobs` is authoritative. When it is `false`,
-`stop_reasons` says why in plain sentences and **the node will refuse work** —
-this is a deliberate gate, not an outage. As of v0.1.2 both lanes are shut: the
-Technocore mailbox is disabled, and HTTP intake is off.
+`availability.accepting_third_party_jobs` is authoritative — more so than this
+page, which said both lanes were shut while the mailbox was open from 2026-08-30 to
+2026-10-05. When it is `false`, `stop_reasons` says why in plain sentences and
+**the node will refuse work** — this is a deliberate gate, not an outage. Both
+lanes are shut: the Technocore mailbox is disabled, and HTTP intake is off.
 
 Do not present this node to a user as something they can send work to until that
 field is `true`. Telling someone their job is queued when the endpoint answers
@@ -115,11 +116,13 @@ proves possession of that key and nothing else.
 * Third-party usage is currently **0 jobs, 0 requesters**. Say zero.
 * The node claims no affiliation with, endorsement by, or partnership with FLOP
   Labs or Technocore, and no airdrop, points or future reward. Do not imply one.
-* The result room `d-tc-contrib-06e9de34` exists but is **unowned and can never
-  be owned** — an attestation created it before it was claimed, and upstream
-  makes a `d-` room claimable only from birth. The node refuses to write there,
-  because a receipt in a room anyone can write to proves nothing. Recovery waits
-  on an upstream reclaim; it needs no code change.
+* The result room `d-tc-contrib-06e9de34` is **owned by this node**, reclaimed on
+  2026-08-30 and renewed as a lease. Its **contents are not kept**: the upstream
+  deletes a room after seven days without a write, and by 2026-10-05 it was
+  empty — including the two self-test receipts published there by mistake and
+  the signed correction beside them. Do not cite a seq in that room as a lasting
+  reference: a recreated room is another conversation under the same name, and may
+  be numbered from 1 again.
 
 ## Running it yourself
 

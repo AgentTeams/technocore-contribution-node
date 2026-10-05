@@ -1,6 +1,86 @@
 # Changelog
 
-## Unreleased — the 2026-08-30 record, completed
+## v0.2.3 — 2026-10-05
+
+Found in a status check of a node nobody had touched for five weeks.
+
+### What was found
+
+- **The README said mailbox intake was disabled. It was on.** Production had
+  `TCN_MAILBOX_ENABLED=true` from about 12:24 UTC on 2026-08-30, by the configuration
+  backups on the host, while the README said intake was disabled and that enabling it was a
+  separate decision that "has not been taken". That was false for 36 days. `/v1/info`, which
+  reported `accepting_third_party_jobs: true` throughout, was the one surface telling the
+  truth. Intake was switched off at 09:24 UTC on 2026-10-05, so the README is true again;
+  opening it is a decision still to be taken. Third-party usage remains zero.
+- **This node's public record is no longer upstream.** The audit room
+  `d-tc-contrib-06e9de34` and the mailbox `mb-tc-jobs-06e9de34` were both empty: the
+  upstream deletes a room after seven days without a write, and nothing had written to
+  either since 2026-08-30. The two receipts at seq 3 and 4 carrying `internal_test: false`,
+  and the signed correction at seq 5, went with the audit room. The record below and the
+  `v0.2.2` notes say they *are* there, which was true when written and is not now. The
+  profile note at `/kv/did-06/e9de34c1ec6bba` answers 404, and the attestation that made it
+  this node's went with the room. A signature cannot be withdrawn, but the message carrying
+  it can be deleted by the service that stores it, and that service says plainly that it is
+  not durable storage.
+- **Nothing in the node knew a room could be replaced.** Its cursors only move forward, and
+  it never read a room's `generation`. It got away with it: the upstream keeps a deleted
+  room's last seq as a floor and numbers a recreated room on from it (upstream #343), and
+  both rooms had kept theirs — 3 and 5, read back on 2026-10-05 — so the next job would
+  have arrived at seq 4 and been read. But a name the upstream holds no record of starts
+  again at 1 (`/interop.md`), and a cursor held past the start of that room skips it without
+  a word.
+- **The pin was fifteen upstream changes old.** `proof/protocol-snapshot.json` recorded
+  0.10.0; the public instance runs 0.14.5. The watcher logged every change, and nobody
+  re-pinned.
+
+### Fixed
+
+- **A cursor is a position in one lifetime of a room.** The ledger records the
+  `generation` each cursor counts in. A read from another generation is another room, and
+  so is a read whose `last_seq` comes back below the cursor — with nothing newer, the
+  upstream answers the lower of the cursor and the room's head. Either way the cursor goes
+  back to zero, the one write allowed to move it backwards, and the room is read again from
+  its first message. What came back from the old position is not handled; it waits one
+  cycle for the read from the start, so nothing is answered out of order.
+- **And the check `/interop.md` prescribes, for an upstream that would show neither.** The
+  first read a process makes of a room it holds a cursor in, and one every ten minutes
+  after, is made without a cursor. A probe that fails raises, rather than reading on from a
+  position nobody has checked.
+- **An upgraded ledger is not replayed.** A cursor written before lifetimes were recorded
+  is kept when the room's tail is at or past it, and its generation is adopted. Reading
+  every such room from the start would answer nothing twice — job ids are idempotent — but
+  it would record every refusal again, and refusals are a published count.
+- **Both rooms.** The audit room's sync kept the same kind of cursor, so a copy that had
+  already landed in a renumbered room would have gone unrecognised — and been posted again
+  by the reconciler that runs straight after the sync.
+- **Inbound records name their lifetime.** A mailbox line was recorded as
+  `in-<room>-<seq>` with `INSERT OR REPLACE`, so a lifetime numbered from 1 again would
+  have overwritten the records of the one before it, in a ledger whose job is to be the
+  record. New rows are `in-<room>-g<generation>-<seq>`; existing rows keep their ids.
+- **Checked against the upstream itself, not only a fake of it.** On a local 0.14.5, with
+  the upstream's own reaper run eight days ahead of the clock, a mailbox deleted and
+  recreated while the node was polling had its next job read once, in order.
+- **Re-pinned to upstream 0.14.5** (`0e47f77`), and CI's end-to-end job runs against it.
+  Two changes reached this node's mirrors. The server accepts only the canonical spelling of
+  a signature now — 86 characters, the last one of `A`, `Q`, `g`, `w` — and so does this
+  node, so the signature task no longer calls good a spelling the server refuses. And a
+  room on its single message is deleted after 12 hours rather than 24, which
+  `inspect-result-room` now says.
+- **`pip-audit`**: urllib3 2.7.0 → 2.8.0 (PYSEC-2026-4175, -4176, -4177). A dev dependency
+  only, reached through `pip-audit` itself; production does not install it.
+- **`docs/OPERATIONS.md` says how to upgrade.** It described a first install and nothing
+  after it, so each release was deployed from memory.
+
+### Not fixed
+
+- **The audit room is not durable, and this does not make it so.** Decided: the ledger is
+  the record and the room a short-lived copy of it, which is what the README and
+  `docs/SECURITY.md` now say. Not yet done: `publicly_auditable` stays true after the room
+  is deleted. No receipt is in that state — there are no third-party receipts — and intake
+  should stay shut until it is fixed.
+
+## The 2026-08-30 record, completed — released with v0.2.3
 
 `v0.2.2` was written and released while the incident was still being understood, and its
 notes are incomplete. The full account:
