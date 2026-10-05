@@ -265,6 +265,12 @@ async def test_the_held_jobs_are_processed_after_recovery(node: Node) -> None:
         }
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     assert await node.poll_mailbox_once(wait=0) == 0
     assert node.ledger.get_job("deferred-00001") is None
 
@@ -545,6 +551,12 @@ async def test_a_message_that_raises_still_advances_the_cursor(node: Node) -> No
         raise RuntimeError("handler exploded")
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     node.process_message = boom  # type: ignore[method-assign]
 
     await node.poll_mailbox_once(wait=0)
@@ -571,6 +583,12 @@ async def test_a_ring_gap_is_detected_and_recorded(node: Node) -> None:
         return {"room": room, "count": 6, "first_seq": 25, "last_seq": 30, "messages": surviving}
 
     node.client.read_room = read_room  # type: ignore[method-assign]
+
+    async def export_room(room: str) -> list[dict[str, Any]]:
+        # The room holds exactly what the read returned: nothing older survives.
+        return list((await read_room(room))["messages"])
+
+    node.client.export_room = export_room  # type: ignore[method-assign]
     await node.poll_mailbox_once(wait=0)
 
     gap, _ = node.ledger.get_state("mailbox_gap")

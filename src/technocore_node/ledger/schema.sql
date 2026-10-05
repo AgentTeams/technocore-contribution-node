@@ -182,5 +182,8 @@ CREATE TABLE IF NOT EXISTS cursors (
     room       TEXT PRIMARY KEY,
     last_seq   INTEGER NOT NULL,
     generation INTEGER,
+    -- How many times this node has found the room replaced. Inbound records carry it, so a
+    -- room renumbered under its old generation cannot overwrite the records of the last.
+    restarts   INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );

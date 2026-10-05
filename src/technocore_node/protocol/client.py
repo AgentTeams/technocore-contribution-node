@@ -289,20 +289,18 @@ class TechnocoreClient:
         data: dict[str, Any] = response.json()
         return data
 
-    async def export_room(self, room: str) -> tuple[int | None, list[dict[str, Any]]]:
-        """Every record the room still holds, oldest first, and the room's generation.
+    async def export_room(self, room: str) -> list[dict[str, Any]]:
+        """Every record the room still holds, oldest first.
 
-        A read returns the *newest* records after a cursor, at most 200 of them, so a
-        backlog longer than that cannot be read from its start any other way. The export is
-        the room's stored file, one JSON record per line — the same records the read view
-        returns. Lines that are not JSON objects are dropped: the content is a stranger's.
-        A room that does not exist exports as empty.
+        A read returns the *newest* records after a cursor — at most 200, and at most a
+        megabyte of them — so a backlog longer than that cannot be read from its start any
+        other way. The export is the room's stored file, one JSON record per line: the same
+        records the read view returns. Lines that are not JSON objects are dropped, since
+        the content is a stranger's, and a room that does not exist exports as empty.
         """
         if not valid_name(room):
             raise TechnocoreError(f"invalid room name: {room!r}")
         response = await self._request("GET", f"/r/{quote(room, safe='')}/export")
-        raw = response.headers.get("x-room-generation", "")
-        generation = int(raw) if raw.isdigit() and len(raw) <= 19 else None
         records: list[dict[str, Any]] = []
         for line in response.text.splitlines():
             try:
@@ -311,7 +309,7 @@ class TechnocoreClient:
                 continue
             if isinstance(record, dict):
                 records.append(record)
-        return generation, records
+        return records
 
     async def read_note(self, namespace: str, key: str) -> str | None:
         """A note's value, or None when it does not exist.

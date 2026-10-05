@@ -16,6 +16,7 @@ nothing is newer. These tests cover both.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,8 @@ class FakeUpstream:
         self.echo_cursor = False
         self.report_generation = True
         self.bump_late = False
+        self.read_cap: int | None = None  # stands in for upstream's 1 MiB read budget
+        self.exports = 0
         self.reads: list[tuple[str, int | None]] = []
         self._pending: dict[str, int] = {}
         self._nonce = 0
@@ -104,7 +107,8 @@ class FakeUpstream:
         self.reads.append((room, since))
         messages = self.rooms.get(room, [])
         after = [m for m in messages if since is None or m["seq"] > since]
-        out = after[-max(1, min(limit or 50, 200)) :]
+        cap = max(1, min(limit or 50, 200, self.read_cap or 200))
+        out = after[-cap:]
         if out:
             last_seq = out[-1]["seq"]
         elif self.echo_cursor:
@@ -123,8 +127,9 @@ class FakeUpstream:
             body["generation"] = self._generation(room)
         return body
 
-    async def export_room(self, room: str) -> tuple[int | None, list[dict[str, Any]]]:
-        return self.generations.get(room, 0), [dict(m) for m in self.rooms.get(room, [])]
+    async def export_room(self, room: str) -> list[dict[str, Any]]:
+        self.exports += 1
+        return [dict(m) for m in self.rooms.get(room, [])]
 
 
 @pytest.fixture
@@ -430,12 +435,19 @@ async def test_a_room_renumbered_under_the_same_generation_is_caught_on_restart(
     handled = [await node.poll_mailbox_once(wait=0) for _ in range(2)]
     assert sum(handled) == 5, handled
     assert node.ledger.cursor(node.mailbox) == 5
+    inbound = node.ledger.conn.execute(
+        "SELECT COUNT(*) AS n FROM messages WHERE direction = 'in'"
+    ).fetchone()
+    assert inbound["n"] == 3 + 5, "the old lifetime's records are still there"
 
 
 async def test_an_emptied_room_keeps_its_gap_accounting(node: Node, upstream: FakeUpstream) -> None:
     """Gate shut, seq 4 to 10 unread, the room deleted with its numbering kept. Nothing
     below the cursor can be missed, so the cursor stays — and the next job's seq says how
-    many went unread, where a restart to zero would have said nothing."""
+    many went unread, where a restart to zero would have said nothing.
+
+    Said once the gate opens. While it is shut nothing is downloaded, so a read that
+    starts past the cursor cannot yet be told from one that stopped short."""
     _lose_the_room(node)
     for n in range(10):
         upstream.post(node.mailbox, REQUESTER, f"line {n}")
@@ -448,8 +460,13 @@ async def test_an_emptied_room_keeps_its_gap_accounting(node: Node, upstream: Fa
 
     upstream.post(node.mailbox, REQUESTER, _job("after-the-gap-1"))
     assert await node.poll_mailbox_once(wait=0) == 0
+    assert node.ledger.get_state("mailbox_gap")[0] is None, "not claimed while unchecked"
+
+    _own_the_room(node)
+    assert await node.poll_mailbox_once(wait=0) == 1
     gap, _ = node.ledger.get_state("mailbox_gap")
     assert gap is not None and gap.startswith("7 message(s)")
+    assert node.ledger.get_job("after-the-gap-1") is not None
 
 
 async def test_a_probe_that_answers_with_no_room_is_not_a_check(node: Node) -> None:
@@ -474,13 +491,59 @@ async def test_a_message_without_a_usable_seq_is_not_handled_and_moves_nothing(
 
     async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
         message = {"seq": seq, "ts": "now", "from": REQUESTER, "nonce": 1, "text": "x"}
-        return {"room": room, "last_seq": 0, "messages": [message]}
+        return {"room": room, "last_seq": 7, "messages": [message]}
 
     node.client.read_room = read_room  # type: ignore[method-assign]
     assert await node.poll_mailbox_once(wait=0) == 0
     assert node.ledger.cursor(node.mailbox) == 0
     rows = node.ledger.conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
     assert rows["n"] == 0
+
+
+async def test_a_read_cut_short_by_size_is_not_taken_for_lost_messages(
+    node: Node, upstream: FakeUpstream
+) -> None:
+    """Upstream stops a read at a megabyte as well as at 200 records. A short read that
+    starts past the cursor was recorded as messages aged out — and the job at seq 4,
+    still in the room, was never handled."""
+    _own_the_room(node)
+    _three_lines_already_read(node, upstream)
+    upstream.post(node.mailbox, REQUESTER, _job("under-big-ones-1"))
+    for n in range(150):
+        upstream.post(node.mailbox, REQUESTER, f"a large line {n}")
+    upstream.read_cap = 85
+
+    handled = [await node.poll_mailbox_once(wait=0) for _ in range(2)]
+    assert sum(handled) == 151, handled
+    assert node.ledger.get_job("under-big-ones-1") is not None
+    assert node.ledger.get_state("mailbox_gap")[0] is None
+
+
+async def test_a_held_mailbox_waits_between_reads_and_downloads_nothing(
+    node: Node, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate shut, 250 waiting. The long-poll returns at once when anything is waiting, and
+    the loop went straight back: in five seconds against a real upstream it exported the
+    whole room 622 times."""
+    _lose_the_room(node)
+    for n in range(250):
+        upstream.post(node.mailbox, REQUESTER, f"waiting {n}")
+    slept: list[float] = []
+
+    async def stop_at_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    async def observe() -> None:
+        return None
+
+    node.observe_reachability = observe  # type: ignore[method-assign]
+    monkeypatch.setattr("technocore_node.service.node.asyncio.sleep", stop_at_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_mailbox()
+    assert slept == [node.HELD_POLL_SECONDS]
+    assert upstream.exports == 0
+    assert node.ledger.cursor(node.mailbox) == 0
 
 
 @pytest.mark.parametrize("generation", [True, -1, "2", 1.5, None])
@@ -498,8 +561,9 @@ async def test_a_generation_that_is_not_a_count_is_not_recorded(
 
 
 async def test_inbound_records_from_two_lifetimes_are_both_kept(node: Node) -> None:
-    """seq 1 can name a different message in each lifetime. Neither record may replace the
-    other — this is an evidence ledger, and it was keyed on the seq alone."""
+    """seq 1 can name a different message in each lifetime, under one generation number
+    even. Neither record may replace the other — this is an evidence ledger, and it was
+    keyed on the seq alone."""
     _own_the_room(node)
 
     async def say_signed(room: str, text: str, *, confirm: bool = True) -> Confirmation:
@@ -508,16 +572,18 @@ async def test_inbound_records_from_two_lifetimes_are_both_kept(node: Node) -> N
         )
 
     node.client.say_signed = say_signed  # type: ignore[method-assign]
-    for generation, job_id in ((1, "lifetime-one-01"), (2, "lifetime-two-01")):
+    node.ledger.set_cursor(node.mailbox, 1)
+    for job_id in ("lifetime-one-01", "lifetime-two-01"):
         message = {"seq": 1, "ts": "now", "from": REQUESTER, "nonce": 1, "text": _job(job_id)}
-        assert await node.process_message(message, generation=generation)
+        assert await node.process_message(message)
+        node.ledger.restart_cursor(node.mailbox, 1)  # the room found replaced
 
     rows = node.ledger.conn.execute(
         "SELECT local_event_id FROM messages WHERE direction = 'in' ORDER BY local_event_id"
     ).fetchall()
     assert [r["local_event_id"] for r in rows] == [
-        f"in-{node.mailbox}-g1-1",
-        f"in-{node.mailbox}-g2-1",
+        f"in-{node.mailbox}-1",
+        f"in-{node.mailbox}-r1-1",
     ]
 
 
@@ -567,3 +633,45 @@ async def test_a_copy_in_a_replaced_owned_room_is_recognised(
     assert row is not None
     assert (row["audit_state"], row["audit_seq"]) == ("published", 1)
     assert node.ledger.cursor(node.result_room) == 1
+
+
+async def test_the_whole_owned_room_is_read_before_anything_is_reposted(
+    node: Node, upstream: FakeUpstream
+) -> None:
+    """210 copies already in the room, all still marked owed — a crash after the posts and
+    before the records. One page of 200 left ten unrecognised, and the reconciler posted
+    them again."""
+    _own_the_room(node)
+    for n in range(210):
+        job_id = f"crashed-{n:06d}"
+        receipt = {
+            "type": "receipt",
+            "receipt_id": f"receipt-{n:06d}",
+            "job_id": job_id,
+            "requester_did": REQUESTER,
+            "provider_did": node.did,
+            "request_hash": "sha256:" + "0" * 64,
+            "result_hash": "sha256:" + "1" * 64,
+            "provider_signature": "a" * 85 + "A",
+            "receipt_hash": "sha256:" + f"{n:064x}",
+            "created_at": utcnow(),
+        }
+        node.ledger.insert_job(
+            job_id=job_id,
+            protocol_version="1",
+            requester_did=REQUESTER,
+            provider_did=node.did,
+            request_room=node.mailbox,
+            reply_room="mb-p-r",
+            request_seq=n + 1,
+            request_hash=receipt["request_hash"],
+            task_type="canonical_json_sha256",
+            status="completed",
+            internal_test=False,
+        )
+        node.ledger.record_receipt(receipt, json.dumps(receipt), internal_test=False)
+        upstream.post(node.result_room, node.did, json.dumps(receipt))
+
+    assert await node.sync_owned_room() == 210
+    assert node.ledger.receipts_awaiting_audit_copy(limit=500) == []
+    assert len(upstream.rooms[node.result_room]) == 210, "nothing posted twice"

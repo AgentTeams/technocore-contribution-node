@@ -52,12 +52,18 @@ Found in a status check of a node nobody had touched for five weeks.
   after, makes the same comparison. A check that fails, or answers with something that is
   not a room, raises rather than reading on from a position nobody has checked.
 - **A backlog longer than one read is no longer cut short.** The upstream returns the
-  *newest* records after a cursor — 50 unless asked, 200 at most — and this node asked for
-  neither, so a mailbox holding more than 50 unread messages lost its oldest without a
-  word, though they were still in the room. That has been true since `v0.1.0`, and the
-  cursor that is held while the gate is shut is exactly what builds such a backlog. Reads
-  now take 200, and a full read that starts past the cursor is caught up from the room's
-  export, oldest first, a page at a time.
+  *newest* records after a cursor — 50 unless asked, 200 at most, and never more than a
+  megabyte — and this node asked for neither, so a mailbox holding more than 50 unread
+  messages lost its oldest without a word, though they were still in the room. That has
+  been true since `v0.1.0`, and the cursor that is held while the gate is shut is exactly
+  what builds such a backlog. Reads now take 200, and any read that starts past the cursor
+  is checked against the room's export: what the room still holds is handled oldest first,
+  a page at a time, and only what it does not is counted as aged out.
+- **A held cursor no longer spins.** With the gate shut and messages waiting, the
+  long-poll returns at once and the loop went straight back, reading the same messages as
+  fast as the upstream would answer for as long as the gate stayed shut. It now waits 30
+  seconds between reads, and downloads no export: nothing is handled until the gate opens,
+  and the backlog is read then.
 - **A seq is a position only if it is one.** `True`, `"7"` and `-1` read off the wire are
   no longer handled, and no longer move a cursor.
 - **An upgraded ledger is not replayed.** A cursor written before lifetimes were recorded
@@ -71,15 +77,22 @@ Found in a status check of a node nobody had touched for five weeks.
 - **Inbound records name their lifetime.** A mailbox line was recorded as
   `in-<room>-<seq>` with `INSERT OR REPLACE`, so a lifetime numbered from 1 again would
   have overwritten the records of the one before it, in a ledger whose job is to be the
-  record. New rows are `in-<room>-g<generation>-<seq>`; existing rows keep their ids.
+  record. New rows are `in-<room>-r<n>-<seq>`, `n` counting the times this node has found
+  the room replaced — not the upstream's generation, which a renumbered room can share
+  with the last. Existing rows keep their ids.
 - **Checked against the upstream itself, not only a fake of it.** On a local 0.14.5, with
   the upstream's own reaper run eight days ahead of the clock, a mailbox deleted and
-  recreated while the node was polling had its next job read once, in order, and a backlog
-  of 250 was handled whole and in order.
-- **Reviewed, and the review changed it.** The first version of this release restarted on
-  every new generation, took an emptied room for a replaced one, and left the 50-message
-  cut where it was. A review found those three and two smaller faults; each now has a test
-  that fails without its fix.
+  recreated while the node was polling had its next job read once, in order; a backlog of
+  250 was handled whole and in order; a job under 150 records of 12 KB each, past what one
+  read returns, was handled and nothing was counted lost; and a held mailbox made one read
+  in five seconds where it had made 622 exports.
+- **Reviewed twice, and both reviews changed it.** The first version restarted on every
+  new generation, took an emptied room for a replaced one, and left the 50-message cut
+  where it was. The second exported only when a read came back with 200 records, missing
+  the megabyte cut; re-downloaded the whole room every cycle while the gate was shut; read
+  one page of the audit room before the reconciler posted; and keyed inbound records on a
+  generation a renumbered room can repeat. Each of those, and four smaller faults, now has
+  a test that fails without its fix.
 - **Re-pinned to upstream 0.14.5** (`0e47f77`), and CI's end-to-end job runs against it.
   Two changes reached this node's mirrors. The server accepts only the canonical spelling of
   a signature now — 86 characters, the last one of `A`, `Q`, `g`, `w` — and so does this

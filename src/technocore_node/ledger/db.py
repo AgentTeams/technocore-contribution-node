@@ -103,6 +103,7 @@ class Ledger:
         ("receipts", "audit_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("receipts", "audit_error", "TEXT"),
         ("cursors", "generation", "INTEGER"),
+        ("cursors", "restarts", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _columns(self, table: str) -> set[str]:
@@ -324,6 +325,11 @@ class Ledger:
         row = self.conn.execute("SELECT generation FROM cursors WHERE room = ?", (room,)).fetchone()
         return int(row["generation"]) if row and row["generation"] is not None else None
 
+    def cursor_restarts(self, room: str) -> int:
+        """How many times this node has found `room` replaced and read it from the start."""
+        row = self.conn.execute("SELECT restarts FROM cursors WHERE room = ?", (room,)).fetchone()
+        return int(row["restarts"]) if row else 0
+
     def adopt_cursor_epoch(self, room: str, generation: int) -> None:
         """Record which lifetime of `room` the cursor counts in, leaving the cursor alone."""
         with self.tx() as conn:
@@ -345,9 +351,10 @@ class Ledger:
         """
         with self.tx() as conn:
             conn.execute(
-                "INSERT INTO cursors (room, last_seq, generation, updated_at) "
-                "VALUES (?, 0, ?, ?) ON CONFLICT (room) DO UPDATE SET last_seq = 0, "
-                "generation = excluded.generation, updated_at = excluded.updated_at",
+                "INSERT INTO cursors (room, last_seq, generation, restarts, updated_at) "
+                "VALUES (?, 0, ?, 1, ?) ON CONFLICT (room) DO UPDATE SET last_seq = 0, "
+                "generation = excluded.generation, restarts = restarts + 1, "
+                "updated_at = excluded.updated_at",
                 (room, generation, utcnow()),
             )
 

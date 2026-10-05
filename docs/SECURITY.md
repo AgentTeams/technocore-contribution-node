@@ -183,8 +183,11 @@ ten minutes after, because a room can come back under its old generation number.
 that fails raises, rather than reading on from a position nobody has checked.
 
 **And one read is not the whole backlog.** The upstream returns the newest records after a
-cursor, at most 200. A full read that starts past the cursor is caught up from the room's
-export, oldest first — until `v0.2.3` the oldest were simply skipped.
+cursor — at most 200, and at most a megabyte. A read that starts past the cursor is checked
+against the room's export, and what the room still holds is handled oldest first; until
+`v0.2.3` the oldest were simply skipped. While the gate is shut nothing is downloaded and
+the loop waits between reads, so a held backlog costs the upstream one read every 30
+seconds rather than one as fast as it can answer.
 
 **What is written in the owned room is not kept.** The lease keeps the ownership note
 alive. It writes nothing to the room itself, and with no third-party traffic nothing else

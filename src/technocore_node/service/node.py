@@ -272,7 +272,6 @@ class Node:
         message: dict[str, Any],
         *,
         internal_test: bool = False,
-        generation: int | None = None,
     ) -> bool:
         """Handle one inbound mailbox line, start to finish.
 
@@ -280,10 +279,10 @@ class Node:
         as a duplicate — and False when it was left untouched because the node is not in
         a safe state. The caller uses that to decide whether the cursor may move past it.
 
-        `generation` is the lifetime of the mailbox the line was read from. A recreated
-        room can number from 1 again, so a seq alone may name a different message in each
-        lifetime, and the record of an earlier one must not be overwritten by a later one
-        that happens to share its number.
+        A recreated room can number from 1 again — under its old generation number, even —
+        so a seq alone may name a different message in each lifetime. The record carries how
+        many times this node has found the mailbox replaced, so a later lifetime cannot
+        overwrite the records of an earlier one that happen to share its numbers.
         """
         sender = str(message.get("from", ""))
         text = str(message.get("text", ""))
@@ -313,13 +312,12 @@ class Node:
             )
             return True  # seen and refused on its own merits
 
+        # Unqualified until the room was first found replaced: the ids existing ledgers
+        # already hold.
+        lifetime = self.ledger.cursor_restarts(self.mailbox)
         self.ledger.record_message(
-            # Unqualified when no lifetime was reported — None, or the 0 the upstream gives
-            # a name that never existed. Those are the ids existing ledgers already hold.
             local_event_id=(
-                f"in-{self.mailbox}-g{generation}-{seq}"
-                if generation
-                else f"in-{self.mailbox}-{seq}"
+                f"in-{self.mailbox}-r{lifetime}-{seq}" if lifetime else f"in-{self.mailbox}-{seq}"
             ),
             direction="in",
             room=self.mailbox,
@@ -519,13 +517,13 @@ class Node:
             return 0
 
         try:
-            batch = await self._read_from_cursor(self.result_room)
+            batch = await self._read_from_cursor(self.result_room, whole=True)
             if batch.restarted:
                 # Replaced since the last look. Read the new room from its first message
                 # now rather than on the next pass: the reconciler publishes straight after
                 # this, and a copy that already landed in the new room must be recognised
                 # before anything is posted there again.
-                batch = await self._read_from_cursor(self.result_room)
+                batch = await self._read_from_cursor(self.result_room, whole=True)
                 if batch.restarted:
                     return 0
         except TechnocoreError:
@@ -568,11 +566,11 @@ class Node:
                 observed[job_id] = (seq, receipt_hash)
 
         marked = self.ledger.mark_published(observed)
-        # To the last message read, not the room's head: a backlog read from the export
-        # is taken a page at a time, and the rest of it is still ahead of this cursor.
+        # To the last message read. The whole backlog was read — the reconciler publishes
+        # straight after this, and a copy it cannot see is a copy it posts again.
         if batch.messages:
             self.ledger.set_cursor(self.result_room, batch.messages[-1][0])
-        elif batch.last_seq is not None:
+        elif batch.nothing_returned and batch.last_seq is not None:
             self.ledger.set_cursor(self.result_room, batch.last_seq)
         return marked
 
@@ -664,10 +662,11 @@ class Node:
         generation = _count(data.get("generation"))
 
         at = next((m for seq, m in messages if seq == since), None)
-        if at is None and len(raw) >= self.ROOM_READ_LIMIT and messages and messages[0][0] > since:
-            # The read came back full and started past the cursor: the message there may
-            # still be in the room, older than anything a read returns.
-            _, records = await self.client.export_room(room)
+        if at is None and messages and messages[0][0] > since:
+            # The read started past the cursor. The message there may still be in the room,
+            # older than anything a read returns — reads stop at 200 records or a megabyte,
+            # whichever comes first — and only the export says.
+            records = await self.client.export_room(room)
             at = next((m for seq, m in _with_seq(records) if seq == since), None)
 
         replaced: str | None = None
@@ -702,11 +701,20 @@ class Node:
             and row["normalized_text_sha256"] == _sha(str(message.get("text", "")))
         )
 
-    async def _read_from_cursor(self, room: str, *, wait: int = 0) -> _Batch:
+    async def _read_from_cursor(
+        self, room: str, *, wait: int = 0, backlog: bool = True, whole: bool = False
+    ) -> _Batch:
         """One read of `room` from its cursor, with everything known about where it stands.
 
         `restarted` means the room was found replaced and the cursor sent back to its
         start: nothing read this time is to be handled, and the next read starts over.
+
+        A read returns the *newest* records after the cursor, so one that starts past the
+        cursor has either lost messages to the ring or left them behind, and only the
+        room's export can say which. With `backlog`, the export is read and the batch
+        starts at the oldest record the room still holds — all of them with `whole`, a
+        page otherwise. Without it, nothing is downloaded and where the backlog starts is
+        reported as unknown: a caller holding its cursor has no use for the rest.
         """
         since = await self._cursor_for(room)
         data = await self.client.read_room(room, since=since, wait=wait, limit=self.ROOM_READ_LIMIT)
@@ -735,14 +743,14 @@ class Node:
                 self.ledger.adopt_cursor_epoch(room, generation)
 
         first_seq = messages[0][0] if messages else None
-        if len(raw) >= self.ROOM_READ_LIMIT and first_seq is not None and first_seq > since + 1:
-            # The newest records after the cursor, and more of them than one read returns:
-            # the oldest are still in the room, but only the export reaches them. Taken a
-            # page at a time, oldest first, so they are handled in order.
-            _, records = await self.client.export_room(room)
-            backlog = [(seq, m) for seq, m in _with_seq(records) if seq > since]
-            first_seq = backlog[0][0] if backlog else None
-            messages = backlog[: self.ROOM_READ_LIMIT]
+        if first_seq is not None and first_seq > since + 1:
+            if backlog:
+                records = await self.client.export_room(room)
+                pending = [(seq, m) for seq, m in _with_seq(records) if seq > since]
+                first_seq = pending[0][0] if pending else None
+                messages = pending if whole else pending[: self.ROOM_READ_LIMIT]
+            else:
+                first_seq = None
 
         return _Batch(
             since=since,
@@ -750,6 +758,7 @@ class Node:
             first_seq=first_seq,
             last_seq=last_seq,
             generation=generation,
+            nothing_returned=not raw,
         )
 
     def _restart_cursor(self, room: str, generation: int | None, previous: int, why: str) -> None:
@@ -784,7 +793,7 @@ class Node:
         the newest messages after it — see :meth:`_read_from_cursor`.
         """
         safe, reasons = self.lane_is_open("mailbox")
-        batch = await self._read_from_cursor(self.mailbox, wait=wait)
+        batch = await self._read_from_cursor(self.mailbox, wait=wait, backlog=safe)
         if batch.restarted:
             # What came back was read from a position in a room that is gone, so it is left
             # for the next cycle, which reads the new room from its first message. Handling
@@ -830,7 +839,7 @@ class Node:
         for seq, message in messages:
             handled = False
             try:
-                handled = await self.process_message(message, generation=batch.generation)
+                handled = await self.process_message(message)
             except Exception:
                 # One malformed or hostile message must never end the loop. It counts as
                 # handled: it was seen, it failed on its own merits, and re-reading it
@@ -848,7 +857,7 @@ class Node:
                 )
                 return 0
             self.ledger.set_cursor(self.mailbox, seq)
-        if not messages and batch.last_seq is not None:
+        if batch.nothing_returned and batch.last_seq is not None:
             self.ledger.set_cursor(self.mailbox, batch.last_seq)
         return len(messages)
 
@@ -1137,6 +1146,10 @@ class Node:
             )
             await asyncio.sleep(min(self.OWNERSHIP_OBSERVATION_SECONDS, max(remaining, 1.0)))
 
+    #: How long a mailbox loop whose gate is shut waits between reads. Nothing is handled
+    #: while it is shut, so there is nothing to hurry for.
+    HELD_POLL_SECONDS = 30
+
     async def run_mailbox(self) -> None:
         backoff = 1.0
         while True:
@@ -1151,6 +1164,11 @@ class Node:
                 await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
                 backoff = 1.0
+                if not self.lane_is_open("mailbox")[0]:
+                    # Held. A long-poll returns at once when messages are waiting, so a
+                    # loop that went straight back would read the same unhandled messages
+                    # as fast as the upstream answers, for as long as the gate stayed shut.
+                    await asyncio.sleep(self.HELD_POLL_SECONDS)
             except RateLimited as exc:
                 log.warning(
                     "mailbox poll rate limited",
@@ -1468,6 +1486,9 @@ class _Batch:
     last_seq: int | None = None
     generation: int | None = None
     restarted: bool = False
+    #: The read returned no records at all — the only case in which its `last_seq` may
+    #: move a cursor. Records that came back without a usable seq do not count as none.
+    nothing_returned: bool = True
 
     @classmethod
     def restart(cls, since: int) -> _Batch:
