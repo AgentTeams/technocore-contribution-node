@@ -185,9 +185,10 @@ that fails raises, rather than reading on from a position nobody has checked.
 **And one read is not the whole backlog.** The upstream returns the newest records after a
 cursor — at most 200, and at most a megabyte. A read that starts past the cursor is checked
 against the room's export, and what the room still holds is handled oldest first; until
-`v0.2.3` the oldest were simply skipped. While the gate is shut nothing is downloaded and
-the loop waits between reads, so a held backlog costs the upstream one read every 30
-seconds rather than one as fast as it can answer.
+`v0.2.3` the oldest were simply skipped. While the gate is shut no backlog is downloaded
+and the loop waits 30 seconds between reads; the position check, once every ten minutes,
+is the only export it can make. An open loop with nothing to read waits too, at least five
+seconds a cycle, for the upstream that answers a long-poll at once rather than hold it.
 
 **What is written in the owned room is not kept.** The lease keeps the ownership note
 alive. It writes nothing to the room itself, and with no third-party traffic nothing else

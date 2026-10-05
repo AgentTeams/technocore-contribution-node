@@ -546,6 +546,40 @@ async def test_a_held_mailbox_waits_between_reads_and_downloads_nothing(
     assert node.ledger.cursor(node.mailbox) == 0
 
 
+async def test_an_idle_mailbox_the_upstream_will_not_hold_is_not_read_flat_out(
+    node: Node, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upstream parks only a few long-polls per address and answers the rest at once. An
+    idle loop was then read as fast as it was answered — 1,691 polls in five seconds
+    against a local upstream — until the rate limit ran out and shut the gate with it."""
+    _own_the_room(node)
+    slept: list[float] = []
+    reads = 0
+    read = upstream.read_room
+
+    async def answered_at_once(room: str, **kwargs: Any) -> dict[str, Any]:
+        nonlocal reads
+        reads += 1
+        if reads > 50:
+            raise asyncio.CancelledError  # spinning: stop rather than hang
+        return await read(room, **kwargs)
+
+    async def stop_at_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    async def observe() -> None:
+        return None
+
+    node.client.read_room = answered_at_once  # type: ignore[method-assign]
+    node.observe_reachability = observe  # type: ignore[method-assign]
+    monkeypatch.setattr("technocore_node.service.node.asyncio.sleep", stop_at_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await node.run_mailbox()
+    assert len(slept) == 1, f"{reads} reads before any pause"
+    assert 0 < slept[0] <= node.IDLE_POLL_FLOOR_SECONDS
+
+
 @pytest.mark.parametrize("generation", [True, -1, "2", 1.5, None])
 async def test_a_generation_that_is_not_a_count_is_not_recorded(
     node: Node, generation: Any

@@ -1150,6 +1150,12 @@ class Node:
     #: while it is shut, so there is nothing to hurry for.
     HELD_POLL_SECONDS = 30
 
+    #: The shortest an idle cycle may take. A held long-poll takes ten seconds and never
+    #: meets it; it is for the upstream that answers at once instead — it parks only a few
+    #: waiters per address — where an idle mailbox would otherwise be read as fast as the
+    #: upstream answers, and the rate limit that ran out would shut the gate with it.
+    IDLE_POLL_FLOOR_SECONDS = 5.0
+
     async def run_mailbox(self) -> None:
         backoff = 1.0
         while True:
@@ -1160,8 +1166,9 @@ class Node:
                 # worth of jobs, and publish for them, before ever checking whether it
                 # still owns the room. Reordering closes the window; the freshness bound
                 # in `_ownership_observation` is what closes it for good.
+                started = time.monotonic()
                 await self.observe_reachability()
-                await self.poll_mailbox_once()
+                handled = await self.poll_mailbox_once()
                 await self.reconcile_audit_copies()
                 backoff = 1.0
                 if not self.lane_is_open("mailbox")[0]:
@@ -1169,6 +1176,10 @@ class Node:
                     # loop that went straight back would read the same unhandled messages
                     # as fast as the upstream answers, for as long as the gate stayed shut.
                     await asyncio.sleep(self.HELD_POLL_SECONDS)
+                elif not handled:
+                    spent = time.monotonic() - started
+                    if spent < self.IDLE_POLL_FLOOR_SECONDS:
+                        await asyncio.sleep(self.IDLE_POLL_FLOOR_SECONDS - spent)
             except RateLimited as exc:
                 log.warning(
                     "mailbox poll rate limited",

@@ -62,8 +62,14 @@ Found in a status check of a node nobody had touched for five weeks.
 - **A held cursor no longer spins.** With the gate shut and messages waiting, the
   long-poll returns at once and the loop went straight back, reading the same messages as
   fast as the upstream would answer for as long as the gate stayed shut. It now waits 30
-  seconds between reads, and downloads no export: nothing is handled until the gate opens,
-  and the backlog is read then.
+  seconds between reads and downloads no backlog: nothing is handled until the gate opens,
+  and the backlog is read then. The position check still runs at start and every ten
+  minutes, and exports the room when it cannot find the message at the cursor any other
+  way.
+- **Nor does an idle one.** The upstream parks only a few long-polls per address and
+  answers the rest at once, and an idle mailbox was then read as fast as it was answered —
+  1,691 polls in five seconds against a local upstream — until the rate limit ran out and
+  shut the gate with it. An idle cycle now takes at least five seconds.
 - **A seq is a position only if it is one.** `True`, `"7"` and `-1` read off the wire are
   no longer handled, and no longer move a cursor.
 - **An upgraded ledger is not replayed.** A cursor written before lifetimes were recorded
@@ -111,6 +117,9 @@ Found in a status check of a node nobody had touched for five weeks.
   `docs/SECURITY.md` now say. Not yet done: `publicly_auditable` stays true after the room
   is deleted. No receipt is in that state — there are no third-party receipts — and intake
   should stay shut until it is fixed.
+- **A room renumbered from 1, under its old generation, and refilled past the cursor
+  between two reads a few seconds apart is not detected.** Nothing in either read differs
+  from an ordinary one. It needs the upstream to lose a record it does not prune.
 
 ## The 2026-08-30 record, completed — released with v0.2.3
 
