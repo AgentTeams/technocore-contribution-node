@@ -36,21 +36,35 @@ Found in a status check of a node nobody had touched for five weeks.
 
 ### Fixed
 
-- **A cursor is a position in one lifetime of a room.** The ledger records the
-  `generation` each cursor counts in. A read from another generation is another room, and
-  so is a read whose `last_seq` comes back below the cursor — with nothing newer, the
-  upstream answers the lower of the cursor and the room's head. Either way the cursor goes
-  back to zero, the one write allowed to move it backwards, and the room is read again from
-  its first message. What came back from the old position is not handled; it waits one
-  cycle for the read from the start, so nothing is answered out of order.
-- **And the check `/interop.md` prescribes, for an upstream that would show neither.** The
-  first read a process makes of a room it holds a cursor in, and one every ten minutes
-  after, is made without a cursor. A probe that fails raises, rather than reading on from a
-  position nobody has checked.
+- **A cursor is a position in one lifetime of a room, and the message at it says which.**
+  The ledger records the `generation` each cursor counts in. A read whose `last_seq` comes
+  back below the cursor is a room that no longer reaches it — with nothing newer, the
+  upstream answers the lower of the cursor and the room's head — and is read again from its
+  first message: the one write allowed to move a cursor back. A new generation is not
+  taken on its word. The room is read from just before the cursor and the message there
+  compared with the one this node recorded handling: the same message, or none because the
+  numbering carried on past it, and the cursor stands; a different one, and the room is
+  read from the start. Restarting on the generation alone would answer a message twice
+  whenever a read lands between the upstream's first write to a new room and its bump.
+- **Checked when nothing says to.** A room can come back numbered from 1 under the very
+  generation number it had, and pass the cursor while nothing is reading — the node down,
+  or intake shut. So the first read a process makes of a room, and one every ten minutes
+  after, makes the same comparison. A check that fails, or answers with something that is
+  not a room, raises rather than reading on from a position nobody has checked.
+- **A backlog longer than one read is no longer cut short.** The upstream returns the
+  *newest* records after a cursor — 50 unless asked, 200 at most — and this node asked for
+  neither, so a mailbox holding more than 50 unread messages lost its oldest without a
+  word, though they were still in the room. That has been true since `v0.1.0`, and the
+  cursor that is held while the gate is shut is exactly what builds such a backlog. Reads
+  now take 200, and a full read that starts past the cursor is caught up from the room's
+  export, oldest first, a page at a time.
+- **A seq is a position only if it is one.** `True`, `"7"` and `-1` read off the wire are
+  no longer handled, and no longer move a cursor.
 - **An upgraded ledger is not replayed.** A cursor written before lifetimes were recorded
-  is kept when the room's tail is at or past it, and its generation is adopted. Reading
-  every such room from the start would answer nothing twice — job ids are idempotent — but
-  it would record every refusal again, and refusals are a published count.
+  is checked the same way and kept when the message at it is the one this node handled, or
+  cannot be compared. Reading every such room from the start would answer nothing twice —
+  job ids are idempotent — but it would record every refusal again, and refusals are a
+  published count.
 - **Both rooms.** The audit room's sync kept the same kind of cursor, so a copy that had
   already landed in a renumbered room would have gone unrecognised — and been posted again
   by the reconciler that runs straight after the sync.
@@ -60,7 +74,12 @@ Found in a status check of a node nobody had touched for five weeks.
   record. New rows are `in-<room>-g<generation>-<seq>`; existing rows keep their ids.
 - **Checked against the upstream itself, not only a fake of it.** On a local 0.14.5, with
   the upstream's own reaper run eight days ahead of the clock, a mailbox deleted and
-  recreated while the node was polling had its next job read once, in order.
+  recreated while the node was polling had its next job read once, in order, and a backlog
+  of 250 was handled whole and in order.
+- **Reviewed, and the review changed it.** The first version of this release restarted on
+  every new generation, took an emptied room for a replaced one, and left the 50-message
+  cut where it was. A review found those three and two smaller faults; each now has a test
+  that fails without its fix.
 - **Re-pinned to upstream 0.14.5** (`0e47f77`), and CI's end-to-end job runs against it.
   Two changes reached this node's mirrors. The server accepts only the canonical spelling of
   a signature now — 86 characters, the last one of `A`, `Q`, `g`, `w` — and so does this

@@ -560,8 +560,15 @@ async def test_a_ring_gap_is_detected_and_recorded(node: Node) -> None:
     _own_the_room(node)
     node.ledger.set_cursor(node.mailbox, 10)
 
+    # The upstream's `first_seq` is the first message it returned, so the gap is what lies
+    # between the cursor and the oldest message the room still holds.
+    surviving = [
+        {"seq": seq, "ts": "now", "from": REQUESTER, "nonce": seq, "text": f"line {seq}"}
+        for seq in range(25, 31)
+    ]
+
     async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
-        return {"room": room, "count": 0, "first_seq": 25, "last_seq": 30, "messages": []}
+        return {"room": room, "count": 6, "first_seq": 25, "last_seq": 30, "messages": surviving}
 
     node.client.read_room = read_room  # type: ignore[method-assign]
     await node.poll_mailbox_once(wait=0)

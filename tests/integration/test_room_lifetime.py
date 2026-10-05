@@ -32,18 +32,24 @@ from ..conftest import job_line
 
 PASSPHRASE = b"test-secret-do-not-use"
 REQUESTER = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+STRANGER = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
 
 
 class FakeUpstream:
-    """Rooms with lifetimes, as upstream 0.14.5 keeps them.
+    """Rooms with lifetimes, as upstream 0.14.5 keeps them (`src/store.py`).
 
     A room is created by its first write, and `generation` counts its lifetimes: 0 for a
     name the upstream holds no record of, bumped each time the name is written to after a
     deletion. A deleted room leaves its last seq behind as a floor, and a recreated one is
     numbered on from it — unless the record is gone (`forget=True`) or the upstream keeps
-    no floors (`keep_floor=False`), and then numbering starts again at 1. With nothing
-    newer, a read answers `last_seq` as the lower of the cursor and the room's head; with
-    `echo_cursor=True`, as the cursor itself, which is how `/interop.md` describes it.
+    no floors (`keep_floor=False`), and then numbering starts again at 1.
+
+    A read returns the *newest* `limit` records after the cursor (default 50, at most
+    200), oldest first. With none to return it answers `last_seq` as the lower of the
+    cursor and the room's head — the floor, for an emptied room, but only when a cursor was
+    given; with `echo_cursor=True`, as the cursor itself, which is how `/interop.md`
+    describes it. With `bump_late=True` a recreated room's first record is readable one
+    read before its generation moves, as upstream writes the two in that order.
     """
 
     def __init__(self, *, keep_floor: bool = True) -> None:
@@ -53,7 +59,9 @@ class FakeUpstream:
         self.keep_floor = keep_floor
         self.echo_cursor = False
         self.report_generation = True
+        self.bump_late = False
         self.reads: list[tuple[str, int | None]] = []
+        self._pending: dict[str, int] = {}
         self._nonce = 0
 
     def _head(self, room: str) -> int:
@@ -64,7 +72,11 @@ class FakeUpstream:
         seq = self._head(room) + 1
         messages = self.rooms.setdefault(room, [])
         if not messages:
-            self.generations[room] = self.generations.get(room, 0) + 1
+            bumped = self.generations.get(room, 0) + 1
+            if self.bump_late:
+                self._pending[room] = bumped
+            else:
+                self.generations[room] = bumped
         self._nonce += 1
         messages.append(
             {"seq": seq, "ts": "now", "from": sender, "nonce": self._nonce, "text": text}
@@ -80,31 +92,39 @@ class FakeUpstream:
             self.generations[room] = 0
             self.floors[room] = 0
 
+    def _generation(self, room: str) -> int:
+        seen = self.generations.get(room, 0)
+        if room in self._pending:
+            self.generations[room] = self._pending.pop(room)
+        return seen
+
     async def read_room(
         self, room: str, *, since: int | None = None, wait: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
         self.reads.append((room, since))
         messages = self.rooms.get(room, [])
-        if since is None:
-            selected = messages[-(limit or 100) :]
-        else:
-            selected = [m for m in messages if m["seq"] > since][: limit or 100]
-        if selected:
-            last_seq = selected[-1]["seq"]
+        after = [m for m in messages if since is None or m["seq"] > since]
+        out = after[-max(1, min(limit or 50, 200)) :]
+        if out:
+            last_seq = out[-1]["seq"]
         elif self.echo_cursor:
             last_seq = since or 0
         else:
-            last_seq = min(since or 0, self._head(room))
+            head = messages[-1]["seq"] if messages else (self.floors.get(room, 0) if since else 0)
+            last_seq = min(since or 0, head)
         body: dict[str, Any] = {
             "room": room,
-            "count": len(messages),
-            "first_seq": messages[0]["seq"] if messages else None,
+            "count": len(out),
+            "first_seq": out[0]["seq"] if out else None,
             "last_seq": last_seq,
-            "messages": [dict(m) for m in selected],
+            "messages": [dict(m) for m in out],
         }
         if self.report_generation:
-            body["generation"] = self.generations.get(room, 0)
+            body["generation"] = self._generation(room)
         return body
+
+    async def export_room(self, room: str) -> tuple[int | None, list[dict[str, Any]]]:
+        return self.generations.get(room, 0), [dict(m) for m in self.rooms.get(room, [])]
 
 
 @pytest.fixture
@@ -128,6 +148,7 @@ def upstream(node: Node) -> FakeUpstream:
         )
 
     node.client.read_room = fake.read_room  # type: ignore[method-assign]
+    node.client.export_room = fake.export_room  # type: ignore[method-assign]
     node.client.say_signed = say_signed  # type: ignore[method-assign]
     return fake
 
@@ -303,7 +324,7 @@ async def test_a_plausible_cursor_is_kept_and_its_lifetime_recorded(
     assert await node.poll_mailbox_once(wait=0) == 0
     assert node.ledger.cursor(node.mailbox) == 3
     assert node.ledger.cursor_epoch(node.mailbox) == 1
-    assert upstream.reads == [(node.mailbox, None), (node.mailbox, 3)]
+    assert upstream.reads == [(node.mailbox, 2), (node.mailbox, 3)]
 
 
 async def test_the_cursor_restarts_even_while_the_gate_is_shut(
@@ -333,7 +354,7 @@ async def test_a_failed_probe_reads_nothing_from_an_unchecked_position(node: Nod
     positions: list[int] = []
 
     async def read_room(room: str, *, since: int | None = None, **kwargs: Any) -> dict[str, Any]:
-        if since is None:
+        if since != 3:  # anything but a read from the cursor is the check
             raise TechnocoreError("HTTP 503: upstream unavailable")
         positions.append(since)
         return {"room": room, "count": 0, "last_seq": since, "generation": 1, "messages": []}
@@ -343,6 +364,123 @@ async def test_a_failed_probe_reads_nothing_from_an_unchecked_position(node: Nod
         await node.poll_mailbox_once(wait=0)
     assert positions == []
     assert node.ledger.cursor(node.mailbox) == 3
+
+
+async def test_a_backlog_longer_than_one_read_is_handled_whole_and_in_order(
+    node: Node, upstream: FakeUpstream
+) -> None:
+    """A read returns the newest 200 after the cursor. A backlog of 250 — a gate held
+    shut, a burst — used to cost its oldest 200 without a word; they were still in the
+    room, and only the export reaches them."""
+    _own_the_room(node)
+    for n in range(250):
+        upstream.post(node.mailbox, REQUESTER, f"backlog line {n}")
+
+    for _ in range(4):
+        await node.poll_mailbox_once(wait=0)
+    assert node.ledger.cursor(node.mailbox) == 250
+    rows = node.ledger.conn.execute(
+        "SELECT technocore_seq FROM messages WHERE direction = 'in' ORDER BY technocore_seq"
+    ).fetchall()
+    assert [r["technocore_seq"] for r in rows] == list(range(1, 251)), "each once, in order"
+    assert node.ledger.get_state("mailbox_gap")[0] is None, "nothing aged out"
+
+
+async def test_a_new_lifetime_seen_before_its_bump_is_not_answered_twice(
+    node: Node, upstream: FakeUpstream
+) -> None:
+    """Upstream writes a recreated room's first record before it bumps the generation, so
+    one read can show the record under the old number. Restarting when the bump then
+    shows would handle that record a second time — two refusals for one line, both
+    charged to the sender's hourly budget."""
+    _own_the_room(node)
+    _three_lines_already_read(node, upstream)
+    node.ledger.adopt_cursor_epoch(node.mailbox, 1)
+    assert await node.poll_mailbox_once(wait=0) == 0
+
+    upstream.reap(node.mailbox)
+    upstream.bump_late = True
+    upstream.post(node.mailbox, REQUESTER, "not a job")
+    assert await node.poll_mailbox_once(wait=0) == 1  # read under the old generation
+    assert await node.poll_mailbox_once(wait=0) == 0  # the bump shows; nothing new
+    assert await node.poll_mailbox_once(wait=0) == 0  # and nothing is read again
+    assert node.ledger.cursor_epoch(node.mailbox) == 2
+    refusals = node.ledger.conn.execute("SELECT COUNT(*) AS n FROM rejections").fetchone()
+    assert refusals["n"] == 1
+
+
+async def test_a_room_renumbered_under_the_same_generation_is_caught_on_restart(
+    node: Node, upstream: FakeUpstream
+) -> None:
+    """The upstream loses its record of the mailbox; a new room starts at 1 as generation
+    1, the number the old one had; and it passes the cursor while nothing is reading —
+    the node down, or intake shut. Neither the numbers nor the generation show it. The
+    message at the cursor does: it is not the one this node handled there."""
+    _own_the_room(node)
+    for n in range(3):
+        upstream.post(node.mailbox, REQUESTER, f"old line {n}")
+    assert await node.poll_mailbox_once(wait=0) == 3
+    assert (node.ledger.cursor(node.mailbox), node.ledger.cursor_epoch(node.mailbox)) == (3, 1)
+
+    upstream.reap(node.mailbox, forget=True)
+    for n in range(5):
+        upstream.post(node.mailbox, STRANGER, f"new line {n}")
+    node._epoch_probed.clear()  # a fresh process
+
+    handled = [await node.poll_mailbox_once(wait=0) for _ in range(2)]
+    assert sum(handled) == 5, handled
+    assert node.ledger.cursor(node.mailbox) == 5
+
+
+async def test_an_emptied_room_keeps_its_gap_accounting(node: Node, upstream: FakeUpstream) -> None:
+    """Gate shut, seq 4 to 10 unread, the room deleted with its numbering kept. Nothing
+    below the cursor can be missed, so the cursor stays — and the next job's seq says how
+    many went unread, where a restart to zero would have said nothing."""
+    _lose_the_room(node)
+    for n in range(10):
+        upstream.post(node.mailbox, REQUESTER, f"line {n}")
+    node.ledger.set_cursor(node.mailbox, 3)
+    assert await node.poll_mailbox_once(wait=0) == 0
+
+    upstream.reap(node.mailbox)
+    assert await node.poll_mailbox_once(wait=0) == 0
+    assert node.ledger.cursor(node.mailbox) == 3, "an emptied room is not a replaced one"
+
+    upstream.post(node.mailbox, REQUESTER, _job("after-the-gap-1"))
+    assert await node.poll_mailbox_once(wait=0) == 0
+    gap, _ = node.ledger.get_state("mailbox_gap")
+    assert gap is not None and gap.startswith("7 message(s)")
+
+
+async def test_a_probe_that_answers_with_no_room_is_not_a_check(node: Node) -> None:
+    _own_the_room(node)
+    node.ledger.set_cursor(node.mailbox, 3)
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    with pytest.raises(TechnocoreError):
+        await node.poll_mailbox_once(wait=0)
+    assert node.mailbox not in node._epoch_probed, "tried again next cycle, not in ten minutes"
+    assert node.ledger.cursor(node.mailbox) == 3
+
+
+@pytest.mark.parametrize("seq", [True, "7", -1, None])
+async def test_a_message_without_a_usable_seq_is_not_handled_and_moves_nothing(
+    node: Node, seq: Any
+) -> None:
+    _own_the_room(node)
+
+    async def read_room(room: str, **kwargs: Any) -> dict[str, Any]:
+        message = {"seq": seq, "ts": "now", "from": REQUESTER, "nonce": 1, "text": "x"}
+        return {"room": room, "last_seq": 0, "messages": [message]}
+
+    node.client.read_room = read_room  # type: ignore[method-assign]
+    assert await node.poll_mailbox_once(wait=0) == 0
+    assert node.ledger.cursor(node.mailbox) == 0
+    rows = node.ledger.conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
+    assert rows["n"] == 0
 
 
 @pytest.mark.parametrize("generation", [True, -1, "2", 1.5, None])

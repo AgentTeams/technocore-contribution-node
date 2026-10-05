@@ -173,11 +173,18 @@ room's `generation`, or anything else that could say the room had been replaced.
 away with it — the upstream had kept both rooms' numbering — but in a room that starts
 again at 1, a cursor held at 3 skips seq 1 to 3 without a word, because a read with
 `since=` answers "nothing new" until the room passes it. So the ledger records the
-generation each cursor counts in. A read from another generation, or one whose `last_seq`
-comes back below the cursor, sends the cursor back to zero and the room is read again from
-its first message. A read without a cursor — the first a process makes of each room, then
-one every ten minutes — covers an upstream that would show neither. A probe that fails
-raises, rather than reading on from a position nobody has checked.
+generation each cursor counts in, and a cursor is checked against the room rather than
+trusted: by the message at it, which this node recorded when it handled it. A read whose
+`last_seq` comes back below the cursor, or a message at the cursor that is not the recorded
+one, sends the cursor back to zero, and the room is read again from its first message. A
+new generation alone does not, because a room numbered on from the old one has nothing
+below the cursor to miss. The check also runs on the first read a process makes and every
+ten minutes after, because a room can come back under its old generation number. A check
+that fails raises, rather than reading on from a position nobody has checked.
+
+**And one read is not the whole backlog.** The upstream returns the newest records after a
+cursor, at most 200. A full read that starts past the cursor is caught up from the room's
+export, oldest first — until `v0.2.3` the oldest were simply skipped.
 
 **What is written in the owned room is not kept.** The lease keeps the ownership note
 alive. It writes nothing to the room itself, and with no third-party traffic nothing else

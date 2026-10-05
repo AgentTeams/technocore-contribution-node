@@ -232,6 +232,22 @@ class Ledger:
                 tuple(row[c] for c in columns),
             )
 
+    def recorded_message_at(self, room: str, seq: int) -> sqlite3.Row | None:
+        """The newest message this node recorded at `seq` in `room`, in or out.
+
+        What a cursor position is checked against: a room the upstream renumbered can hold
+        a different message at the same seq, under the same generation, and only the
+        message itself can say whether it is the one this node handled there.
+        """
+        return _row(
+            self.conn.execute(
+                "SELECT did, normalized_text_sha256, direction FROM messages "
+                "WHERE room = ? AND technocore_seq = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (room, seq),
+            ).fetchone()
+        )
+
     def last_nonce(self, did: str, room: str) -> int:
         row = self.conn.execute(
             "SELECT MAX(nonce) AS n FROM messages WHERE did = ? AND room = ? AND direction = 'out'",
