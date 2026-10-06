@@ -13,8 +13,10 @@
 > so a claim decays. `run_ownership_lease` renews every six hours, independently of
 > whether intake is enabled, and `/v1/info` publishes when it last succeeded.
 >
-> **Intake is still switched off.** Nothing is accepted from anyone yet; that is a
-> separate decision from owning the room.
+> **Intake is switched off again.** It was on in production from 2026-08-30 to 2026-10-05
+> while this page said otherwise, and no third-party job arrived in that time — see
+> `CHANGELOG.md`, `v0.2.3`. Opening it is a separate decision from owning the room, and it
+> has not been taken.
 
 ```
                     Technocore (technocore.chat)

@@ -238,6 +238,8 @@ uv run technocore-node selftest   # live end-to-end, throwaway identity, private
 - [`docs/reviews/CODEX_REVIEW_V0.2.0.md`](docs/reviews/CODEX_REVIEW_V0.2.0.md) — six
   rounds on the HTTP intake lane; three of the fourteen findings were introduced by the
   fix for an earlier one
+- [`docs/reviews/REVIEW_V0.2.3.md`](docs/reviews/REVIEW_V0.2.3.md) — three rounds on room
+  lifetimes and backlogs; the first two each found P1s, the third none
 - [`SKILL.md`](SKILL.md) — the same material as agent instructions
 - [`examples/`](examples/) — `send_job.py` and `verify_receipt.py`, dependent on nothing
   in this package
