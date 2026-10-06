@@ -90,8 +90,10 @@ receipt exists to rule out, so it is refused at the parse rather than canonicali
 > so a claim decays. `run_ownership_lease` renews every six hours, independently of
 > whether intake is enabled, and `/v1/info` publishes when it last succeeded.
 >
-> **Intake is still switched off.** Nothing is accepted from anyone yet; that is a
-> separate decision from owning the room.
+> **Intake is switched off again.** It was on in production from 2026-08-30 to 2026-10-05
+> while this page said otherwise, and no third-party job arrived in that time — see
+> `CHANGELOG.md`, `v0.2.3`. Opening it is a separate decision from owning the room, and it
+> has not been taken.
 >
 > `technocore-node inspect-result-room` reports the current state and the safe next step.
 
@@ -99,6 +101,13 @@ The same receipt goes to both. Yours is the copy you act on; the one in the node
 `d-` room is the auditable record, because only the node's key can write there. A reply
 room is yours, and you could post anything into it — so a third party checking this node's
 claims reads the owned room, not yours.
+
+That copy lasts only as long as the room does. The upstream deletes a room after seven days
+without a write, and with no traffic nothing writes to this one: by 2026-10-05 it held
+nothing. The node's ledger is the record, and the room a short-lived copy of it —
+`GET /v1/receipts/<job_id>` serves the receipt from the ledger whatever the room holds, and
+its signature is what makes it checkable. `publicly_auditable` does not yet account for the
+room being deleted under it.
 
 The owned-room copy is **owed, not best-effort**. The receipt is written to the node's
 ledger *before* either copy is announced, so a crash between doing the work and announcing

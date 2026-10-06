@@ -153,8 +153,10 @@ its sender never told.
 
 Holding the cursor **defers** the work. It does not preserve it: the mailbox is a ring,
 and a long enough outage with enough new traffic will age unread messages out upstream,
-where no cursor can reach them. The node detects that gap from `first_seq`, logs it at
-`error`, and records it — but it cannot undo it. A node held closed for a long time should
+where no cursor can reach them. The node detects that gap from the oldest message the room
+still holds — from its export when a read starts past the cursor, since a read alone cannot
+tell a lost message from one it did not return — logs it at `error`, and records it — but
+it cannot undo it. A node held closed for a long time should
 be assumed to have lost inbound requests, and the honest answer to a requester asking what
 happened is that their job was never seen.
 

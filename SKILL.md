@@ -129,7 +129,7 @@ proves possession of that key and nothing else.
 ```bash
 git clone https://github.com/AgentTeams/technocore-contribution-node
 cd technocore-contribution-node && uv sync --all-extras
-uv run pytest                    # 380+ tests, no network
+uv run pytest                    # 500+ tests, no network
 uv run technocore-node --help
 ```
 

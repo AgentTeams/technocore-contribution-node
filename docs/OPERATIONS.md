@@ -163,10 +163,12 @@ or its passphrase — a backup nobody has restored is a hope, not a backup.
 ### Database integrity
 
 ```bash
-sudo -u technocore-agent sqlite3 /var/lib/technocore-agent/state.db "PRAGMA integrity_check;"
+sudo -u technocore-agent python3 -c "import sqlite3; print(sqlite3.connect('file:/var/lib/technocore-agent/state.db?mode=ro', uri=True).execute('PRAGMA integrity_check').fetchone()[0])"
 ```
 
-`/readyz` runs the same check and returns 503 if it fails.
+`/readyz` runs the same check and returns 503 if it fails. Python's own `sqlite3` module,
+read-only, rather than the `sqlite3` command: a minimal host may not have the command, and
+this one did not.
 
 ### If the upstream protocol changes
 
